@@ -420,3 +420,20 @@ gateway loads Python from the same checkout with no extra env.
   - Ink (`ui-tui/`) untouched; the engine gate still defaults to Ink and falls back to Ink on
     Windows/Termux. Distribution realities (Bun + per-arch native lib; runtime-provisioned) per spec
     §10 are unchanged and remain the deploy plan.
+
+### Live-feedback polish pass — 15 items (2026-06-08, PASS)
+
+After driving the real TUI, glitch filed 15 UX bugs/gaps; each was fixed (Ink for UX, opencode for
+primitives), gated, and tmux-smoked. Run-log highlights (full matrix in `opentui-feature-map.md`):
+
+- **Status bar (14):** launch → `● claude-opus-4.8-fast ·xhigh  ░░░░░░░░ 0%  …/lively-thrush/hermes-agent (feat/opentui-native-engine)` above the composer, a top-rule separator dividing it from the transcript; context bar updated 0→4% across a turn; turn dot `●`→`◐`.
+- **Ctrl-C interrupt (11):** long turn → 1st Ctrl+C → `⏹ stopped — Ctrl+C again to quit` + idle dot (turn interrupted via `session.interrupt`); 2nd press exited cleanly, no orphan gateway (the user's installed-venv Ink sessions untouched).
+- **Always-active input (2):** type → lands; `/`→completions→Esc→type again → still lands.
+- **Prompt history (6):** seeded a dir's JSONL → Up/Up/Down cycled two→one→two; a freshly submitted prompt recalled via Up. Scoped per-dir (`$HERMES_HOME/tui-history/<sha1(cwd)>.jsonl`).
+- **Completions (5,13):** `/details ` → section dropdown, Tab → `/details hidden` (arg-only splice); `tui_gateway/` → its `.py` files; `@hermes_cli/m` → m-prefixed files.
+- **Tools + composer (3,7):** `ls -la` → collapsed `▶ terminal  total 3460  (N lines)`; SGR-click → `▼` + clean per-line output (`normalizeOutput` un-double-escapes `\n`); composer shows `❯`, no blue tint.
+- **/tools, /skills, /agents trace (9,15):** `/tools` → roster pager; `/skills` → picker; a real delegation (spawn subagent → reply PURPLE) → `/agents` master-detail showed the subagent's goal · completed · model, `🧠 PURPLE` thought, and `▶`/`✓` trace lines.
+- **Cursor (10):** streaming start now shows `⚕ ▍` on one line (was a dangling caret a line below); reply text aligns with the glyph.
+- **Copy/paste/selection (1,4):** drag-select + Ctrl+C → `Copied to clipboard` (OSC52 + native; not quit); no-selection Ctrl+C still arms quit; bracketed text paste lands in the composer; gutter glyphs/chrome are `selectable={false}`. Image-paste wired (`onPaste` empty → `image.attach_bytes`) — unverified in the clipboard-less CI env.
+- **/goal (8):** probed live — `slash.exec` rejects (pending-input) → `command.dispatch {name:goal}` → `{type:'send', notice:'⊙ Goal set (50-turn budget)…', message}` → notice shown + goal turn submitted. Wired.
+- *Follow-ups (not blockers):* item 12 home banner/help-hint; image-paste live verify; large agent-tree windowing.

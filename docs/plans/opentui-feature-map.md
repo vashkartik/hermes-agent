@@ -42,9 +42,33 @@ A row is ✅ only when it has a test (Layer 1–4) AND a smoke-doc check. The ju
 | 7 | **Agents dashboard** (subagent tree) | `agentsOverlay`, `thinking.tsx:281` | — | `view/overlays/agentsDashboard.tsx` | ✅ | `store`/`render`.test · P5e (live delegation) |
 | 8 | **Launcher cutover** (`_make_opentui_argv` → v2 Solid entry) | `main.py` | `cli/cmd/tui.ts` | `hermes_cli/main.py` | ✅ | py_compile + resolution · P8 |
 
-53 tests / 7 files; `bun run check` green every phase; each surface live-smoked in tmux. Remaining
-polish (NOT first-class blockers): header chrome detail (model/cwd/context%/cost from
-`session.info`+`Usage`) and agent-feature trail (reasoning/todos/notifications/voice) — §3 below.
+53 tests / 7 files; `bun run check` green every phase; each surface live-smoked in tmux.
+
+### Live-feedback polish pass — the 15 items glitch found in 15 min (2026-06-08)
+
+After driving the real TUI, glitch filed 15 UX bugs/gaps. All addressed (Ink for UX, opencode for
+primitives), each gated (`bun run check`) + tmux-smoked + committed. 71 tests / 8 files.
+
+| # | Item | opencode/Ink primitive | v2 build | Status |
+|---|---|---|---|---|
+| 1 | OSC52 copy/paste + image paste | opencode `clipboard.ts` (OSC52, image read) | `boundary/clipboard.ts`; Ctrl+C copies selection; `onPaste` empty→`image.attach_bytes` | ✅ copy/text-paste smoked; image-paste wired (no clipboard in CI env) |
+| 2 | Always-active input | opencode keep-prompt-focused | `composer.tsx` printable-key refocus + `onMouseDown` | ✅ |
+| 3 | Distinguish input (blue tint) | — | `❯` prompt glyph + dropped focusedBg; status-bar rule above | ✅ |
+| 4 | Mouse selection ignores glyphs | opencode `selectable={false}` | `selectable={false}` on all gutter glyphs + chrome | ✅ |
+| 5 | Slash-arg autocomplete | gateway `complete.slash` (args) | `slash.ts planCompletion` + `replace_from` splice | ✅ (`/details ` sections) |
+| 6 | Per-session/dir prompt history | opencode `prompt/history.tsx` | `logic/history.ts` (Up/Down, per-dir JSONL) | ✅ |
+| 7 | Collapsible tools, de-interlaced | opencode InlineTool/BlockTool | `toolPart.tsx` ▶/▼ collapsed-default + `normalizeOutput` | ✅ |
+| 8 | Feature matrix + `/goal` wired | — | this doc; `/goal`→`command.dispatch`→`{type:send}` | ✅ (probed live) |
+| 9 | `/tools`,`/skills` interactive UI | Ink `skillsHub`,`modelPicker` | `/tools`→pager, `/skills`→picker | ✅ |
+| 10 | Cursor misalignment (response) | — | `messageLine.tsx` caret inline with glyph | ✅ |
+| 11 | Ctrl-C stops agent, 2nd quits | opencode double-press interrupt | `renderer.ts` `onCtrlC` + `entry` machine (`session.interrupt`, 3s debounce) | ✅ |
+| 12 | Helper popup on empty/home | Ink `helpHint.tsx` | `view/homeHint.tsx` (brand + common cmds + tips on empty transcript) | ✅ |
+| 13 | File/dir @-mention tagging | gateway `complete.path` | `planCompletion`→`complete.path` | ✅ (`@hermes_cli/m`) |
+| 14 | Status bar (status·model·effort·context·dir) | Ink `appChrome` StatusRule | `view/statusBar.tsx` (`session.info`) above composer | ✅ |
+| 15 | `/agents` live trace | Ink `agentsOverlay` | `agentsDashboard.tsx` master-detail + per-subagent trace | ✅ (live delegation) |
+
+Remaining follow-ups (NOT blockers): a richer ASCII home banner; image-paste live verify on a
+machine with a clipboard; large subagent-tree windowing in the dashboard.
 
 ### Phase 0 — scaffold (foundation; commit `a47c6df`)
 | Concern | opencode ref | v2 build | Status | Test · smoke |
