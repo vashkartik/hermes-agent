@@ -16,6 +16,7 @@ import type {
   HermesConfig,
   HermesConfigRecord,
   LogsResponse,
+  MemoryFactsResponse,
   MessagingPlatformsResponse,
   MessagingPlatformTestResponse,
   MessagingPlatformUpdate,
@@ -68,6 +69,8 @@ export type {
   HermesConfig,
   HermesConfigRecord,
   LogsResponse,
+  MemoryFact,
+  MemoryFactsResponse,
   MessagingEnvVarInfo,
   MessagingHomeChannel,
   MessagingPlatformInfo,
@@ -419,6 +422,37 @@ export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boole
     path: '/api/skills/toggle',
     method: 'PUT',
     body: { name, enabled }
+  })
+}
+
+// Read-only browse/search over the holographic memory fact store. Profile-
+// scoped like skills/config so the Memories page follows the active profile.
+export function getMemoryFacts(
+  params: { q?: string; category?: string; limit?: number; offset?: number } = {}
+): Promise<MemoryFactsResponse> {
+  const query = new URLSearchParams()
+
+  if (params.q?.trim()) {
+    query.set('q', params.q.trim())
+  }
+
+  if (params.category) {
+    query.set('category', params.category)
+  }
+
+  if (typeof params.limit === 'number') {
+    query.set('limit', String(Math.max(1, Math.floor(params.limit))))
+  }
+
+  if (typeof params.offset === 'number' && params.offset > 0) {
+    query.set('offset', String(Math.floor(params.offset)))
+  }
+
+  const suffix = query.toString()
+
+  return window.hermesDesktop.api<MemoryFactsResponse>({
+    ...profileScoped(),
+    path: suffix ? `/api/memory/facts?${suffix}` : '/api/memory/facts'
   })
 }
 

@@ -31,6 +31,10 @@ check "$ROOT/tui_gateway/server.py"              "_rebind_ws_transport" "gateway
 check "$ROOT/tui_gateway/server.py"              "_persist_session_history" "gateway: turn-end transcript persistence"
 check "$ROOT/agent/codex_runtime.py"             "run_conversation already appended the user message" "codex runtime: no duplicate user echo in spliced transcript"
 check "$ROOT/scripts/install.sh"                 "HERMES_REPO_URL"    "install: pinned-fork repo override for embedders"
+check "$ROOT/hermes_cli/web_server.py"           "api/memory/facts"   "memory: read-only facts browser endpoint (Memories page REST)"
+check "$ROOT/hermes_cli/web_server.py"           "_sessions_daily_stats" "sessions: per-day stats breakdown in /api/sessions/stats"
+check "$DESK/src/app/memories/index.tsx"         "MemoriesView"       "memories: animated facts browser page (motion)"
+check "$DESK/src/app/routes.ts"                  "MEMORIES_ROUTE"     "memories: /memories route + sidebar nav entry"
 [ -f "$DESK/CAPELLA_FORK.md" ] && echo "  ok   fork doc (CAPELLA_FORK.md)" || { echo "  MISS CAPELLA_FORK.md"; fail=1; }
 
 # Gateway patch — best-effort: only checks when upstream is fetched locally.

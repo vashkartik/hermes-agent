@@ -584,6 +584,31 @@ export const en: Translations = {
     failedToUpdate: name => `Failed to update ${name}`
   },
 
+  memories: {
+    title: 'Memories',
+    search: 'Search memories...',
+    refresh: 'Refresh memories',
+    refreshing: 'Refreshing memories',
+    loading: 'Loading memories...',
+    all: 'All',
+    factsCount: count => `${count} ${count === 1 ? 'fact' : 'facts'}`,
+    matchingCount: count => `${count} matching`,
+    trust: 'Trust',
+    recalls: count => `${count} ${count === 1 ? 'recall' : 'recalls'}`,
+    helpfulVotes: count => `${count} helpful`,
+    loadMore: 'Load more',
+    emptyTitle: 'No memories yet',
+    emptyDesc: 'Facts the agent stores about you and your projects will appear here.',
+    noMatchTitle: 'No matching memories',
+    noMatchDesc: 'Try a different search or category.',
+    errorTitle: 'Memory store unavailable',
+    loadFailed: 'Memories failed to load',
+    justNow: 'just now',
+    minutesAgo: minutes => `${minutes}m ago`,
+    hoursAgo: hours => `${hours}h ago`,
+    daysAgo: days => `${days}d ago`
+  },
+
   agents: {
     close: 'Close agents',
     title: 'Spawn tree',
@@ -1044,7 +1069,8 @@ export const en: Translations = {
       'new-session': 'New session',
       skills: 'Skills & Tools',
       messaging: 'Messaging',
-      artifacts: 'Artifacts'
+      artifacts: 'Artifacts',
+      memories: 'Memories'
     },
     searchAria: 'Search sessions',
     searchPlaceholder: 'Search sessions…',
