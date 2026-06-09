@@ -505,6 +505,14 @@ class CodexAppServerSession:
                     if pending is None:
                         break
                     _apply_token_usage_notification(result, pending)
+                    # Display parity with the main poll loop below: deltas
+                    # consumed during an approval round-trip must still
+                    # reach the live-event hook or the UI stream stalls.
+                    if self._on_event is not None:
+                        try:
+                            self._on_event(pending)
+                        except Exception:  # pragma: no cover - display callback
+                            logger.debug("on_event callback raised", exc_info=True)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
                     if proj.messages:
