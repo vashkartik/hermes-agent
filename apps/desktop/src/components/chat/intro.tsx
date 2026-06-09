@@ -150,7 +150,7 @@ function pickCopy(copies: IntroCopy[], seed = 0): IntroCopy {
 // no emoji field in the data model, so known operator lanes are mapped here.
 const HERO_EMOJI_BY_KEY: Record<string, string> = {
   rook: '♜',
-  king: '👑',
+  king: '♚',
 }
 
 // The hero wordmark reflects the profile the chat is scoped to: a named profile
