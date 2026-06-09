@@ -18,13 +18,23 @@ branch in the owner's fork so upstream updates rebase cleanly onto them.
 ```sh
 git fetch upstream
 git rebase upstream/main capella/patches   # replay our patches onto latest upstream
-# resolve conflicts if any, then:
+# resolve conflicts if any, then VERIFY our patches survived the rebase:
+bash apps/desktop/scripts/capella-patch-guard.sh   # fails if any patch was clobbered
 cd apps/desktop && npm run build            # rebuild the renderer
 # rebuild + reinstall the embedded Hermes.app (see Deploy below)
 git push --force-with-lease fork capella/patches
 ```
 
-So: **Update Hermes = `git fetch upstream && git rebase upstream/main capella/patches` → rebuild → reinstall.**
+So: **Update Hermes = `git fetch upstream && git rebase upstream/main capella/patches` → patch-guard → rebuild → reinstall.**
+
+## Patch guard (don't lose our changes on update)
+
+`apps/desktop/scripts/capella-patch-guard.sh` asserts every Capella patch is
+still present (hero emoji, per-profile session persistence, the restore-on-switch
+controller change, the gateway patch) and exits non-zero if a rebase dropped one
+— so an upstream update can never silently clobber our work. It also runs in CI
+via `.github/workflows/capella-patches-guard.yml` (GitHub-hosted runner; enable
+Actions on the fork to have it run on every push to `capella/**`).
 
 ## Deploy into Capella's embed
 
