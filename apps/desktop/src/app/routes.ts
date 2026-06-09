@@ -5,6 +5,7 @@ export const COMMAND_CENTER_ROUTE = '/command-center'
 export const SKILLS_ROUTE = '/skills'
 export const MESSAGING_ROUTE = '/messaging'
 export const ARTIFACTS_ROUTE = '/artifacts'
+export const MEMORIES_ROUTE = '/memories'
 export const CRON_ROUTE = '/cron'
 export const PROFILES_ROUTE = '/profiles'
 export const AGENTS_ROUTE = '/agents'
@@ -15,6 +16,7 @@ export type AppView =
   | 'chat'
   | 'command-center'
   | 'cron'
+  | 'memories'
   | 'messaging'
   | 'profiles'
   | 'settings'
@@ -25,6 +27,7 @@ export type AppRouteId =
   | 'artifacts'
   | 'command-center'
   | 'cron'
+  | 'memories'
   | 'messaging'
   | 'new'
   | 'profiles'
@@ -44,6 +47,7 @@ export const APP_ROUTES = [
   { id: 'skills', path: SKILLS_ROUTE, view: 'skills' },
   { id: 'messaging', path: MESSAGING_ROUTE, view: 'messaging' },
   { id: 'artifacts', path: ARTIFACTS_ROUTE, view: 'artifacts' },
+  { id: 'memories', path: MEMORIES_ROUTE, view: 'memories' },
   { id: 'cron', path: CRON_ROUTE, view: 'cron' },
   { id: 'profiles', path: PROFILES_ROUTE, view: 'profiles' },
   { id: 'agents', path: AGENTS_ROUTE, view: 'agents' }

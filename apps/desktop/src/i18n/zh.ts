@@ -796,6 +796,31 @@ export const zh: Translations = {
     failedToUpdate: name => `更新 ${name} 失败`
   },
 
+  memories: {
+    title: '记忆',
+    search: '搜索记忆…',
+    refresh: '刷新记忆',
+    refreshing: '正在刷新记忆',
+    loading: '正在加载记忆…',
+    all: '全部',
+    factsCount: count => `${count} 条事实`,
+    matchingCount: count => `匹配 ${count} 条`,
+    trust: '信任度',
+    recalls: count => `调用 ${count} 次`,
+    helpfulVotes: count => `有用 ${count} 次`,
+    loadMore: '加载更多',
+    emptyTitle: '暂无记忆',
+    emptyDesc: '代理存储的关于你和项目的事实将显示在这里。',
+    noMatchTitle: '没有匹配的记忆',
+    noMatchDesc: '请尝试其他搜索词或分类。',
+    errorTitle: '记忆存储不可用',
+    loadFailed: '记忆加载失败',
+    justNow: '刚刚',
+    minutesAgo: minutes => `${minutes} 分钟前`,
+    hoursAgo: hours => `${hours} 小时前`,
+    daysAgo: days => `${days} 天前`
+  },
+
   agents: {
     close: '关闭代理',
     title: '派生树',
@@ -1263,7 +1288,8 @@ export const zh: Translations = {
       'new-session': '新建会话',
       skills: '技能与工具',
       messaging: '消息平台',
-      artifacts: '产物'
+      artifacts: '产物',
+      memories: '记忆'
     },
     searchAria: '搜索会话',
     searchPlaceholder: '搜索会话…',

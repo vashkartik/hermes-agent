@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -18,6 +19,14 @@ export default defineConfig({
     // "`@layer base` is used but no matching `@tailwind base` directive is
     // present." Pinning the config makes the build hermetic.
     postcss: { plugins: [] }
+  },
+  test: {
+    // Renderer unit tests only. The in-place runtime tree also contains
+    // electron node:test files (run via test:desktop:platforms), staged
+    // native deps under build/, and a packed Hermes.app under release/ —
+    // vitest must never crawl into those.
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    exclude: ['**/node_modules/**', 'build/**', 'dist/**', 'electron/**', 'release/**']
   },
   build: {
     // Keep desktop packaging stable: Shiki ships many dynamic chunks by

@@ -506,6 +506,31 @@ export interface SkillInfo {
   name: string
 }
 
+// One structured fact from the holographic memory store (GET /api/memory/facts).
+export interface MemoryFact {
+  id: number
+  content: string
+  category: string
+  tags: string
+  trust_score: number
+  retrieval_count: number
+  helpful_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface MemoryFactsResponse {
+  facts: MemoryFact[]
+  /** Rows matching the current q/category filter (for pagination). */
+  total: number
+  /** Unfiltered per-category histogram (chips + stats strip). */
+  categories: Record<string, number>
+  provider: string
+  db_mtime: number | null
+  /** Present when the store is missing/locked/corrupt — facts will be empty. */
+  error?: string
+}
+
 export interface ToolsetInfo {
   configured: boolean
   description: string

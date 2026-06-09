@@ -501,6 +501,31 @@ export interface Translations {
     failedToUpdate: (name: string) => string
   }
 
+  memories: {
+    title: string
+    search: string
+    refresh: string
+    refreshing: string
+    loading: string
+    all: string
+    factsCount: (count: number) => string
+    matchingCount: (count: number) => string
+    trust: string
+    recalls: (count: number) => string
+    helpfulVotes: (count: number) => string
+    loadMore: string
+    emptyTitle: string
+    emptyDesc: string
+    noMatchTitle: string
+    noMatchDesc: string
+    errorTitle: string
+    loadFailed: string
+    justNow: string
+    minutesAgo: (minutes: number) => string
+    hoursAgo: (hours: number) => string
+    daysAgo: (days: number) => string
+  }
+
   agents: {
     close: string
     title: string

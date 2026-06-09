@@ -6388,12 +6388,107 @@ async def delete_empty_sessions_endpoint():
         db.close()
 
 
+_SESSION_SOURCE_CLASSES = ("tui", "cli", "cron")
+
+
+def _sessions_daily_stats(db_path, days: int = 30, now: Optional[float] = None) -> Dict[str, Any]:
+    """Per-day session activity for the last ``days`` days from a state.db.
+
+    Pure read-only helper (``mode=ro`` URI) over the ``sessions`` table so it
+    never triggers SessionDB schema migrations or WAL writes, and is testable
+    against a temp sqlite file. Buckets by local calendar day of
+    ``started_at``; sources are classed tui/cli/cron/other.  [capella]
+    sessions daily stats.
+    """
+    import sqlite3
+    from datetime import date, timedelta
+
+    days = max(1, min(int(days), 365))
+    now_ts = time.time() if now is None else float(now)
+    start_day = date.fromtimestamp(now_ts) - timedelta(days=days - 1)
+    # Local midnight of the first day in the window, matching the
+    # date(..., 'localtime') bucketing below.
+    cutoff = time.mktime(start_day.timetuple())
+    day_keys = [(start_day + timedelta(days=i)).isoformat() for i in range(days)]
+
+    def _bucket() -> Dict[str, Any]:
+        return {
+            "sessions": 0,
+            "messages": 0,
+            "tool_calls": 0,
+            "by_source": {
+                src: {"sessions": 0, "messages": 0, "tool_calls": 0}
+                for src in (*_SESSION_SOURCE_CLASSES, "other")
+            },
+        }
+
+    daily = {key: _bucket() for key in day_keys}
+    totals = _bucket()
+    result: Dict[str, Any] = {
+        "window_days": days,
+        "days": [{"date": key, **daily[key]} for key in day_keys],
+        "totals": totals,
+    }
+
+    db_path = Path(db_path)
+    if not db_path.exists():
+        result["error"] = f"state db not found at {db_path}"
+        return result
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        result["error"] = f"could not open state db: {exc}"
+        return result
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT date(started_at, 'unixepoch', 'localtime') AS day,
+                   source,
+                   COUNT(*) AS sessions,
+                   COALESCE(SUM(message_count), 0) AS messages,
+                   COALESCE(SUM(tool_call_count), 0) AS tool_calls
+            FROM sessions
+            WHERE started_at >= ?
+            GROUP BY day, source
+            """,
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        result["error"] = f"state db query failed: {exc}"
+        return result
+    finally:
+        conn.close()
+
+    for day, source, sessions, messages, tool_calls in rows:
+        bucket = daily.get(str(day))
+        if bucket is None:
+            continue
+        src = str(source or "").lower()
+        cls = src if src in _SESSION_SOURCE_CLASSES else "other"
+        for target in (bucket, totals):
+            target["sessions"] += int(sessions)
+            target["messages"] += int(messages or 0)
+            target["tool_calls"] += int(tool_calls or 0)
+            target["by_source"][cls]["sessions"] += int(sessions)
+            target["by_source"][cls]["messages"] += int(messages or 0)
+            target["by_source"][cls]["tool_calls"] += int(tool_calls or 0)
+
+    result["days"] = [{"date": key, **daily[key]} for key in day_keys]
+    return result
+
+
 @app.get("/api/sessions/stats")
 async def get_session_stats():
     """Session-store statistics for the Sessions page (mirrors `hermes sessions stats`).
 
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
+
+    Also reports a per-day activity breakdown for the last 30 days under
+    ``daily`` (sessions / message_count sums / tool_call_count sums, split by
+    tui/cli/cron/other source class) read straight off this home's state.db.
     """
     from hermes_state import SessionDB
 
@@ -6410,12 +6505,18 @@ async def get_session_stats():
                 by_source[src] = by_source.get(src, 0) + 1
         except Exception:
             pass
+        try:
+            daily = _sessions_daily_stats(get_hermes_home() / "state.db", days=30)
+        except Exception:
+            _log.exception("sessions daily stats failed")
+            daily = None
         return {
             "total": total,
             "active_store": active_store,
             "archived": archived,
             "messages": messages,
             "by_source": by_source,
+            "daily": daily,
         }
     finally:
         db.close()
@@ -7783,6 +7884,154 @@ async def reset_memory(body: MemoryReset):
             except OSError as exc:
                 raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
     return {"ok": True, "deleted": deleted}
+
+
+# ---------------------------------------------------------------------------
+# Memory facts browser — read-only REST view into the holographic provider's
+# SQLite fact store (plugins/memory/holographic) for the desktop Memories
+# page.  [capella] memory facts browser endpoint.
+#
+# The ACTIVE db path is resolved exactly the way the plugin runtime does
+# (HolographicMemoryProvider.initialize): config.yaml
+# ``plugins.hermes-memory-store.db_path`` with ``$HERMES_HOME`` expansion,
+# falling back to the provider default ``<home>/memory_store.db``.  The db is
+# opened with a ``mode=ro`` URI so browsing can never mutate, migrate, or
+# write-lock the live store — notably it does NOT bump ``retrieval_count``
+# the way the plugin's own ``search_facts`` does.
+# ---------------------------------------------------------------------------
+
+_MEMORY_FACTS_MAX_LIMIT = 500
+
+
+def _holographic_db_path() -> Path:
+    """Resolve the holographic fact store path the way the plugin does."""
+    home = get_hermes_home()
+    plugin_cfg = cfg_get(load_config(), "plugins", "hermes-memory-store", default={})
+    db_path = plugin_cfg.get("db_path") if isinstance(plugin_cfg, dict) else None
+    if not isinstance(db_path, str) or not db_path.strip():
+        return home / "memory_store.db"
+    db_path = db_path.replace("$HERMES_HOME", str(home))
+    db_path = db_path.replace("${HERMES_HOME}", str(home))
+    return Path(db_path).expanduser()
+
+
+def _fts_match_expr(q: str) -> str:
+    """Build a safe FTS5 MATCH expression from free-form user input.
+
+    The raw query can contain FTS5 operators (quotes, ``-``, ``NEAR``…) that
+    raise OperationalError mid-request, so reduce it to AND-ed quoted prefix
+    terms: ``deploy proc`` → ``"deploy"* "proc"*``.
+    """
+    tokens = re.findall(r"[A-Za-z0-9_]+", q or "")
+    return " ".join(f'"{t}"*' for t in tokens[:16])
+
+
+def _query_memory_facts(
+    db_path,
+    q: str = "",
+    category: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Read-only browse/search over a holographic fact store sqlite file.
+
+    Pure function over ``db_path`` (testable against a temp db). Returns
+    ``{facts, total, categories}`` on success or ``{error, facts: [],
+    total: 0, categories: {}}`` when the store is missing/locked/corrupt.
+    ``total`` counts rows matching the current q/category filter (for
+    pagination); ``categories`` is the unfiltered per-category histogram
+    (for the chips + stats strip).
+    """
+    import sqlite3
+
+    limit = max(1, min(int(limit), _MEMORY_FACTS_MAX_LIMIT))
+    offset = max(0, int(offset))
+    empty = {"facts": [], "total": 0, "categories": {}}
+
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {"error": f"memory store not found at {db_path}", **empty}
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        return {"error": f"could not open memory store: {exc}", **empty}
+
+    try:
+        conn.row_factory = sqlite3.Row
+        params: List[Any] = []
+        category_clause = ""
+        if category:
+            category_clause = "f.category = ?"
+            params.append(category)
+
+        match_expr = _fts_match_expr(q) if q.strip() else ""
+        if match_expr:
+            base = (
+                "FROM facts f JOIN facts_fts fts ON fts.rowid = f.fact_id "
+                "WHERE facts_fts MATCH ?"
+            )
+            params.insert(0, match_expr)
+            if category_clause:
+                base += f" AND {category_clause}"
+            order = "ORDER BY fts.rank, f.trust_score DESC"
+        else:
+            base = "FROM facts f"
+            if category_clause:
+                base += f" WHERE {category_clause}"
+            order = "ORDER BY f.updated_at DESC, f.fact_id DESC"
+
+        total = conn.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score,
+                   f.retrieval_count, f.helpful_count, f.created_at, f.updated_at
+            {base} {order} LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+        categories = {
+            str(row["category"] or "general"): row["n"]
+            for row in conn.execute(
+                "SELECT category, COUNT(*) AS n FROM facts GROUP BY category ORDER BY n DESC"
+            )
+        }
+        facts = [
+            {
+                "id": row["fact_id"],
+                "content": row["content"],
+                "category": row["category"],
+                "tags": row["tags"],
+                "trust_score": row["trust_score"],
+                "retrieval_count": row["retrieval_count"],
+                "helpful_count": row["helpful_count"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+        return {"facts": facts, "total": int(total), "categories": categories}
+    except sqlite3.Error as exc:
+        return {"error": f"memory store query failed: {exc}", **empty}
+    finally:
+        conn.close()
+
+
+@app.get("/api/memory/facts")
+async def get_memory_facts(q: str = "", category: str = "", limit: int = 100, offset: int = 0):
+    """Browse/search the holographic fact store (read-only, never trains it)."""
+    cfg = load_config()
+    provider = str(cfg_get(cfg, "memory", "provider", default="") or "")
+    db_path = _holographic_db_path()
+    db_mtime: Optional[float] = None
+    try:
+        db_mtime = db_path.stat().st_mtime
+    except OSError:
+        pass
+    result = _query_memory_facts(db_path, q=q, category=category, limit=limit, offset=offset)
+    result["provider"] = provider
+    result["db_mtime"] = db_mtime
+    return result
 
 
 # ---------------------------------------------------------------------------
