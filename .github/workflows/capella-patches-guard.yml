@@ -1,0 +1,27 @@
+# Capella fork guard — runs on our patch branches to catch an upstream rebase
+# that clobbers our patches or breaks the desktop build. GitHub-hosted runner,
+# no secrets. (Enable Actions on the fork for this to run automatically.)
+name: Capella Patch Guard
+
+on:
+  push:
+    branches: ['capella/**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify Capella patches are present
+        run: bash apps/desktop/scripts/capella-patch-guard.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install deps (lockfile-faithful)
+        run: npm ci
+      - name: Build desktop renderer
+        run: cd apps/desktop && npm run build
