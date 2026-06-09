@@ -780,9 +780,14 @@ export function createSessionStore() {
 
   /** Replace history with the resume snapshot, then replay events buffered meanwhile. */
   function commitSnapshot(snapshot: Message[]): void {
-    setState('messages', snapshot)
-    // An over-cap resume snapshot must be trimmed too (it sets the whole array).
-    setState(produce(capMessages))
+    // Slice to the cap BEFORE the first setState, not after. Yoga (WASM) layout
+    // memory is grow-only, so even a TRANSIENT mount of an over-cap resume
+    // snapshot would permanently ratchet the high-water mark — a set-then-trim
+    // briefly hands the full fetched history to <For>. Pre-slicing guarantees
+    // resuming ANY session mounts at most MESSAGE_CAP rows. (Events buffered
+    // across the resume RPC, replayed below, self-cap via capMessages per push.)
+    const capped = snapshot.length > MESSAGE_CAP ? snapshot.slice(-MESSAGE_CAP) : snapshot
+    setState('messages', capped)
     const pending = buffering ?? []
     buffering = null
     for (const event of pending) applyNow(event)
