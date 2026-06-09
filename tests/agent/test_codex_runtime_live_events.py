@@ -63,6 +63,36 @@ def test_failed_command_result_carries_exit_code():
     assert _codex_tool_result(item) == "[exit 2]\nboom"
 
 
+def test_token_usage_updates_session_counters():
+    """thread/tokenUsage/updated must feed the session_* attrs _get_usage
+    reads — codex turns otherwise report zero tokens forever."""
+    agent = SimpleNamespace()
+    _codex_live_event(
+        agent,
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 16568,
+                        "inputTokens": 16547,
+                        "cachedInputTokens": 9600,
+                        "outputTokens": 21,
+                        "reasoningOutputTokens": 5,
+                    }
+                }
+            },
+        },
+    )
+    assert agent.session_total_tokens == 16568
+    assert agent.session_input_tokens == 16547
+    assert agent.session_prompt_tokens == 16547
+    assert agent.session_output_tokens == 21
+    assert agent.session_completion_tokens == 21
+    assert agent.session_cache_read_tokens == 9600
+    assert agent.session_reasoning_tokens == 5
+
+
 def test_non_tool_items_and_junk_are_ignored():
     agent, calls = _recording_agent()
     _codex_live_event(agent, {"method": "item/started", "params": {"item": {"type": "reasoning"}}})

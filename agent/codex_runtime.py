@@ -275,6 +275,20 @@ def _codex_live_event(agent, note: dict) -> None:
             if delta:
                 agent._fire_reasoning_delta(str(delta))
             return
+        if method == "thread/tokenUsage/updated":
+            # Cumulative thread totals → the session_* attrs _get_usage()
+            # reads. Without this every codex turn reports zero tokens and
+            # the desktop statusbar shows 0/<context> forever.
+            usage = (params.get("tokenUsage") or {}).get("total") or {}
+            if usage:
+                agent.session_input_tokens = usage.get("inputTokens", 0) or 0
+                agent.session_prompt_tokens = agent.session_input_tokens
+                agent.session_output_tokens = usage.get("outputTokens", 0) or 0
+                agent.session_completion_tokens = agent.session_output_tokens
+                agent.session_cache_read_tokens = usage.get("cachedInputTokens", 0) or 0
+                agent.session_reasoning_tokens = usage.get("reasoningOutputTokens", 0) or 0
+                agent.session_total_tokens = usage.get("totalTokens", 0) or 0
+            return
         if method in ("item/started", "item/completed"):
             descriptor = _codex_tool_descriptor(params.get("item") or {})
             if descriptor is None:
@@ -400,6 +414,9 @@ def run_codex_app_server_turn(
     # Only _iters_since_skill needs explicit increment, since the
     # chat_completions loop bumps it per tool iteration (line ~12110)
     # and that loop is bypassed on this path.
+    # One app-server turn = one logical API call for the usage readout.
+    agent.session_api_calls = getattr(agent, "session_api_calls", 0) + 1
+
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
