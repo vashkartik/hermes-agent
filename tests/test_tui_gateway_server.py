@@ -1382,6 +1382,66 @@ def test_ws_orphan_reap_disabled_when_grace_zero(monkeypatch):
     assert fired["timer"] is False
 
 
+def test_sess_nowait_rebinds_stdio_parked_session_to_live_ws():
+    """A session-scoped RPC over a live WS reclaims a stdio-parked session.
+
+    After a WS drop parks a session on _stdio_transport (a black hole in
+    dashboard mode), any session-scoped RPC arriving over a new live WS must
+    re-bind the event stream so the rest of the turn reaches the client.
+    """
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    class _LiveTransport:
+        def write(self, *a, **k):
+            return True
+
+    live = _LiveTransport()
+    server._sessions["rebind-sid"] = _session(transport=server._stdio_transport)
+    token = bind_transport(live)
+    try:
+        session, err = server._sess_nowait({"session_id": "rebind-sid"}, 1)
+        assert err is None
+        assert session["transport"] is live
+    finally:
+        reset_transport(token)
+        server._sessions.pop("rebind-sid", None)
+
+
+def test_sess_nowait_does_not_steal_from_live_transport():
+    """A second live client must not hijack another websocket's stream."""
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    class _LiveTransport:
+        def write(self, *a, **k):
+            return True
+
+    owner, intruder = _LiveTransport(), _LiveTransport()
+    server._sessions["owned-sid"] = _session(transport=owner)
+    token = bind_transport(intruder)
+    try:
+        session, err = server._sess_nowait({"session_id": "owned-sid"}, 1)
+        assert err is None
+        assert session["transport"] is owner
+    finally:
+        reset_transport(token)
+        server._sessions.pop("owned-sid", None)
+
+
+def test_sess_nowait_leaves_real_stdio_gateway_untouched():
+    """Ink/stdio gateways dispatch with _stdio_transport — never 'upgrade' there."""
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    server._sessions["stdio-sid"] = _session(transport=server._stdio_transport)
+    token = bind_transport(server._stdio_transport)
+    try:
+        session, err = server._sess_nowait({"session_id": "stdio-sid"}, 1)
+        assert err is None
+        assert session["transport"] is server._stdio_transport
+    finally:
+        reset_transport(token)
+        server._sessions.pop("stdio-sid", None)
+
+
 def test_init_session_fires_reset_hook(monkeypatch):
     hooks = []
 
