@@ -41,6 +41,7 @@ import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '../
 import {
   $activeGatewayProfile,
   $freshSessionRequest,
+  $newChatProfile,
   $profileScope,
   ALL_PROFILES,
   normalizeProfileKey,
@@ -57,6 +58,7 @@ import {
   $workingSessionIds,
   CRON_SECTION_LIMIT,
   getRecentlySettledSessionIds,
+  lastSessionFor,
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
   sessionPinId,
@@ -649,8 +651,10 @@ export function DesktopController() {
     toggleSelectedPin
   })
 
-  // A profile switch/create drops to a fresh new-session draft so the previously
-  // open session doesn't bleed across contexts. Skip the initial value.
+  // A profile switch/create drops the previously open session so it doesn't
+  // bleed across contexts. If the profile we're moving to has a remembered
+  // session, re-open it (so the switch restores that profile's chat); otherwise
+  // start a fresh new-session draft (the welcome screen). Skip the initial value.
   const freshSessionRequest = useStore($freshSessionRequest)
   const lastFreshRef = useRef(freshSessionRequest)
 
@@ -660,8 +664,17 @@ export function DesktopController() {
     }
 
     lastFreshRef.current = freshSessionRequest
+
+    const remembered = lastSessionFor($newChatProfile.get() ?? $activeGatewayProfile.get())
+
+    if (remembered) {
+      navigate(sessionRoute(remembered))
+
+      return
+    }
+
     startFreshSessionDraft()
-  }, [freshSessionRequest, startFreshSessionDraft])
+  }, [freshSessionRequest, navigate, startFreshSessionDraft])
 
   // Swapping the live gateway to another profile must re-pull that profile's
   // global model + active-profile pill. Both are nanostores, so the blanket

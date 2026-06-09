@@ -4,6 +4,7 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { persistString, storedString } from '@/lib/storage'
+import { $activeGatewayProfile, $gatewaySwapTarget, normalizeProfileKey } from '@/store/profile'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
 type Updater<T> = T | ((current: T) => T)
@@ -239,6 +240,31 @@ export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
+
+// ── Per-profile last active session ────────────────────────────────────────
+// Remember which session was open in each profile so switching profiles
+// re-opens that profile's chat instead of dropping to the welcome screen. Keyed
+// by the normalized profile key; a profile with no remembered session restores
+// to null (the welcome screen), preserving the original behavior.
+const LAST_SESSION_KEY_PREFIX = 'hermes:last-session:'
+
+export const lastSessionFor = (profileKey: string): string | null =>
+  storedString(LAST_SESSION_KEY_PREFIX + normalizeProfileKey(profileKey))
+
+// Persist the active session id under the gateway's current profile whenever the
+// user lands in a real session. We only record non-null ids: a transient null
+// (the new-chat draft shown mid profile-switch, before the gateway pointer has
+// moved) would otherwise wipe the profile we're leaving. While a gateway swap is
+// in flight the live profile pointer is ambiguous, so we skip persisting until it
+// settles. The remembered id advances to the newest real session the user opened.
+$activeSessionId.subscribe(sessionId => {
+  if (!sessionId || $gatewaySwapTarget.get()) {
+    return
+  }
+
+  const key = normalizeProfileKey($activeGatewayProfile.get())
+  persistString(LAST_SESSION_KEY_PREFIX + key, sessionId)
+})
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => updateAtom($selectedStoredSessionId, next)
 export const setMessages = (next: Updater<ChatMessage[]>) => updateAtom($messages, next)
 export const setFreshDraftReady = (next: Updater<boolean>) => updateAtom($freshDraftReady, next)
