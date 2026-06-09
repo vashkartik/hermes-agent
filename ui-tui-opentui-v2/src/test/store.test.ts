@@ -177,6 +177,27 @@ describe('session store — ordered parts (Phase 2b)', () => {
     expect(c.mcp.servers).toEqual(['railway', 'beeper']) // non-string dropped
   })
 
+  test('setCatalog leaves the catalog unset on garbage / non-object input (decode → none)', () => {
+    const store = createSessionStore()
+    expect(store.state.catalog).toBeUndefined()
+    store.setCatalog('not an object')
+    expect(store.state.catalog).toBeUndefined()
+    store.setCatalog(null)
+    expect(store.state.catalog).toBeUndefined()
+    store.setCatalog(42)
+    expect(store.state.catalog).toBeUndefined()
+  })
+
+  test('setCatalog accepts a sparse but well-shaped catalog (absent sections default empty)', () => {
+    const store = createSessionStore()
+    store.setCatalog({ tools: { total: 3, toolsets: [{ name: 'core', count: 3, tools: ['a'] }] } })
+    const c = store.state.catalog!
+    expect(c.tools.total).toBe(3)
+    expect(c.tools.toolsets).toEqual([{ name: 'core', count: 3, enabled: true, tools: ['a'] }]) // enabled defaults on
+    expect(c.skills).toEqual({ total: 0, categories: [] }) // absent section → empty
+    expect(c.mcp.servers).toEqual([])
+  })
+
   test('reasoning.delta accumulates into a reasoning part', () => {
     const store = createSessionStore()
     store.apply({ type: 'message.start' })
@@ -302,6 +323,44 @@ describe('session store — session chrome / status bar (item 14)', () => {
     expect(info.branch).toBe('main')
     expect(info.contextPercent).toBe(21)
     expect(info.contextMax).toBe(200000)
+  })
+
+  test('session.info reads context from TOP-LEVEL fields when there is no nested usage', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.info',
+      payload: { model: 'gpt-5.4', context_used: 1000, context_max: 8000, context_percent: 13, compressions: 2 }
+    })
+    const info = store.state.info
+    expect(info.model).toBe('gpt-5.4')
+    expect(info.contextUsed).toBe(1000)
+    expect(info.contextMax).toBe(8000)
+    expect(info.contextPercent).toBe(13)
+    expect(info.compressions).toBe(2)
+  })
+
+  test('session.info prefers nested usage.context_* over the top-level fallback', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.info',
+      payload: { context_percent: 5, usage: { context_percent: 88 } }
+    })
+    expect(store.state.info.contextPercent).toBe(88) // nested wins
+  })
+
+  test('session.info with a malformed payload does NOT crash and leaves chrome untouched (decode → none)', () => {
+    const store = createSessionStore()
+    store.applyInfo({ model: 'opus', cwd: '/p' })
+    // a wrong-typed field (model: number) fails the schema → empty patch, prior info survives
+    store.apply({ type: 'session.info', payload: { model: 123, usage: 'nope' } })
+    expect(store.state.info).toMatchObject({ model: 'opus', cwd: '/p' })
+  })
+
+  test('session.info with a partial payload only patches the present fields', () => {
+    const store = createSessionStore()
+    store.applyInfo({ model: 'opus', branch: 'main', running: true })
+    store.apply({ type: 'session.info', payload: { branch: 'dev' } }) // only branch present
+    expect(store.state.info).toMatchObject({ model: 'opus', branch: 'dev', running: true })
   })
 
   test('message.start sets running, message.complete clears it + refreshes usage', () => {

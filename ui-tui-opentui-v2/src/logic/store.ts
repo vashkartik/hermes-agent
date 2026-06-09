@@ -11,9 +11,16 @@
  * User/system rows stay flat `text` (no parts). Carried from Phase 1: streaming
  * concat (prefer `payload.text`), skin→theme, LRU dedup, hydrate-while-buffering.
  */
+import { Option } from 'effect'
 import { createStore, produce } from 'solid-js/store'
 
 import type { GatewayEvent, GatewaySkinDecoded } from '../boundary/schema/GatewayEvent.ts'
+import {
+  decodeCatalog,
+  decodeSessionInfoPatch,
+  type CatalogDecoded,
+  type SessionInfoPatchDecoded
+} from '../boundary/schema/SessionInfo.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
 import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
 
@@ -205,43 +212,70 @@ function readOptNum(payload: { readonly [k: string]: unknown }, key: string): nu
   return typeof v === 'number' ? v : undefined
 }
 
-/** Read a boolean field (undefined when absent). */
-function readOptBool(payload: { readonly [k: string]: unknown }, key: string): boolean | undefined {
-  const v = payload[key]
-  return typeof v === 'boolean' ? v : undefined
-}
-
 /**
- * Fold a `session.info` / `session.create.info` / `session.usage` payload into a
- * partial SessionInfo, reading context/usage fields from either a nested `usage`
- * object or the top level (the gateway shapes vary by RPC vs event — §gateway map).
+ * Fold a `session.info` / `session.create.info` payload into a partial SessionInfo.
+ * The loose wire JSON is decoded ONCE via `SessionInfoPatchSchema` (decode-at-
+ * boundary); context/usage numbers are read from the nested `usage` object first,
+ * falling back to the top level (the gateway shapes vary by RPC vs event). A
+ * malformed payload decodes to `Option.none` → an empty patch (never crashes).
+ * Only present fields are included so a partial patch can't clobber prior chrome.
  */
 function readInfoPatch(payload: { readonly [k: string]: unknown }): Partial<SessionInfo> {
-  const usageRaw = payload['usage']
-  const usage: { readonly [k: string]: unknown } =
-    usageRaw && typeof usageRaw === 'object' ? (usageRaw as { readonly [k: string]: unknown }) : {}
+  const decoded = decodeSessionInfoPatch(payload)
+  if (Option.isNone(decoded)) return {}
+  return infoPatchFrom(decoded.value)
+}
+
+/** Build the SessionInfo patch from a decoded session.info payload. */
+function infoPatchFrom(d: SessionInfoPatchDecoded): Partial<SessionInfo> {
   const patch: Partial<SessionInfo> = {}
-  const model = readStr(payload, 'model')
-  if (model) patch.model = model
-  const effort = readStr(payload, 'reasoning_effort')
-  if (effort) patch.effort = effort
-  const fast = readOptBool(payload, 'fast')
-  if (fast !== undefined) patch.fast = fast
-  const cwd = readStr(payload, 'cwd')
-  if (cwd) patch.cwd = cwd
-  const branch = readStr(payload, 'branch')
-  if (branch) patch.branch = branch
-  const running = readOptBool(payload, 'running')
-  if (running !== undefined) patch.running = running
-  const used = readOptNum(usage, 'context_used') ?? readOptNum(payload, 'context_used')
+  if (d.model) patch.model = d.model
+  if (d.reasoning_effort) patch.effort = d.reasoning_effort
+  if (d.fast !== undefined) patch.fast = d.fast
+  if (d.cwd) patch.cwd = d.cwd
+  if (d.branch) patch.branch = d.branch
+  if (d.running !== undefined) patch.running = d.running
+  // prefer the nested usage.context_* numbers, else the top-level fallback.
+  const used = d.usage?.context_used ?? d.context_used
   if (used !== undefined) patch.contextUsed = used
-  const max = readOptNum(usage, 'context_max') ?? readOptNum(payload, 'context_max')
+  const max = d.usage?.context_max ?? d.context_max
   if (max !== undefined) patch.contextMax = max
-  const pct = readOptNum(usage, 'context_percent') ?? readOptNum(payload, 'context_percent')
+  const pct = d.usage?.context_percent ?? d.context_percent
   if (pct !== undefined) patch.contextPercent = pct
-  const comp = readOptNum(usage, 'compressions') ?? readOptNum(payload, 'compressions')
+  const comp = d.usage?.compressions ?? d.compressions
   if (comp !== undefined) patch.compressions = comp
   return patch
+}
+
+/** Keep only the string elements of a decoded (unknown-element) array. */
+function onlyStrings(items: ReadonlyArray<unknown> | undefined): string[] {
+  return (items ?? []).filter((s): s is string => typeof s === 'string')
+}
+
+/** Build the typed Catalog from a decoded startup.catalog result (item 9). An
+ *  absent `enabled` flag means on; nameless toolsets/categories are dropped and
+ *  non-string tool/server names are filtered (defensive — wire arrays are loose). */
+function catalogFrom(d: CatalogDecoded): Catalog {
+  return {
+    mcp: { servers: onlyStrings(d.mcp?.servers) },
+    skills: {
+      total: d.skills?.total ?? 0,
+      categories: (d.skills?.categories ?? [])
+        .map(c => ({ count: c.count ?? 0, name: c.name ?? '' }))
+        .filter(c => c.name)
+    },
+    tools: {
+      total: d.tools?.total ?? 0,
+      toolsets: (d.tools?.toolsets ?? [])
+        .map(t => ({
+          count: t.count ?? 0,
+          enabled: t.enabled !== false,
+          name: t.name ?? '',
+          tools: onlyStrings(t.tools)
+        }))
+        .filter(t => t.name)
+    }
+  }
 }
 
 /** The subagent status implied by an event type (an explicit payload `status` wins). */
@@ -760,41 +794,15 @@ export function createSessionStore() {
     commitSnapshot(loadSnapshot())
   }
 
-  /** Map the loose `startup.catalog` response into the typed Catalog (item 9). */
+  /**
+   * Map the loose `startup.catalog` response into the typed Catalog (item 9).
+   * Decoded ONCE via `CatalogSchema` (decode-at-boundary); garbage decodes to
+   * `Option.none` → the catalog is left unset rather than crashing the panel.
+   */
   function setCatalog(raw: unknown): void {
-    if (!raw || typeof raw !== 'object') return
-    const root = raw as { readonly [k: string]: unknown }
-    const obj = (v: unknown): { readonly [k: string]: unknown } =>
-      v && typeof v === 'object' ? (v as { readonly [k: string]: unknown }) : {}
-    const num = (v: unknown): number => (typeof v === 'number' ? v : 0)
-    const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
-    const strs = (v: unknown): string[] => list(v).filter((s): s is string => typeof s === 'string')
-    const pair = (v: unknown) => {
-      const o = obj(v)
-      return { count: num(o.count), name: readStr(o, 'name') ?? '' }
-    }
-    const toolset = (v: unknown) => {
-      const o = obj(v)
-      return { count: num(o.count), enabled: o.enabled !== false, name: readStr(o, 'name') ?? '', tools: strs(o.tools) }
-    }
-    const tools = obj(root.tools)
-    const skills = obj(root.skills)
-    const mcp = obj(root.mcp)
-    setState('catalog', {
-      mcp: { servers: strs(mcp.servers) },
-      skills: {
-        categories: list(skills.categories)
-          .map(pair)
-          .filter(p => p.name),
-        total: num(skills.total)
-      },
-      tools: {
-        toolsets: list(tools.toolsets)
-          .map(toolset)
-          .filter(p => p.name),
-        total: num(tools.total)
-      }
-    })
+    const decoded = decodeCatalog(raw)
+    if (Option.isNone(decoded)) return
+    setState('catalog', catalogFrom(decoded.value))
   }
 
   function setSessionId(sid: string | undefined): void {
