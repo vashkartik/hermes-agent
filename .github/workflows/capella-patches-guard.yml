@@ -25,3 +25,19 @@ jobs:
         run: npm ci
       - name: Build desktop renderer
         run: cd apps/desktop && npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install python package
+        run: pip install -e . pytest pytest-asyncio pytest-timeout
+      - name: Gateway + codex-runtime patch regression tests
+        # The string markers in the patch guard prove the patches EXIST;
+        # these prove they still WORK after an upstream rebase: stdio
+        # black-hole re-bind, turn-end transcript persistence, and the
+        # codex live-event bridge (streaming/reasoning/tool events).
+        run: |
+          python -m pytest -q \
+            tests/test_tui_gateway_server.py \
+            tests/agent/test_codex_runtime_live_events.py \
+            tests/agent/transports/test_codex_event_projector.py \
+            --deselect tests/test_tui_gateway_server.py::test_browser_manage_connect_default_local_reports_launch_hint
