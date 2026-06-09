@@ -24,7 +24,13 @@ check() { # <file> <marker> <description>
 echo "Capella patch guard — verifying our fork patches survived:"
 check "$DESK/src/components/chat/intro.tsx"      "HERO_EMOJI_BY_KEY"  "hero: per-agent emoji + name (King/Rook)"
 check "$DESK/src/store/session.ts"               "hermes:last-session:" "persistence: last session per profile"
+check "$DESK/src/store/session.ts"               'selectedStoredSessionId.subscribe' "persistence: last-session stores STORED ids (not runtime ids)"
 check "$DESK/src/app/desktop-controller.tsx"     "lastSessionFor"     "persistence: restore chat on profile switch"
+check "$DESK/src/app/session/hooks/use-route-resume.ts" "needsReattach" "gateway client: re-attach session stream on every fresh socket"
+check "$ROOT/tui_gateway/server.py"              "_rebind_ws_transport" "gateway: stdio black-hole re-bind on session-scoped RPC"
+check "$ROOT/tui_gateway/server.py"              "_persist_session_history" "gateway: turn-end transcript persistence"
+check "$ROOT/agent/codex_runtime.py"             "run_conversation already appended the user message" "codex runtime: no duplicate user echo in spliced transcript"
+check "$ROOT/scripts/install.sh"                 "HERMES_REPO_URL"    "install: pinned-fork repo override for embedders"
 [ -f "$DESK/CAPELLA_FORK.md" ] && echo "  ok   fork doc (CAPELLA_FORK.md)" || { echo "  MISS CAPELLA_FORK.md"; fail=1; }
 
 # Gateway patch — best-effort: only checks when upstream is fetched locally.

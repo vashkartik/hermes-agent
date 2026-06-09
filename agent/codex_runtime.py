@@ -256,7 +256,20 @@ def run_codex_app_server_turn(
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
     if turn.projected_messages:
-        messages.extend(turn.projected_messages)
+        projected = list(turn.projected_messages)
+        # Codex echoes the submitted input back as its own userMessage event,
+        # but run_conversation already appended the user message before
+        # handing us the turn — splicing both stores every user message
+        # twice, which shows up as doubled user bubbles in any persisted /
+        # resumed transcript.
+        if (
+            projected
+            and isinstance(projected[0], dict)
+            and projected[0].get("role") == "user"
+            and projected[0].get("content") == user_message
+        ):
+            projected = projected[1:]
+        messages.extend(projected)
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented

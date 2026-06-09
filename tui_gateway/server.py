@@ -1235,6 +1235,33 @@ def _session_db(session: dict):
                 db.close()
 
 
+def _persist_session_history(session: dict, history: list) -> None:
+    """Write the session's transcript to its state.db at turn end.
+
+    Until now a finished turn lived only in this process's memory; the next
+    prompt.submit (or a /retry-style rewrite) was the first thing to persist
+    it. Any backend restart between turns — desktop profile switch, sidecar
+    respawn, crash — therefore lost every completed exchange: the session row
+    existed (and got a generated title) but message_count stayed 0 and a
+    resume painted an empty transcript. Rides :func:`_session_db` for the
+    profile-home routing so global-remote-mode sessions persist into their
+    own profile's state.db.
+    """
+    key = session.get("session_key")
+    if not key:
+        return
+    with _session_db(session) as db:
+        if db is None:
+            return
+        try:
+            db.replace_messages(key, history)
+        except Exception as exc:
+            print(
+                f"[tui_gateway] turn-end history persist failed: {exc}",
+                file=sys.stderr,
+            )
+
+
 def _set_session_cwd(session: dict, cwd: str) -> str:
     resolved = os.path.abspath(os.path.expanduser(str(cwd)))
     if not os.path.isdir(resolved):
@@ -5705,6 +5732,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             last_reasoning = None
             status_note = None
+            turn_history = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
                     with session["history_lock"]:
@@ -5712,6 +5740,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            turn_history = list(result["messages"])
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -5741,6 +5770,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 _sync_session_key_after_compress(
                     sid, session, clear_pending_title=False, restart_slash_worker=True,
                 )
+
+                # Durable transcript: persist the finished turn NOW (after any
+                # compression key rotation) instead of waiting for the next
+                # prompt.submit — a backend restart between turns must not
+                # erase a completed exchange.
+                if turn_history is not None:
+                    _persist_session_history(session, turn_history)
 
                 raw = result.get("final_response", "")
                 status = (
