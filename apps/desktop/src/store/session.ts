@@ -146,13 +146,16 @@ const LAST_SESSION_KEY_PREFIX = 'hermes:last-session:'
 export const lastSessionFor = (profileKey: string): string | null =>
   storedString(LAST_SESSION_KEY_PREFIX + normalizeProfileKey(profileKey))
 
-// Persist the active session id under the gateway's current profile whenever the
-// user lands in a real session. We only record non-null ids: a transient null
-// (the new-chat draft shown mid profile-switch, before the gateway pointer has
-// moved) would otherwise wipe the profile we're leaving. While a gateway swap is
-// in flight the live profile pointer is ambiguous, so we skip persisting until it
-// settles. The remembered id advances to the newest real session the user opened.
-$activeSessionId.subscribe(sessionId => {
+// Persist the STORED session id under the gateway's current profile whenever the
+// user lands in a real session. The restore path navigates sessionRoute(<id>) and
+// session.resume expects a stored DB id — the runtime id in $activeSessionId is a
+// different id class and resolves to 4007 "session not found" on restore. We only
+// record non-null ids: a transient null (the new-chat draft shown mid
+// profile-switch, before the gateway pointer has moved) would otherwise wipe the
+// profile we're leaving. While a gateway swap is in flight the live profile
+// pointer is ambiguous, so we skip persisting until it settles. The remembered id
+// advances to the newest real session the user opened.
+$selectedStoredSessionId.subscribe(sessionId => {
   if (!sessionId || $gatewaySwapTarget.get()) {
     return
   }

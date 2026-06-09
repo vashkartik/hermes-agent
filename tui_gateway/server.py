@@ -770,8 +770,32 @@ def _start_agent_build(sid: str, session: dict) -> None:
     threading.Thread(target=_build, daemon=True).start()
 
 
+def _rebind_ws_transport(session: dict | None) -> None:
+    """Upgrade a stdio-parked session to the calling WS transport.
+
+    When a websocket drops mid-turn, ``handle_ws`` points every session it
+    owned at ``_stdio_transport`` — in dashboard mode a black hole with no
+    reader, so the rest of the turn (deltas, message.complete) vanishes.
+    Any session-scoped RPC arriving over a live WS proves the rightful
+    client is back, so re-bind the stream to it. Only sessions parked on
+    the stdio transport are upgraded: a second live client cannot hijack
+    another websocket's stream, and real stdio gateways (Ink TUI, where
+    stdio has a genuine peer) dispatch with ``_stdio_transport`` as the
+    current transport and are left untouched.
+    """
+    if not session:
+        return
+    t = current_transport()
+    if t is None or t is _stdio_transport:
+        return
+    if session.get("transport") is _stdio_transport:
+        session["transport"] = t
+
+
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
+    if s is not None:
+        _rebind_ws_transport(s)
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
@@ -3537,7 +3561,15 @@ def _(rid, params: dict) -> dict:
 
     return _ok(
         rid,
-        _live_session_payload(sid, session, touch=True),
+        # Attaching the frontend must also claim the event stream — mirror
+        # session.resume so a WS activate re-binds a detached session instead
+        # of leaving its turn events on whatever transport last held it.
+        _live_session_payload(
+            sid,
+            session,
+            touch=True,
+            transport=current_transport() or _stdio_transport,
+        ),
     )
 
 

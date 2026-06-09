@@ -82,7 +82,14 @@ export function useRouteResume({
       // before the pathname updates from /:sid -> /.
       const shouldResume = pathnameChanged || gatewayBecameOpen
 
-      if (!alreadyActive && shouldResume && !creatingSessionRef.current) {
+      // "alreadyActive" only describes client state. When the gateway socket
+      // was replaced, the server has already detached this session onto its
+      // stdio fallback (a black hole in desktop mode), so skipping the resume
+      // here would leave every later turn event undeliverable. A fresh socket
+      // always needs an explicit session.resume to re-bind the event stream.
+      const needsReattach = gatewayBecameOpen || !alreadyActive
+
+      if (needsReattach && shouldResume && !creatingSessionRef.current) {
         void resumeSession(routedSessionId, true)
       }
 
