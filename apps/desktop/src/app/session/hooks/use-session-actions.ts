@@ -612,7 +612,24 @@ export function useSessionActions({
 
       try {
         const watchWindow = isWatchWindow()
+        // Load the local snapshot first, then ask the gateway to resume.
+        // Previously these raced:
+        //   1. clear messages to []
+        //   2. local getSessionMessages -> 45 msgs
+        //   3. a second resume path cleared [] again
+        //   4. gateway resume -> 43 msgs
+        // That is the ctrl+R flash chain. Avoid showing an empty thread
+        // while we already have a route-scoped session id, and don't race the
+        // local snapshot against gateway resume.
+        //
+        // The snapshot starts as the previous session's view only to keep the
+        // paint stable; it must never WIN over gateway messages unless it was
+        // actually fetched for THIS session — otherwise a failed
+        // getSessionMessages() left the prior session's transcript on screen
+        // under the new session's title (every chat looked like the newest
+        // one).
         let localSnapshot = $messages.get()
+        let localSnapshotIsForTarget = false
 
         try {
           // Watch windows skip REST prefetch — lazy resume attaches the live mirror.
@@ -621,6 +638,7 @@ export function useSessionActions({
 
             if (isCurrentResume()) {
               localSnapshot = preserveLocalAssistantErrors(toChatMessages(storedMessages.messages), $messages.get())
+              localSnapshotIsForTarget = true
 
               if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
                 setMessages(localSnapshot)
@@ -650,7 +668,7 @@ export function useSessionActions({
         )
         // Keep the local snapshot when resume would only reshuffle runtime projection.
         const preferredMessages =
-          localSnapshot.length > 0
+          localSnapshotIsForTarget && localSnapshot.length > 0
             ? localSnapshot
             : chatMessageArraysEquivalent(currentMessages, resumedMessages)
               ? currentMessages
