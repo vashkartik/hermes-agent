@@ -26,7 +26,9 @@ check "$DESK/src/components/chat/intro.tsx"      "HERO_EMOJI_BY_KEY"  "hero: per
 check "$DESK/src/store/session.ts"               "hermes:last-session:" "persistence: last session per profile"
 check "$DESK/src/store/session.ts"               'selectedStoredSessionId.subscribe' "persistence: last-session stores STORED ids (not runtime ids)"
 check "$DESK/src/app/desktop-controller.tsx"     "lastSessionFor"     "persistence: restore chat on profile switch"
-check "$DESK/src/app/session/hooks/use-route-resume.ts" "needsReattach" "gateway client: re-attach session stream on every fresh socket"
+# Upstream absorbed our needsReattach patch as an inline gate (with their own
+# stuckOnRoutedSession improvement); guard the behavior, not our old variable.
+check "$DESK/src/app/session/hooks/use-route-resume.ts" "gatewayBecameOpen || !alreadyActive" "gateway client: re-attach session stream on every fresh socket"
 check "$ROOT/tui_gateway/server.py"              "_rebind_ws_transport" "gateway: stdio black-hole re-bind on session-scoped RPC"
 check "$ROOT/tui_gateway/server.py"              "_persist_session_history" "gateway: turn-end transcript persistence"
 check "$ROOT/agent/codex_runtime.py"             "run_conversation already appended the user message" "codex runtime: no duplicate user echo in spliced transcript"
