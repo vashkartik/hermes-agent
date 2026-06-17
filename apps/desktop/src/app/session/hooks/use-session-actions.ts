@@ -4,7 +4,14 @@ import type { NavigateFunction } from 'react-router-dom'
 
 import { deleteSession, getSessionMessages, listAllProfileSessions, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import {
+  assistantTextPart,
+  type ChatMessage,
+  chatMessageText,
+  preserveLocalAssistantErrors,
+  textPart,
+  toChatMessages
+} from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -676,22 +683,61 @@ export function useSessionActions({
 
         const messagesForView = preserveLocalAssistantErrors(preferredMessages, currentMessages)
 
+        // A turn still streaming when the client dropped keeps running on the
+        // gateway, which accumulates the in-progress prompt + partial answer
+        // server-side. On resume that snapshot comes back as `inflight` — seed it
+        // (keyed by streamId) so a reconnect mid-run shows the work instead of a
+        // blank tail, and so live deltas append to the same bubble. The bubble is
+        // finalized with the full text on message.complete (which targets
+        // streamId), and the gateway clears `inflight` once the turn ends.
+        const inflight = resumed.inflight
+        let inflightStreamId: null | string = null
+        let messagesWithInflight = messagesForView
+
+        if (inflight?.streaming) {
+          const additions: ChatMessage[] = []
+          const inflightUser = (inflight.user ?? '').trim()
+
+          if (inflightUser) {
+            const lastUser = [...messagesForView].reverse().find(message => message.role === 'user')
+
+            if (!lastUser || chatMessageText(lastUser).trim() !== inflightUser) {
+              additions.push({
+                id: `user-inflight-${storedSessionId}`,
+                role: 'user',
+                parts: [textPart(inflightUser)]
+              })
+            }
+          }
+
+          inflightStreamId = `assistant-stream-${storedSessionId}`
+          additions.push({
+            id: inflightStreamId,
+            role: 'assistant',
+            parts: inflight.assistant ? [assistantTextPart(inflight.assistant)] : [],
+            pending: true
+          })
+
+          messagesWithInflight = [...messagesForView, ...additions]
+        }
+
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
-        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+        resumedRunning = Boolean(resumed.running) || Boolean(inflight?.streaming)
 
         updateSessionState(
           resumed.session_id,
           state => ({
             ...state,
             ...(runtimeInfo ?? {}),
-            messages: messagesForView,
+            messages: messagesWithInflight,
             busy: resumedRunning,
-            awaitingResponse: resumedRunning
+            awaitingResponse: resumedRunning,
+            ...(inflightStreamId ? { streamId: inflightStreamId } : {})
           }),
           storedSessionId
         )

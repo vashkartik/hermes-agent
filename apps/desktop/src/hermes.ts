@@ -113,6 +113,10 @@ export class HermesGateway extends JsonRpcGatewayClient {
       closedErrorMessage: 'Hermes gateway connection closed',
       connectErrorMessage: 'Could not connect to Hermes gateway',
       createRequestId: nextId => nextId,
+      // Detect zombie sockets (iOS suspends a backgrounded PWA's WS without
+      // firing 'close') so the boot hook reconnects instead of sitting on a
+      // dead pipe after the phone wakes.
+      heartbeatIntervalMs: 25_000,
       notConnectedErrorMessage: 'Hermes gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })

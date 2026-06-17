@@ -3732,6 +3732,22 @@ def _inflight_snapshot(session: dict) -> dict | None:
     }
 
 
+# ── Methods: gateway ─────────────────────────────────────────────────
+
+
+@method("gateway.ping")
+def _(rid, params: dict) -> dict:
+    """Liveness probe for the renderer's WebSocket heartbeat.
+
+    iOS suspends a backgrounded PWA's WebSocket without firing ``onclose``,
+    leaving a zombie socket that still reads ``readyState === OPEN``. The client
+    pings this method and, when the reply times out, drops the dead socket and
+    reconnects against a fresh one. Intentionally trivial and side-effect free
+    so it stays cheap at the heartbeat cadence.
+    """
+    return _ok(rid, {"ok": True})
+
+
 # ── Methods: session ─────────────────────────────────────────────────
 
 

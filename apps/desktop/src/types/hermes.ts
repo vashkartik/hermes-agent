@@ -336,10 +336,22 @@ export interface SessionMessagesResponse {
 
 export interface SessionResumeResponse {
   info?: SessionRuntimeInfo
+  // A turn still streaming when the client dropped keeps running on the gateway,
+  // which accumulates its text server-side. On resume that in-progress turn is
+  // returned here so a reconnect mid-run renders the partial answer instead of a
+  // blank tail. Absent once the turn completes (history then carries it).
+  inflight?: SessionInflightSnapshot
   message_count: number
   messages: SessionMessage[]
   resumed: string
+  running?: boolean
   session_id: string
+}
+
+export interface SessionInflightSnapshot {
+  assistant?: string
+  streaming?: boolean
+  user?: string
 }
 
 export interface SessionRuntimeInfo {

@@ -190,7 +190,7 @@ export function useGatewayBoot({
       }, delay)
     }
 
-    const reconnectNow = () => {
+    const reconnectNow = async () => {
       if (cancelled || !bootCompleted) {
         return
       }
@@ -198,6 +198,19 @@ export function useGatewayBoot({
       clearReconnectTimer()
       reconnectAttempt = 0
       reconnectSecondaryGateways()
+
+      // A wake signal can fire while the socket still *reads* open but is a
+      // zombie — iOS suspends a backgrounded PWA's WebSocket without firing
+      // 'close', so readyState stays OPEN on a dead pipe and gatewayOpen() lies.
+      // Probe liveness before trusting it; a failed probe force-closes the dead
+      // socket so the reconnect below replaces it instead of sitting on silence.
+      if (gatewayOpen()) {
+        const alive = await gateway.checkLiveness()
+
+        if (cancelled || alive) {
+          return
+        }
+      }
 
       if (!gatewayOpen()) {
         void attemptReconnect()
@@ -251,13 +264,13 @@ export function useGatewayBoot({
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
     // window regaining focus/visibility. Each nudges an immediate reconnect.
-    const offPowerResume = desktop.onPowerResume?.(() => reconnectNow())
+    const offPowerResume = desktop.onPowerResume?.(() => void reconnectNow())
 
-    const onOnline = () => reconnectNow()
+    const onOnline = () => void reconnectNow()
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
-        reconnectNow()
+        void reconnectNow()
       }
     }
 
