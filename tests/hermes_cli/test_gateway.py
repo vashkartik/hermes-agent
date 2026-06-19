@@ -808,7 +808,7 @@ def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkey
     monkeypatch.setattr(gateway.os, "listdir", _no_proc_listdir)
 
     def fake_run(cmd, **kwargs):
-        if cmd[:4] == ["ps", "-A", "eww", "-o"]:
+        if cmd[:4] in (["ps", "-A", "eww", "-o"], ["ps", "-AEww", "-o", "pid=,command="]):
             return SimpleNamespace(returncode=1, stdout="", stderr="ps failed")
         if cmd[:3] == ["ps", "-o", "ppid="]:
             # _get_ancestor_pids() walks up the tree; return "no parent" so
