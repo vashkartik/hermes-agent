@@ -32,6 +32,7 @@ import {
   clearComposerAttachments,
   type ComposerAttachment,
   setComposerAttachmentUploadState,
+  setComposerDraft,
   terminalContextBlocksFromDraft,
   updateComposerAttachment
 } from '@/store/composer'
@@ -58,6 +59,7 @@ import { clearSessionTodos } from '@/store/todos'
 
 import type {
   ClientSessionState,
+  BrowserManageResponse,
   FileAttachResponse,
   HandoffFailResponse,
   HandoffRequestResponse,
@@ -118,14 +120,23 @@ function isSessionNotFoundError(error: unknown): boolean {
 }
 
 // The gateway refuses prompt.submit while a turn is running (4009 "session
-// busy"). Edit/restore (revert) can fire mid-turn, so they interrupt first then
-// retry the submit until the cooperative interrupt has wound the turn down.
+// busy"). It's a transient concurrency guard, never a user-facing error: a
+// submit racing the settle edge (or a rewind interrupting mid-turn) just waits
+// a beat for the turn to wind down, then lands. Bounded so a genuinely stuck
+// turn still surfaces eventually.
+const SESSION_BUSY_RETRY_TIMEOUT_MS = 6_000
+const SESSION_BUSY_RETRY_INTERVAL_MS = 150
+
+// Edit/restore (revert) can fire mid-turn, so they interrupt first then retry
+// the submit until the cooperative interrupt has wound the turn down.
 const REWIND_INTERRUPT_TIMEOUT_MS = 6_000
 const REWIND_RETRY_INTERVAL_MS = 150
-// A plain send that races a still-running turn comes back "session busy". We
-// recover by steering the text into the live turn; if there's no live tool
-// window to steer into (between iterations), we re-submit on this deadline so
-// the message lands as the next turn instead of dead-ending on an error.
+
+// A plain send that races a still-running turn comes back "session busy" after
+// the short generic retry window. Recover by steering the text into the live
+// turn; if there's no live tool window to steer into (between iterations),
+// re-submit on this deadline so the message lands as the next turn instead of
+// dead-ending on an error.
 const SUBMIT_BUSY_RETRY_DEADLINE_MS = 6_000
 const SUBMIT_BUSY_RETRY_INTERVAL_MS = 200
 
@@ -134,6 +145,26 @@ function isSessionBusyError(error: unknown): boolean {
 }
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+
+// Retry a gateway call across transient "session busy" so it never reaches the
+// user — the turn settles within the deadline and the call lands.
+async function withSessionBusyRetry<T>(call: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + SESSION_BUSY_RETRY_TIMEOUT_MS
+
+  for (;;) {
+    try {
+      return await call()
+    } catch (err) {
+      if (isSessionBusyError(err) && Date.now() < deadline) {
+        await sleep(SESSION_BUSY_RETRY_INTERVAL_MS)
+
+        continue
+      }
+
+      throw err
+    }
+  }
+}
 
 function base64FromDataUrl(dataUrl: string): string {
   const comma = dataUrl.indexOf(',')
@@ -689,7 +720,7 @@ export function usePromptActions({
         let submitErr: unknown = null
 
         try {
-          await requestGateway('prompt.submit', { session_id: sessionId, text })
+          await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: sessionId, text }))
         } catch (firstErr) {
           if (isSessionNotFoundError(firstErr) && selectedStoredSessionIdRef.current) {
             // Re-register the session in the gateway and get a fresh live ID.
@@ -701,7 +732,7 @@ export function usePromptActions({
 
             if (recoveredId) {
               activeSessionIdRef.current = recoveredId
-              await requestGateway('prompt.submit', { session_id: recoveredId, text })
+              await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: recoveredId, text }))
             } else {
               submitErr = firstErr
             }
@@ -780,9 +811,17 @@ export function usePromptActions({
 
         return true
       } catch (err) {
+        releaseBusy()
+
+        // A queued drain that raced a not-yet-settled turn gets a transient
+        // "session busy" (4009). Don't surface an error bubble/toast — the entry
+        // stays queued and the composer's bounded auto-drain retries when idle.
+        if (options?.fromQueue && isSessionBusyError(err)) {
+          return false
+        }
+
         const message = inlineErrorMessage(err, copy.promptFailed)
 
-        releaseBusy()
         updateSessionState(sessionId, state => ({
           ...state,
           messages: [
@@ -988,7 +1027,25 @@ export function usePromptActions({
             return
           }
 
+          // send / prefill carry an optional `notice` (e.g. "⊙ Goal set …")
+          // that the backend wants shown as a system line before the message
+          // is acted on. Mirrors the TUI's createSlashHandler — without it a
+          // `/goal <text>` looked like it did nothing.
+          if ((dispatch.type === 'send' || dispatch.type === 'prefill') && dispatch.notice?.trim()) {
+            renderSlashOutput(dispatch.notice.trim())
+          }
+
           const message = ('message' in dispatch ? dispatch.message : '')?.trim() ?? ''
+
+          // /undo returns a prefill directive: drop the backed-up message into
+          // the composer for editing instead of submitting it immediately.
+          if (dispatch.type === 'prefill') {
+            if (message) {
+              setComposerDraft(message)
+            }
+
+            return
+          }
 
           if (!message) {
             renderSlashOutput(
@@ -1176,6 +1233,81 @@ export function usePromptActions({
             const catalog = await requestGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })
 
             renderSlashOutput(renderCommandsCatalog(catalog, copy))
+          } catch (err) {
+            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+          }
+        },
+        // /browser connect|disconnect|status manages the live CDP connection on
+        // the gateway host, mirroring the TUI's browser.manage RPC. It mutates
+        // BROWSER_CDP_URL (and may launch Chrome) in the gateway process — only
+        // meaningful when that process runs on this machine, so it's gated to
+        // local connections. A remote gateway would act on the wrong host.
+        browser: async ctx => {
+          const resolved = await withSlashOutput(ctx)
+
+          if (!resolved) {
+            return
+          }
+
+          const { render: renderSlashOutput, sessionId } = resolved
+
+          if ($connection.get()?.mode === 'remote') {
+            renderSlashOutput(
+              '/browser manages a Chromium-family browser on the gateway host — only available when connected to a local gateway.'
+            )
+
+            return
+          }
+
+          const [rawAction = 'status', ...rest] = ctx.arg.trim().split(/\s+/).filter(Boolean)
+          const cmdAction = rawAction.toLowerCase()
+
+          if (!['connect', 'disconnect', 'status'].includes(cmdAction)) {
+            renderSlashOutput(
+              'usage: /browser [connect|disconnect|status] [url] · persistent: set browser.cdp_url in config.yaml'
+            )
+
+            return
+          }
+
+          const url = cmdAction === 'connect' ? rest.join(' ').trim() || 'http://127.0.0.1:9222' : undefined
+
+          if (url) {
+            renderSlashOutput(`checking Chromium-family browser remote debugging at ${url}...`)
+          }
+
+          try {
+            const result = await requestGateway<BrowserManageResponse>('browser.manage', {
+              action: cmdAction,
+              session_id: sessionId,
+              ...(url && { url })
+            })
+
+            // Without a streamed session subscription, the gateway bundles its
+            // progress lines into `messages` — flush them inline.
+            result?.messages?.forEach(message => renderSlashOutput(message))
+
+            if (cmdAction === 'status') {
+              renderSlashOutput(
+                result?.connected
+                  ? `browser connected: ${result.url || '(url unavailable)'}`
+                  : 'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)'
+              )
+
+              return
+            }
+
+            if (cmdAction === 'disconnect') {
+              renderSlashOutput('browser disconnected')
+
+              return
+            }
+
+            if (result?.connected) {
+              renderSlashOutput('Browser connected to live Chromium-family browser via CDP')
+              renderSlashOutput(`Endpoint: ${result.url || '(url unavailable)'}`)
+              renderSlashOutput('next browser tool call will use this CDP endpoint')
+            }
           } catch (err) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
@@ -1520,9 +1652,8 @@ export function usePromptActions({
   // text is submitted as a fresh turn. Callers confirm before invoking; errors
   // are rethrown so the confirmation dialog can surface them inline.
   // Submit a rewind (truncate-before-ordinal + resubmit). Because edit/restore
-  // can fire while a turn is streaming, interrupt the live turn first, then
-  // retry the submit until the gateway stops reporting "session busy" — the
-  // interrupt is cooperative, so the running turn takes a beat to wind down.
+  // can fire while a turn is streaming, interrupt the live turn first — the
+  // cooperative interrupt takes a beat, so the shared busy-retry rides it out.
   const submitRewindPrompt = useCallback(
     async (sessionId: string, text: string, truncateOrdinal: number | undefined, wasRunning: boolean) => {
       if (wasRunning) {
@@ -1533,27 +1664,13 @@ export function usePromptActions({
         }
       }
 
-      const deadline = Date.now() + REWIND_INTERRUPT_TIMEOUT_MS
-
-      for (;;) {
-        try {
-          await requestGateway('prompt.submit', {
-            session_id: sessionId,
-            text,
-            ...(truncateOrdinal !== undefined && { truncate_before_user_ordinal: truncateOrdinal })
-          })
-
-          return
-        } catch (err) {
-          if (isSessionBusyError(err) && Date.now() < deadline) {
-            await sleep(REWIND_RETRY_INTERVAL_MS)
-
-            continue
-          }
-
-          throw err
-        }
-      }
+      await withSessionBusyRetry(() =>
+        requestGateway('prompt.submit', {
+          session_id: sessionId,
+          text,
+          ...(truncateOrdinal !== undefined && { truncate_before_user_ordinal: truncateOrdinal })
+        })
+      )
     },
     [requestGateway]
   )
