@@ -122,6 +122,12 @@ function isSessionNotFoundError(error: unknown): boolean {
 // retry the submit until the cooperative interrupt has wound the turn down.
 const REWIND_INTERRUPT_TIMEOUT_MS = 6_000
 const REWIND_RETRY_INTERVAL_MS = 150
+// A plain send that races a still-running turn comes back "session busy". We
+// recover by steering the text into the live turn; if there's no live tool
+// window to steer into (between iterations), we re-submit on this deadline so
+// the message lands as the next turn instead of dead-ending on an error.
+const SUBMIT_BUSY_RETRY_DEADLINE_MS = 6_000
+const SUBMIT_BUSY_RETRY_INTERVAL_MS = 200
 
 function isSessionBusyError(error: unknown): boolean {
   return /session busy/i.test(error instanceof Error ? error.message : String(error))
@@ -704,6 +710,66 @@ export function usePromptActions({
           }
         }
 
+        // "session busy" means the agent turn is still running (the embedded
+        // dashboard's busy signal can lag, so the composer sent instead of
+        // queueing). Don't dead-end: steer the text into the live turn so the
+        // model reads it mid-iteration (parity with /steer); if there's no live
+        // tool window to steer into, re-submit briefly so it lands as the next
+        // turn. This is what lets the user nudge an in-progress session.
+        if (submitErr !== null && isSessionBusyError(submitErr)) {
+          const steerTarget = activeSessionIdRef.current || sessionId
+
+          try {
+            const steered = await requestGateway<SessionSteerResponse>('session.steer', {
+              session_id: steerTarget,
+              text
+            })
+
+            if (steered?.status === 'queued') {
+              // The text joined the running turn — it's no longer a standalone
+              // user turn. Drop the optimistic bubble and leave a steer note,
+              // keeping busy=true since the turn is still in flight.
+              updateSessionState(
+                sessionId,
+                state => ({ ...state, messages: state.messages.filter(m => m.id !== optimisticId) }),
+                selectedStoredSessionIdRef.current
+              )
+              appendSessionTextMessage(sessionId, 'system', `steer:${text}`)
+              triggerHaptic('submit')
+
+              if (usingComposerAttachments) {
+                clearComposerAttachments()
+              }
+
+              return true
+            }
+          } catch {
+            // Steer unavailable — fall through to the timed submit retry below.
+          }
+
+          const deadline = Date.now() + SUBMIT_BUSY_RETRY_DEADLINE_MS
+
+          while (Date.now() < deadline) {
+            await sleep(SUBMIT_BUSY_RETRY_INTERVAL_MS)
+
+            try {
+              await requestGateway('prompt.submit', {
+                session_id: activeSessionIdRef.current || sessionId,
+                text
+              })
+              submitErr = null
+              break
+            } catch (retryErr) {
+              if (isSessionBusyError(retryErr)) {
+                continue
+              }
+
+              submitErr = retryErr
+              break
+            }
+          }
+        }
+
         if (submitErr !== null) {
           throw submitErr
         }
@@ -748,6 +814,8 @@ export function usePromptActions({
     },
     [
       activeSessionId,
+      activeSessionIdRef,
+      appendSessionTextMessage,
       busyRef,
       copy,
       createBackendSessionForSend,

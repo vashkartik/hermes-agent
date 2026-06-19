@@ -156,17 +156,35 @@ const HERO_EMOJI_BY_KEY: Record<string, string> = {
 // The hero wordmark reflects the profile the chat is scoped to: a named profile
 // shows its own name (with its identity emoji when known, tinted with its rail
 // color), while the default/root profile keeps the neutral "Hermes Agent".
+// Capella embed identity override (capella/patches): King is spawned as an
+// identity home that reports backend profile 'default', so the native key alone
+// falls through to neutral "Hermes Agent". The host passes ?capellaProfile so the
+// King hero renders natively in-app — no host-side DOM scrape, persists across
+// updates by construction.
+function readCapellaEmbedProfile(): string | null {
+  try {
+    return new URLSearchParams(window.location.search).get('capellaProfile')
+  } catch {
+    return null
+  }
+}
+
 function useHero(): { color: null | string; wordmark: string } {
   const gatewayProfile = useStore($activeGatewayProfile)
   const profiles = useStore($profiles)
   const colors = useStore($profileColors)
-  const key = normalizeProfileKey(gatewayProfile)
+  const override = readCapellaEmbedProfile()
+  const key = normalizeProfileKey(override ?? gatewayProfile)
 
   if (key === 'default') {
     return { color: null, wordmark: 'Hermes Agent' }
   }
 
-  const name = profiles.find(profile => normalizeProfileKey(profile.name) === key)?.name ?? gatewayProfile
+  const overrideName = override ? override.replace(/\b\w/g, c => c.toUpperCase()) : null
+  const name =
+    overrideName ??
+    profiles.find(profile => normalizeProfileKey(profile.name) === key)?.name ??
+    gatewayProfile
   const emoji = HERO_EMOJI_BY_KEY[key]
 
   return { color: resolveProfileColor(name, colors), wordmark: emoji ? `${emoji} ${name}` : name }
