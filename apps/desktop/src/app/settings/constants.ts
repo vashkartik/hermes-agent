@@ -1,3 +1,4 @@
+import { codiconIcon } from '@/components/ui/codicon'
 import {
   Brain,
   type IconComponent,
@@ -7,7 +8,6 @@ import {
   Monitor,
   Moon,
   Palette,
-  Sparkles,
   Sun,
   Wrench
 } from '@/lib/icons'
@@ -74,7 +74,6 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
     priority: 4
   },
   { prefix: 'GEMINI_', name: 'Gemini', priority: 4 },
-  { prefix: 'HERMES_GEMINI_', name: 'Gemini', priority: 4 },
   {
     prefix: 'DEEPSEEK_',
     name: 'DeepSeek',
@@ -502,7 +501,7 @@ export const SECTIONS: DesktopConfigSection[] = [
   {
     id: 'model',
     label: 'Model',
-    icon: Sparkles,
+    icon: codiconIcon('hubot'),
     keys: ['model_context_length', 'fallback_providers']
   },
   {

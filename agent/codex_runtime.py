@@ -26,6 +26,61 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
+    """Map a Codex app-server ``item/started`` notification to a Hermes
+    tool-progress event ``(tool_name, preview, args)``.
+
+    The Codex app-server runtime processes ``item/started`` notifications for
+    command execution, file changes, and MCP/dynamic tool calls, but never
+    surfaced them as Hermes tool-progress events — so gateways (Telegram, etc.)
+    showed no verbose "running X" breadcrumbs on this route while every other
+    provider did (#38835). Returns None for items that aren't tool-shaped.
+    """
+    if not isinstance(note, dict) or note.get("method") != "item/started":
+        return None
+    params = note.get("params") or {}
+    item = params.get("item") or {}
+    if not isinstance(item, dict):
+        return None
+
+    item_type = item.get("type") or ""
+    if item_type == "commandExecution":
+        command = item.get("command") or ""
+        return "exec_command", command, {"command": command, "cwd": item.get("cwd") or ""}
+
+    if item_type == "fileChange":
+        changes = item.get("changes") or []
+        preview = "file changes"
+        if isinstance(changes, list) and changes:
+            paths = [
+                str(change.get("path"))
+                for change in changes
+                if isinstance(change, dict) and change.get("path")
+            ]
+            if paths:
+                preview = ", ".join(paths[:3])
+                if len(paths) > 3:
+                    preview += f", +{len(paths) - 3} more"
+        return "apply_patch", preview, {"changes": changes}
+
+    if item_type == "mcpToolCall":
+        server = item.get("server") or "mcp"
+        tool = item.get("tool") or "unknown"
+        args = item.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {"arguments": args}
+        return f"mcp.{server}.{tool}", tool, args
+
+    if item_type == "dynamicToolCall":
+        tool = item.get("tool") or "unknown"
+        args = item.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {"arguments": args}
+        return tool, tool, args
+
+    return None
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -55,13 +110,13 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
     """
-    agent.session_api_calls += 1
+    agent.session_api_calls = getattr(agent, "session_api_calls", 0) + 1
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
-        if agent._session_db and agent.session_id:
+        if getattr(agent, "_session_db", None) and getattr(agent, "session_id", None):
             try:
-                if not agent._session_db_created:
+                if not getattr(agent, "_session_db_created", False):
                     agent._ensure_db_session()
                 agent._session_db.update_token_counts(
                     agent.session_id,
@@ -313,6 +368,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    conversation_history: List[Dict[str, Any]] | None = None,
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -328,7 +384,9 @@ def run_codex_app_server_turn(
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
-        cwd = getattr(agent, "session_cwd", None) or os.getcwd()
+        from agent.runtime_cwd import resolve_agent_cwd
+
+        cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -337,12 +395,30 @@ def run_codex_app_server_turn(
             approval_callback = _get_approval_callback()
         except Exception:
             approval_callback = None
+
+        def _on_codex_event(note: dict) -> None:
+            # Live display bridge: stream deltas / reasoning / tool events to
+            # whatever callbacks the host (gateway, TUI) re-binds per turn.
+            _codex_live_event(agent, note)
+            # Bridge Codex app-server item/started notifications to Hermes
+            # tool-progress so gateways show verbose "running X" breadcrumbs
+            # on this route too (#38835).
+            progress_callback = getattr(agent, "tool_progress_callback", None)
+            if progress_callback is None:
+                return
+            mapped = _codex_note_to_tool_progress(note)
+            if mapped is None:
+                return
+            tool_name, preview, args = mapped
+            try:
+                progress_callback("tool.started", tool_name, preview, args)
+            except Exception:
+                logger.debug("codex tool-progress callback raised", exc_info=True)
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
-            # Live display bridge: stream deltas / reasoning / tool events to
-            # whatever callbacks the host (gateway, TUI) re-binds per turn.
-            on_event=lambda note: _codex_live_event(agent, note),
+            on_event=_on_codex_event,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
@@ -414,9 +490,6 @@ def run_codex_app_server_turn(
     # Only _iters_since_skill needs explicit increment, since the
     # chat_completions loop bumps it per tool iteration (line ~12110)
     # and that loop is bypassed on this path.
-    # One app-server turn = one logical API call for the usage readout.
-    agent.session_api_calls = getattr(agent, "session_api_calls", 0) + 1
-
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
@@ -464,6 +537,33 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    completed = not turn.interrupted and turn.error is None
+    _cleanup_errors = []
+
+    try:
+        from agent.codex_responses_adapter import _summarize_user_message_for_log
+
+        agent._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+        )
+    except Exception as exc:
+        _cleanup_errors.append(f"save_trajectory: {exc}")
+        logger.error("codex app-server: _save_trajectory failed: %s", exc, exc_info=True)
+
+    try:
+        agent._cleanup_task_resources(effective_task_id)
+    except Exception as exc:
+        _cleanup_errors.append(f"cleanup_task_resources: {exc}")
+        logger.error("codex app-server: _cleanup_task_resources failed: %s", exc, exc_info=True)
+
+    try:
+        agent._persist_session(messages, conversation_history)
+    except Exception as exc:
+        _cleanup_errors.append(f"persist_session: {exc}")
+        logger.error("codex app-server: _persist_session failed: %s", exc, exc_info=True)
+
     # Final reasoning for the turn: the projector stashes it on the spliced
     # assistant messages, but the codex dispatch early-returns before
     # run_conversation's last_reasoning back-walk — without this the gateway
@@ -481,11 +581,11 @@ def run_codex_app_server_turn(
                 last_reasoning = reasoning.strip()
                 break
 
-    return {
+    result = {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
+        "completed": completed,
         "partial": turn.interrupted or turn.error is not None,
         "error": turn.error,
         "last_reasoning": last_reasoning,
@@ -493,6 +593,10 @@ def run_codex_app_server_turn(
         "codex_turn_id": turn.turn_id,
         **usage_result,
     }
+    if _cleanup_errors:
+        result["cleanup_errors"] = _cleanup_errors
+
+    return result
 
 
 # ---------------------------------------------------------------------------
