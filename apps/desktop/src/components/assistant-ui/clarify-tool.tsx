@@ -68,6 +68,42 @@ function RadioDot({ selected }: { selected: boolean }) {
   )
 }
 
+const YES_NO_FALLBACK_CHOICES = ['Yes', 'No']
+
+function isYesNoClarifyQuestion(question: string): boolean {
+  const normalized = question.trim().replace(/\s+/g, ' ')
+
+  if (!normalized || !/[?？]\s*$/.test(normalized)) {
+    return false
+  }
+
+  if (/^(?:which|what|where|when|who|whom|whose|why|how)\b/i.test(normalized)) {
+    return false
+  }
+
+  return [
+    /\bdo you want\b/i,
+    /\bwould you like\b/i,
+    /\bshould (?:i|we)\b/i,
+    /\bshall (?:i|we)\b/i,
+    /\bcan (?:i|we)\b/i,
+    /\bmay (?:i|we)\b/i,
+    /\bdo (?:i|we)\b/i,
+    /\bshould this\b/i,
+    /\bis (?:this|that|it)\b/i,
+    /\bare (?:you|we)\b/i,
+    /\bproceed\b/i
+  ].some(pattern => pattern.test(normalized))
+}
+
+function clarifyChoicesForDisplay(explicitChoices: string[], question: string): string[] {
+  if (explicitChoices.length > 0) {
+    return explicitChoices
+  }
+
+  return isYesNoClarifyQuestion(question) ? YES_NO_FALLBACK_CHOICES : []
+}
+
 export const ClarifyTool = (props: ToolCallMessagePartProps) => {
   const isPending = props.result === undefined
 
@@ -101,9 +137,13 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
   const question = fromArgs.question || matchingRequest?.question || ''
 
-  const choices = useMemo(
+  const explicitChoices = useMemo(
     () => fromArgs.choices ?? matchingRequest?.choices ?? [],
     [fromArgs.choices, matchingRequest?.choices]
+  )
+  const choices = useMemo(
+    () => clarifyChoicesForDisplay(explicitChoices, question),
+    [explicitChoices, question]
   )
 
   const hasChoices = choices.length > 0
