@@ -20,12 +20,12 @@ import {
 } from './preview'
 import { $activeSessionId, $selectedStoredSessionId } from './session'
 
-function previewTarget(source: string): PreviewTarget {
+function previewTarget(source: string, previewKind: PreviewTarget['previewKind'] = 'html'): PreviewTarget {
   return {
     kind: 'file',
     label: source,
     path: source,
-    previewKind: 'html',
+    previewKind,
     source,
     url: `file://${source}`
   }
@@ -105,7 +105,7 @@ describe('preview store', () => {
     ])
   })
 
-  it('keeps file inspection separate from live preview', () => {
+  it('opens clicked html files in the live browser preview', () => {
     const target = previewTarget('/work/demo.html')
     const preview = previewTarget('/work/live.html')
 
@@ -113,7 +113,26 @@ describe('preview store', () => {
 
     setCurrentSessionPreviewTarget(target, 'manual')
 
-    expect($filePreviewTarget.get()).toEqual(withRenderMode(target, 'source'))
+    expect($filePreviewTarget.get()).toBeNull()
+    expect($previewTarget.get()).toEqual(withRenderMode(target, 'preview'))
+    expect(getSessionPreviewRecord('session-1')?.normalized).toEqual(withRenderMode(target, 'preview'))
+
+    setCurrentSessionPreviewTarget(preview, 'file-browser')
+
+    expect($filePreviewTarget.get()).toBeNull()
+    expect($previewTarget.get()).toEqual(withRenderMode(preview, 'preview'))
+    expect(getSessionPreviewRecord('session-1')?.normalized).toEqual(withRenderMode(preview, 'preview'))
+  })
+
+  it('keeps non-html file inspection separate from live preview', () => {
+    const target = previewTarget('/work/notes.txt', 'text')
+    const preview = previewTarget('/work/live.html')
+
+    setCurrentSessionPreviewTarget(preview, 'tool-result')
+
+    setCurrentSessionPreviewTarget(target, 'manual')
+
+    expect($filePreviewTarget.get()).toEqual(target)
     expect($previewTarget.get()).toEqual(withRenderMode(preview, 'preview'))
     expect(getSessionPreviewRecord('session-1')?.normalized).toEqual(withRenderMode(preview, 'preview'))
 
@@ -124,13 +143,13 @@ describe('preview store', () => {
   })
 
   it('keeps file tabs when a live preview opens', () => {
-    const file = previewTarget('/work/file.html')
+    const file = previewTarget('/work/file.txt', 'text')
     const live = previewTarget('/work/live.html')
 
     setCurrentSessionPreviewTarget(file, 'manual')
     setCurrentSessionPreviewTarget(live, 'tool-result')
 
-    expect($filePreviewTabs.get().map(tab => tab.target)).toEqual([withRenderMode(file, 'source')])
+    expect($filePreviewTabs.get().map(tab => tab.target)).toEqual([file])
     expect($filePreviewTarget.get()).toBeNull()
     expect($rightRailActiveTabId.get()).toBe(RIGHT_RAIL_PREVIEW_TAB_ID)
     expect($previewTarget.get()).toEqual(withRenderMode(live, 'preview'))

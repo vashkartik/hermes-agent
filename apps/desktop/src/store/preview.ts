@@ -154,26 +154,27 @@ function openFilePreviewTarget(target: PreviewTarget) {
   selectRightRailTab(id)
 }
 
-// Manual/file-browser opens are "peeking at a file" → source view in the file
-// pane. Tool/explicit-link opens are runnable artifacts → live preview pane.
+// Manual/file-browser opens for ordinary files are "peeking at a file" → a
+// source/file tab. HTML is executable UI, so even a clicked local .html file goes
+// through the live browser preview instead of a source tab.
 function isFilePreviewSource(source: PreviewRecordSource): boolean {
   return source === 'file-browser' || source === 'manual'
 }
 
-function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSource): PreviewTarget {
+function previewTargetForSource(target: PreviewTarget, _source: PreviewRecordSource): PreviewTarget {
   if (target.kind !== 'file' || target.previewKind !== 'html') {
     return target
   }
 
-  return { ...target, renderMode: isFilePreviewSource(source) ? 'source' : 'preview' }
+  return { ...target, renderMode: 'preview' }
 }
 
 function tryOpenFilePreview(target: PreviewTarget, source: PreviewRecordSource): boolean {
-  if (target.kind !== 'file' || !isFilePreviewSource(source)) {
+  if (target.kind !== 'file' || !isFilePreviewSource(source) || target.previewKind === 'html') {
     return false
   }
 
-  openFilePreviewTarget(previewTargetForSource(target, source))
+  openFilePreviewTarget(target)
 
   return true
 }
@@ -268,7 +269,14 @@ function persistSessionPreviewRegistry(registry: SessionPreviewRegistry) {
     // Drop the inline image bytes before persisting — a screenshot data URL is
     // megabytes and would blow the localStorage quota. On reload the record
     // falls back to reading its `path`/`url`.
-    const lean = JSON.stringify(pruneRegistry(registry), (key, value) => (key === 'dataUrl' ? undefined : value))
+    const pruned = pruneRegistry(registry)
+
+    if (Object.keys(pruned).length === 0) {
+      window.localStorage.removeItem(REGISTRY_STORAGE_KEY)
+      return
+    }
+
+    const lean = JSON.stringify(pruned, (key, value) => (key === 'dataUrl' ? undefined : value))
     window.localStorage.setItem(REGISTRY_STORAGE_KEY, lean)
   } catch {
     // Session previews are a desktop convenience; storage failures are nonfatal.
