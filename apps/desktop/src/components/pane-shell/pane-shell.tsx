@@ -242,6 +242,7 @@ export function Pane({
   defaultOpen = true,
   divider = false,
   disabled = false,
+  forceCollapsed = false,
   hoverReveal = false,
   overlayWidth: overlayWidthProp,
   id,
@@ -374,6 +375,7 @@ export function Pane({
   if (overlayActive) {
     const edge = side === 'left' ? 'left' : 'right'
     const offscreen = side === 'left' ? '-translate-x-[calc(100%+1rem)]' : 'translate-x-[calc(100%+1rem)]'
+    const anchorToViewport = forceCollapsed
 
     return (
       <div
@@ -397,11 +399,13 @@ export function Pane({
             instead of transitioning the transform across the viewport. */}
         <div
           className={cn(
-            'pointer-events-none absolute inset-y-0 z-30 overflow-hidden transition-transform delay-0',
+            'pointer-events-none inset-y-0 z-30 overflow-hidden transition-transform delay-0',
+            anchorToViewport ? 'fixed' : 'absolute',
             offscreen,
             'group-hover/reveal:pointer-events-auto group-hover/reveal:translate-x-0 group-hover/reveal:delay-[var(--reveal-enter-delay)] group-hover/reveal:shadow-[var(--reveal-shadow)]',
             'group-data-[forced]/reveal:pointer-events-auto group-data-[forced]/reveal:translate-x-0 group-data-[forced]/reveal:delay-0 group-data-[forced]/reveal:shadow-[var(--reveal-shadow)]'
           )}
+          data-pane-overlay-anchor={anchorToViewport ? 'viewport' : 'grid'}
           key={edge}
           style={
             {

@@ -43,6 +43,8 @@ import {
 import {
   $composerPopoutPosition,
   $composerPoppedOut,
+  canUseComposerPopout,
+  COMPOSER_POPOUT_MEDIA_QUERY,
   POPOUT_WIDTH_REM,
   readPopoutBounds,
   setComposerPopoutPosition,
@@ -229,12 +231,14 @@ export function ChatBar({
   const statusItemsBySession = useStore($statusItemsBySession)
   const previewStatusBySession = useStore($previewStatusBySession)
   const scrolledUp = useStore($threadScrolledUp)
-  // Pop-out is a shared, persisted state — but secondary windows (the Ctrl+Shift+N
-  // tiny window, subagent watch windows) always start docked and can't pop out:
-  // a floating composer makes no sense in a single-session side window, and it
-  // would otherwise write the shared atom and yank the main window's composer out.
-  const popoutAllowed = !isSecondaryWindow()
+  // Pop-out is a shared, persisted state, but it is a desktop pointer affordance.
+  // Keep secondary windows and mobile/coarse-pointer embeds docked so a saved
+  // desktop float position cannot shrink or offset the phone composer.
+  const popoutViewportEligible = useMediaQuery(COMPOSER_POPOUT_MEDIA_QUERY)
+  const popoutAllowed = canUseComposerPopout(isSecondaryWindow(), popoutViewportEligible)
   const poppedOut = useStore($composerPoppedOut) && popoutAllowed
+  const poppedOutRef = useRef(poppedOut)
+  poppedOutRef.current = poppedOut
   const popoutPosition = useStore($composerPopoutPosition)
   const activeQueueSessionKey = queueSessionKey || sessionId || null
 
@@ -512,11 +516,11 @@ export function ChatBar({
       return
     }
 
-    // Floating composer is out of the thread's flow — it must not reserve any
-    // bottom clearance. Zero the measured vars so the thread reclaims the space.
-    // (Read globals here so the callback stays stable; mirror the popoutAllowed
-    // gate since secondary windows are forced docked.)
-    if ($composerPoppedOut.get() && !isSecondaryWindow()) {
+    // Floating composer is out of the thread's flow and must not reserve bottom
+    // clearance. Read the current effective pop-out state through a ref so
+    // mobile/coarse-pointer layouts with persisted pop-out enabled still publish
+    // docked composer metrics.
+    if (poppedOutRef.current) {
       const root = document.documentElement
       lastBucketedHeightRef.current = 0
       lastBucketedSurfaceHeightRef.current = 0

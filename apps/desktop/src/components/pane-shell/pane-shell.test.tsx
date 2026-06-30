@@ -246,6 +246,38 @@ describe('PaneShell composition', () => {
     expect(cell.getAttribute('data-pane-open')).toBe('false')
   })
 
+  it('anchors force-collapsed reveal overlays to the viewport edge', () => {
+    const rendered = render(
+      <PaneShell>
+        <Pane forceCollapsed hoverReveal id="sessions" side="left" width="240px">
+          <span data-testid="sessions-content">sessions</span>
+        </Pane>
+        <PaneMain>main</PaneMain>
+      </PaneShell>
+    )
+
+    const overlay = rendered.getByTestId('sessions-content').parentElement?.parentElement
+
+    expect(overlay?.getAttribute('data-pane-overlay-anchor')).toBe('viewport')
+    expect(overlay?.className).toContain('fixed')
+  })
+
+  it('keeps ordinary collapsed reveal overlays grid-anchored', () => {
+    const rendered = render(
+      <PaneShell>
+        <Pane defaultOpen={false} hoverReveal id="sessions" side="left" width="240px">
+          <span data-testid="sessions-content">sessions</span>
+        </Pane>
+        <PaneMain>main</PaneMain>
+      </PaneShell>
+    )
+
+    const overlay = rendered.getByTestId('sessions-content').parentElement?.parentElement
+
+    expect(overlay?.getAttribute('data-pane-overlay-anchor')).toBe('grid')
+    expect(overlay?.className).toContain('absolute')
+  })
+
   it('passes through arbitrary non-Pane children for self-placement', () => {
     const rendered = render(
       <PaneShell>
