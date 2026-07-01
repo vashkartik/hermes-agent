@@ -158,12 +158,16 @@ const HERO_EMOJI_BY_KEY: Record<string, string> = {
 // color), while the default/root profile keeps the neutral "Hermes Agent".
 // Capella embed identity override (capella/patches): King is spawned as an
 // identity home that reports backend profile 'default', so the native key alone
-// falls through to neutral "Hermes Agent". The host passes ?capellaProfile so the
-// King hero renders natively in-app — no host-side DOM scrape, persists across
-// updates by construction.
+// falls through to neutral "Hermes Agent". The host passes the profile as a query
+// param so the King hero renders natively in-app — no host-side DOM scrape,
+// persists across updates by construction.
+// The host was renamed Capella → Ace and now emits ?aceProfile alongside the
+// legacy ?capellaProfile. Prefer aceProfile; fall back to capellaProfile until
+// the host drops the legacy param.
 function readCapellaEmbedProfile(): string | null {
   try {
-    return new URLSearchParams(window.location.search).get('capellaProfile')
+    const params = new URLSearchParams(window.location.search)
+    return params.get('aceProfile') ?? params.get('capellaProfile')
   } catch {
     return null
   }
