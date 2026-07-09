@@ -12,7 +12,7 @@
 import { build } from 'esbuild'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdirSync } from 'node:fs'
+import { copyFileSync, mkdirSync } from 'node:fs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -63,3 +63,11 @@ await build({
   logLevel: 'info',
 })
 console.log(`bundled ${preloadOut}${isDev ? ' (dev)' : ''}`)
+
+// Ace-embed compat: shipped Ace builds resolve the packaged desktop app by
+// probing <app.asar>/electron/preload.cjs (the pre-0.18 layout) and refuse the
+// bundle when it's missing. Keep a byte-identical copy at the legacy path so
+// the Ace Teams embed keeps working across the layout change.
+const compatPreload = resolve(root, 'electron/preload.cjs')
+copyFileSync(preloadOut, compatPreload)
+console.log(`copied ${preloadOut} -> ${compatPreload} (Ace embed compat)`)

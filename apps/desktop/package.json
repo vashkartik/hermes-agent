@@ -169,6 +169,7 @@
     },
     "files": [
       "dist/**",
+      "electron/preload.cjs",
       "assets/**",
       "public/**",
       "package.json"
