@@ -216,16 +216,13 @@ export function MemoriesView(props: MemoriesViewProps) {
         </Button>
       }
       searchValue={input}
-      tabs={
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="text-[length:var(--conversation-caption-font-size)] font-medium text-foreground">
-            {m.title}
-          </span>
-          <span className="text-[0.72em] font-normal text-(--ui-text-tertiary)">
-            {filtered && meta ? m.matchingCount(meta.total) : m.factsCount(totalFacts)}
-          </span>
-        </div>
-      }
+      tabs={[
+        {
+          id: 'memories',
+          label: m.title,
+          meta: loading ? null : filtered && meta ? meta.total : totalFacts
+        }
+      ]}
     >
       <div className={cn('h-full overflow-y-auto py-3', PAGE_INSET_X)}>
         {loading ? (

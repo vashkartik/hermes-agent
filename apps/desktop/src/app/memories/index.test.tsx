@@ -83,8 +83,10 @@ describe('MemoriesView', () => {
     // the pretty name, so assert via the chip's button role).
     expect(screen.getByRole('button', { name: /project/i })).toBeTruthy()
     expect(screen.getByRole('button', { name: /user pref/i })).toBeTruthy()
-    // Header total.
-    expect(screen.getByText('2 facts')).toBeTruthy()
+    // Header total: the shell renders the count as the tab's meta badge (a
+    // TextTab button on wide viewports, a dropdown entry when collapsed).
+    const headerTabs = screen.getAllByRole('button', { name: /Memories/ })
+    expect(headerTabs.some(el => (el.textContent ?? '').includes('2'))).toBe(true)
   })
 
   it('filters by category when a chip is clicked', async () => {

@@ -13,6 +13,20 @@ vi.mock('@/lib/haptics', () => ({
   triggerHaptic: vi.fn()
 }))
 
+// ClarifyTool gates the interactive panel on the live message's running state
+// via useAuiState, which needs a full thread/message provider tree. These
+// tests exercise the yes/no-choice logic directly, so answer the selector
+// with a running message instead of mounting a whole Thread.
+vi.mock('@assistant-ui/react', async importOriginal => {
+  const mod = await importOriginal<typeof import('@assistant-ui/react')>()
+
+  return {
+    ...mod,
+    useAuiState: (selector: (state: unknown) => unknown) =>
+      selector({ message: { status: { type: 'running' } }, thread: { isRunning: true } })
+  }
+})
+
 function mockGateway() {
   const request = vi.fn().mockResolvedValue({ ok: true })
   $gateway.set({ request } as unknown as HermesGateway)
@@ -53,11 +67,14 @@ describe('ClarifyTool', () => {
       choices: null
     })
 
-    expect(screen.getByRole('button', { name: /^Yes$/ })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /^No$/ })).toBeTruthy()
-    expect(screen.queryByRole('textbox')).toBeNull()
+    expect(screen.getByRole('button', { name: /Yes$/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /No$/ })).toBeTruthy()
+    // The tappable chips lead; freeform stays available only as the "Other" escape hatch.
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).placeholder).toMatch(/other/i)
 
-    fireEvent.click(screen.getByRole('button', { name: /^No$/ }))
+    // Picking a choice selects it; Continue confirms and sends the answer.
+    fireEvent.click(screen.getByRole('button', { name: /No$/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
 
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
@@ -79,8 +96,8 @@ describe('ClarifyTool', () => {
 
     renderPendingClarify({ question: 'Which deployment target should I use?', choices: null })
 
-    expect(screen.queryByRole('button', { name: /^Yes$/ })).toBeNull()
-    expect(screen.queryByRole('button', { name: /^No$/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Yes$/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /No$/ })).toBeNull()
     expect(screen.getByRole('textbox')).toBeTruthy()
   })
 })
