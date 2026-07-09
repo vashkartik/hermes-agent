@@ -37,6 +37,7 @@ check "$ROOT/hermes_cli/web_server.py"           "api/memory/facts"   "memory: r
 check "$ROOT/hermes_cli/web_server.py"           "_sessions_daily_stats" "sessions: per-day stats breakdown in /api/sessions/stats"
 check "$DESK/src/app/memories/index.tsx"         "MemoriesView"       "memories: animated facts browser page (motion)"
 check "$DESK/src/app/routes.ts"                  "MEMORIES_ROUTE"     "memories: /memories route + sidebar nav entry"
+check "$DESK/tsconfig.json"                      "noEmit"             "build hygiene: tsc -b must not emit .js beside .ts sources"
 [ -f "$DESK/CAPELLA_FORK.md" ] && echo "  ok   fork doc (CAPELLA_FORK.md)" || { echo "  MISS CAPELLA_FORK.md"; fail=1; }
 
 # Gateway patch — best-effort: only checks when upstream is fetched locally.
