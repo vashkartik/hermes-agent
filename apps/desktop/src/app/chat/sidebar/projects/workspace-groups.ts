@@ -1,5 +1,6 @@
 import type { HermesGitWorktree } from '@/global'
 import type { ProjectInfo, SessionInfo } from '@/hermes'
+import { normalize } from '@/lib/text'
 
 // Session grouping is now computed authoritatively on the backend
 // (`tui_gateway/project_tree.py`, exposed via `projects.tree` /
@@ -191,7 +192,7 @@ export function mergeRepoWorktreeGroups(
       return branchForPath !== group.label ? { ...group, label: branchForPath } : group
     }
 
-    const livePath = livePathByBranch.get(group.label.trim().toLowerCase())
+    const livePath = livePathByBranch.get(normalize(group.label))
 
     if (livePath && normalizePath(livePath) !== normalizePath(group.path)) {
       return { ...group, id: livePath, path: livePath }
@@ -280,7 +281,11 @@ export function mergeRepoWorktreeGroups(
       continue
     }
 
-    const label = (worktree.isMain ? worktree.branch?.trim() || DEFAULT_BRANCH_LABEL : worktree.branch?.trim()) || baseName(wtPath) || wtPath
+    const label =
+      (worktree.isMain ? worktree.branch?.trim() || DEFAULT_BRANCH_LABEL : worktree.branch?.trim()) ||
+      baseName(wtPath) ||
+      wtPath
+
     const id = worktree.isMain ? branchLaneId(repo.id, label) : wtPath
 
     const alreadySeen =
@@ -479,7 +484,9 @@ export function overlayRepoLanes(
 
       lane =
         lanes.find(g => g.id === placed.id) ??
-        (placed.isMain ? lanes.find(g => g.isMain && g.label.toLowerCase() === placed.label.toLowerCase()) : undefined) ??
+        (placed.isMain
+          ? lanes.find(g => g.isMain && g.label.toLowerCase() === placed.label.toLowerCase())
+          : undefined) ??
         (!placed.isMain && placedPath ? lanes.find(g => normalizePath(g.path) === placedPath) : undefined)
 
       if (!lane) {

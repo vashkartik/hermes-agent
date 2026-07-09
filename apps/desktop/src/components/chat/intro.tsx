@@ -3,6 +3,7 @@ import { type CSSProperties, useState } from 'react'
 
 import { resolveProfileColor } from '@/lib/profile-color'
 import { $activeGatewayProfile, $profileColors, $profiles, normalizeProfileKey } from '@/store/profile'
+import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
 
@@ -46,14 +47,14 @@ const FALLBACK_COPY: IntroCopy[] = [
 ]
 
 function normalizeKey(value?: string): string {
-  return (value || '').trim().toLowerCase()
+  return normalize(value)
 }
 
 function titleize(value: string): string {
   return value
     .split(/[-_\s]+/)
     .filter(Boolean)
-    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .map(capitalize)
     .join(' ')
 }
 

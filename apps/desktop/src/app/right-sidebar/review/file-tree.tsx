@@ -93,10 +93,7 @@ export function ReviewFileTree() {
   const loading = useStore($reviewLoading)
   const mode = useStore($reviewTreeMode)
 
-  const tree = useMemo(
-    () => (mode === 'tree' ? buildReviewTree(files) : buildReviewFlatList(files)),
-    [files, mode]
-  )
+  const tree = useMemo(() => (mode === 'tree' ? buildReviewTree(files) : buildReviewFlatList(files)), [files, mode])
 
   const heavy = tree.length > HEAVY_LIST_CAP
 
@@ -209,7 +206,7 @@ function ReviewDirRow({
   return (
     <>
       <div
-        className="group/review-row flex h-6 cursor-pointer select-none items-center gap-1.5 rounded-md pr-1.5 text-xs text-(--ui-text-secondary) transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:text-foreground hover:transition-none"
+        className="group/review-row row-hover flex h-6 select-none items-center gap-1.5 rounded-md pr-1.5 text-xs text-(--ui-text-secondary) hover:text-foreground"
         onClick={toggle}
         style={rowStyle(depth)}
       >
@@ -305,7 +302,7 @@ function ReviewFileRow({ node, depth }: { node: ReviewTreeNode; depth: number })
       <div
         aria-selected={selected}
         className={cn(
-          'group/review-row flex h-6 cursor-pointer select-none items-center gap-1.5 rounded-md pr-1.5 text-xs text-(--ui-text-secondary) transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:text-foreground hover:transition-none',
+          'group/review-row row-hover flex h-6 select-none items-center gap-1.5 rounded-md pr-1.5 text-xs text-(--ui-text-secondary) hover:text-foreground',
           selected && 'bg-(--ui-row-active-background) text-foreground'
         )}
         draggable
