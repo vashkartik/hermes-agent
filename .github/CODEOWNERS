@@ -1,0 +1,3 @@
+# All protected paths are owned by the two approved identities. Both identities
+# may push and merge; branch rules have no last-pusher restriction.
+* @vashkartik @vectorcmd
