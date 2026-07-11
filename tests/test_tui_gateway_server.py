@@ -4819,7 +4819,7 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
         def interrupt(self, *args, **kwargs):
             calls["interrupt_called"] = True
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    server._sessions["sid"] = _session(agent=_Agent(), running=True)
     try:
         resp = server.handle_request(
             {
@@ -4836,6 +4836,28 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert resp["result"]["text"] == "also check auth.log"
     assert calls["steer_text"] == "also check auth.log"
     assert "interrupt_called" not in calls  # must NOT interrupt
+
+
+def test_session_steer_rejects_idle_session_so_desktop_can_queue_it():
+    calls = []
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(steer=lambda text: calls.append(text) or True),
+        running=False,
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "do this next"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"]["status"] == "rejected"
+    assert resp["result"]["text"] == "do this next"
+    assert calls == []
 
 
 def test_session_steer_rejects_empty_text():
@@ -4858,7 +4880,7 @@ def test_session_steer_rejects_empty_text():
 
 
 def test_session_steer_errors_when_agent_has_no_steer_method():
-    server._sessions["sid"] = _session(agent=types.SimpleNamespace())  # no steer()
+    server._sessions["sid"] = _session(agent=types.SimpleNamespace(), running=True)  # no steer()
     try:
         resp = server.handle_request(
             {
@@ -5372,6 +5394,43 @@ def test_interrupt_drops_queued_prompt_for_session():
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert calls["interrupted"] is True
         assert session.get("queued_prompt") is None
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_interrupt_does_not_erase_prompt_queued_after_stop_begins():
+    """A concurrent Send now belongs to the next turn, not the cancelled one."""
+    session = None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    class _Agent:
+        def interrupt(self):
+            # Deterministically model prompt.submit landing while the cooperative
+            # interrupt is unwinding. The stop may clear older queued work, but
+            # must not erase input that arrived after stop processing began.
+            server._enqueue_prompt(session, "send this next", None)
+
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        queued_prompt={"text": "cancel this old queue", "transport": None},
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert session.get("queued_prompt") == {
+            "text": "send this next",
+            "transport": None,
+        }
     finally:
         server._sessions.pop("sid", None)
 

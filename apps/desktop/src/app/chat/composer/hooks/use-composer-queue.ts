@@ -10,7 +10,6 @@ import {
   enqueueQueuedPrompt,
   MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
-  promoteQueuedPrompt,
   type QueuedPromptEntry,
   removeQueuedPrompt,
   shouldAutoDrain,
@@ -29,7 +28,6 @@ interface UseComposerQueueArgs {
   draftRef: RefObject<string>
   focusInput: () => void
   loadIntoComposer: (text: string, attachments: ComposerAttachment[]) => void
-  onCancel: ChatBarProps['onCancel']
   onSubmit: ChatBarProps['onSubmit']
   queueEditRef: RefObject<QueueEditState | null>
   queueSessionKey: ChatBarProps['queueSessionKey']
@@ -53,7 +51,6 @@ export function useComposerQueue({
   draftRef,
   focusInput,
   loadIntoComposer,
-  onCancel,
   onSubmit,
   queueEditRef,
   queueSessionKey,
@@ -233,24 +230,18 @@ export function useComposerQueue({
         return false
       }
 
-      if (busy) {
-        // Promote to the head, then interrupt. The gateway always emits a
-        // settle (message.complete + session.info running:false) when the
-        // turn unwinds, and the busy→false auto-drain below sends this entry.
-        promoteQueuedPrompt(activeQueueSessionKey, id)
-        triggerHaptic('selection')
-        void Promise.resolve(onCancel())
-
-        return true
-      }
-
       // A manual send clears the auto-drain backoff so a stuck entry the user
       // taps gets a fresh attempt (and re-enables auto-retry on success).
       drainFailuresRef.current.delete(id)
+      triggerHaptic('selection')
 
+      // Submit while the session is still marked busy. The gateway's
+      // prompt.submit busy path performs interrupt + enqueue atomically; a
+      // separate session.interrupt used to race that enqueue and erase the
+      // acknowledged prompt before the turn could drain it.
       return runDrain(entries => entries.find(e => e.id === id))
     },
-    [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
+    [activeQueueSessionKey, queueEdit, runDrain]
   )
 
   // Edge-independent auto-drain: send the head whenever the session is idle and
