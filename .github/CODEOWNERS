@@ -1,0 +1,4 @@
+# All protected changes require review from one of the two owner identities.
+# Branch rules also dismiss stale reviews and prevent the last pusher from
+# approving their own update.
+* @vashkartik @vectorcmd
