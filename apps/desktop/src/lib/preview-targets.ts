@@ -40,6 +40,34 @@ export function previewTargetFromMarkdownHref(href?: string): string | null {
   }
 }
 
+export function localHtmlPreviewTargetFromMarkdownHref(href?: string): string | null {
+  const raw = href?.trim()
+
+  if (!raw || raw.startsWith('#preview:') || raw.startsWith('#preview/')) {
+    return null
+  }
+
+  if (/^https?:\/\//i.test(raw) || /^javascript:/i.test(raw)) {
+    return null
+  }
+
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) && !/^file:/i.test(raw) && !/^[a-z]:[\\/]/i.test(raw)) {
+    return null
+  }
+
+  let pathname = raw.split(/[?#]/, 1)[0] || raw
+
+  if (/^file:/i.test(raw)) {
+    try {
+      pathname = new URL(raw).pathname
+    } catch {
+      return null
+    }
+  }
+
+  return /\.html?$/i.test(pathname) ? raw : null
+}
+
 export function previewName(target: string): string {
   try {
     const url = new URL(target)

@@ -746,6 +746,10 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
     session["_sid"] = sid
+    # Desktop clarify prompts deliberately have no wall-clock expiry. Closing
+    # the owning session is their bounded escape hatch, so release the wait
+    # before teardown/agent.close and never strand a blocked run thread.
+    _clear_pending(sid)
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -2082,7 +2086,12 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
+def _block(
+    event: str,
+    sid: str,
+    payload: dict,
+    timeout: float | None = 300,
+) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
@@ -3938,7 +3947,10 @@ def _agent_cbs(sid: str) -> dict:
             "notification.clear", sid, {"key": key}
         ),
         "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+            "clarify.request",
+            sid,
+            {"question": q, "choices": c},
+            timeout=None,
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -8183,11 +8195,15 @@ def _(rid, params: dict) -> dict:
     run_thread = session.get("_run_thread")
     run_thread_alive = run_thread is not None and run_thread.is_alive()
     should_interrupt = bool(session.get("running"))
-    if should_interrupt and hasattr(session["agent"], "interrupt"):
-        session["agent"].interrupt()
+    # Clear work that was already queued before Stop, then begin cooperative
+    # interruption. A prompt submitted after this point belongs to the next
+    # turn and must survive; clearing after agent.interrupt() created a race in
+    # which Desktop's Send now acknowledgement could be silently erased.
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
+    if should_interrupt and hasattr(session["agent"], "interrupt"):
+        session["agent"].interrupt()
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
@@ -8452,6 +8468,13 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # A stale renderer can briefly still show the steer affordance after the
+    # turn settled. Accepting into an idle agent parks the text until some
+    # unrelated future turn; reject it so Desktop's existing fallback queues
+    # it as the next explicit user prompt instead.
+    with session["history_lock"]:
+        if not session.get("running"):
+            return _ok(rid, {"status": "rejected", "text": text})
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")

@@ -264,6 +264,44 @@ def test_block_and_respond(capture):
     assert result[0] == "my_answer"
 
 
+def test_desktop_clarify_waits_until_answer_or_session_close(server, monkeypatch):
+    """The persistent desktop UI must not silently expire a live question."""
+    calls = []
+
+    def fake_block(event, sid, payload, timeout="omitted"):
+        calls.append((event, sid, payload, timeout))
+        return "picked"
+
+    monkeypatch.setattr(server, "_block", fake_block)
+
+    answer = server._agent_cbs("sid-live")["clarify_callback"](
+        "Where should this open?",
+        ["Ace browser", "Chrome"],
+    )
+
+    assert answer == "picked"
+    assert calls == [
+        (
+            "clarify.request",
+            "sid-live",
+            {"question": "Where should this open?", "choices": ["Ace browser", "Chrome"]},
+            None,
+        )
+    ]
+
+
+def test_close_session_releases_indefinite_desktop_prompt(server, monkeypatch):
+    """Closing a session remains the bounded escape hatch for an open prompt."""
+    event = threading.Event()
+    server._pending["clarify-1"] = ("sid-live", event)
+    server._sessions["sid-live"] = {}
+    monkeypatch.setattr(server, "_teardown_session", lambda *_args, **_kwargs: None)
+
+    assert server._close_session_by_id("sid-live") is True
+    assert event.is_set()
+    assert server._answers["clarify-1"] == ""
+
+
 def test_clear_pending(server):
     ev = threading.Event()
     # _pending values are (sid, Event) tuples

@@ -4819,7 +4819,7 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
         def interrupt(self, *args, **kwargs):
             calls["interrupt_called"] = True
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    server._sessions["sid"] = _session(agent=_Agent(), running=True)
     try:
         resp = server.handle_request(
             {
@@ -4836,6 +4836,28 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert resp["result"]["text"] == "also check auth.log"
     assert calls["steer_text"] == "also check auth.log"
     assert "interrupt_called" not in calls  # must NOT interrupt
+
+
+def test_session_steer_rejects_idle_session_so_desktop_can_queue_it():
+    calls = []
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(steer=lambda text: calls.append(text) or True),
+        running=False,
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "do this next"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"]["status"] == "rejected"
+    assert resp["result"]["text"] == "do this next"
+    assert calls == []
 
 
 def test_session_steer_rejects_empty_text():
@@ -4858,7 +4880,7 @@ def test_session_steer_rejects_empty_text():
 
 
 def test_session_steer_errors_when_agent_has_no_steer_method():
-    server._sessions["sid"] = _session(agent=types.SimpleNamespace())  # no steer()
+    server._sessions["sid"] = _session(agent=types.SimpleNamespace(), running=True)  # no steer()
     try:
         resp = server.handle_request(
             {
@@ -5125,6 +5147,104 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_continues_after_auto_compression_rotates_session(monkeypatch):
+    """A turn that auto-compacts must not strand the next desktop prompt.
+
+    ``AIAgent.run_conversation`` can rotate ``agent.session_id`` while it is
+    producing the first reply.  The gateway keeps a stable UI ``sid``, but the
+    next turn must use the rotated continuation as its task/session key.  This
+    is the end-to-end regression for the desktop report that Hermes appeared to
+    stop responding after "Summarizing thread".
+    """
+
+    seen_task_ids: list[str | None] = []
+
+    class _CompressingAgent:
+        session_id = "parent-session"
+        model = "test/model"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        _cached_system_prompt = ""
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            task_id=None,
+        ):
+            seen_task_ids.append(task_id)
+            turn = len(seen_task_ids)
+            if turn == 1:
+                # Mirrors AIAgent._compress_context ending the parent DB row
+                # and creating a continuation during the active turn.
+                self.session_id = "continuation-session"
+            messages = list(conversation_history or [])
+            messages.extend(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": f"reply-{turn}"},
+                ]
+            )
+            return {"final_response": f"reply-{turn}", "messages": messages}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    agent = _CompressingAgent()
+    session = _session(agent=agent)
+    session["session_key"] = "parent-session"
+    server._sessions["sid"] = session
+    emits: list[tuple] = []
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+        monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
+        monkeypatch.setattr(server, "_register_session_cwd", lambda *_a: None)
+        monkeypatch.setattr(server, "_wire_callbacks", lambda *_a: None)
+        monkeypatch.setattr(server, "_persist_session_history", lambda *_a: None)
+        monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a: None)
+        monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_kw: True)
+
+        first = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "first"},
+            }
+        )
+        second = server.handle_request(
+            {
+                "id": "2",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "second"},
+            }
+        )
+
+        assert first.get("result")
+        assert second.get("result")
+        assert seen_task_ids == ["parent-session", "continuation-session"]
+        assert session["session_key"] == "continuation-session"
+        assert session["running"] is False
+        completions = [
+            call[2]
+            for call in emits
+            if len(call) >= 3 and call[0] == "message.complete"
+        ]
+        assert [payload["text"] for payload in completions] == ["reply-1", "reply-2"]
+        assert session["history"][-1] == {"role": "assistant", "content": "reply-2"}
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     """Desktop user-message edits should restart the turn from the edited user."""
 
@@ -5372,6 +5492,43 @@ def test_interrupt_drops_queued_prompt_for_session():
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert calls["interrupted"] is True
         assert session.get("queued_prompt") is None
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_interrupt_does_not_erase_prompt_queued_after_stop_begins():
+    """A concurrent Send now belongs to the next turn, not the cancelled one."""
+    session = None
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    class _Agent:
+        def interrupt(self):
+            # Deterministically model prompt.submit landing while the cooperative
+            # interrupt is unwinding. The stop may clear older queued work, but
+            # must not erase input that arrived after stop processing began.
+            server._enqueue_prompt(session, "send this next", None)
+
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        queued_prompt={"text": "cancel this old queue", "transport": None},
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert session.get("queued_prompt") == {
+            "text": "send this next",
+            "transport": None,
+        }
     finally:
         server._sessions.pop("sid", None)
 
