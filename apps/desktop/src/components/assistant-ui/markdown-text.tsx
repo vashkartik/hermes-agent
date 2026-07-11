@@ -37,7 +37,7 @@ import {
   mediaPathFromMarkdownHref,
   mediaStreamUrl
 } from '@/lib/media'
-import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
+import { localHtmlPreviewTargetFromMarkdownHref, previewTargetFromMarkdownHref } from '@/lib/preview-targets'
 import { tailBoundedRemend } from '@/lib/remend-tail'
 import { cn } from '@/lib/utils'
 
@@ -292,6 +292,12 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 
   if (previewTarget) {
     return <PreviewAttachment source="explicit-link" target={previewTarget} />
+  }
+
+  const localHtmlTarget = localHtmlPreviewTargetFromMarkdownHref(href)
+
+  if (localHtmlTarget) {
+    return <PreviewAttachment source="explicit-link" target={localHtmlTarget} />
   }
 
   const target = href ? normalizeExternalUrl(href) : href

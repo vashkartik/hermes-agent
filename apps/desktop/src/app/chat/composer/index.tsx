@@ -179,7 +179,6 @@ export function ChatBar({
     draftRef,
     focusInput,
     loadIntoComposer,
-    onCancel,
     onSubmit,
     queueEditRef,
     queueSessionKey,

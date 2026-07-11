@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { extractPreviewTargets, previewTargetFromMarkdownHref, stripPreviewTargets } from './preview-targets'
+import {
+  extractPreviewTargets,
+  localHtmlPreviewTargetFromMarkdownHref,
+  previewTargetFromMarkdownHref,
+  stripPreviewTargets
+} from './preview-targets'
 
 describe('preview target detection', () => {
   it('does not infer preview targets from raw paths or URLs', () => {
@@ -23,5 +28,12 @@ describe('preview target detection', () => {
       'ready\n/tmp/mycelium-bunnies.html\nopen it'
     )
     expect(stripPreviewTargets('[Preview: demo.html](#preview:%2Ftmp%2Fdemo.html)\nopen it')).toBe('open it')
+  })
+
+  it('routes local HTML markdown links into the built-in preview', () => {
+    expect(localHtmlPreviewTargetFromMarkdownHref('./dist/index.html')).toBe('./dist/index.html')
+    expect(localHtmlPreviewTargetFromMarkdownHref('file:///tmp/demo.htm')).toBe('file:///tmp/demo.htm')
+    expect(localHtmlPreviewTargetFromMarkdownHref('https://example.com/index.html')).toBeNull()
+    expect(localHtmlPreviewTargetFromMarkdownHref('javascript:alert(1)')).toBeNull()
   })
 })
