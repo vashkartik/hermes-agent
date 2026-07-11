@@ -5147,6 +5147,104 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_continues_after_auto_compression_rotates_session(monkeypatch):
+    """A turn that auto-compacts must not strand the next desktop prompt.
+
+    ``AIAgent.run_conversation`` can rotate ``agent.session_id`` while it is
+    producing the first reply.  The gateway keeps a stable UI ``sid``, but the
+    next turn must use the rotated continuation as its task/session key.  This
+    is the end-to-end regression for the desktop report that Hermes appeared to
+    stop responding after "Summarizing thread".
+    """
+
+    seen_task_ids: list[str | None] = []
+
+    class _CompressingAgent:
+        session_id = "parent-session"
+        model = "test/model"
+        provider = "test"
+        base_url = ""
+        api_key = ""
+        _cached_system_prompt = ""
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            task_id=None,
+        ):
+            seen_task_ids.append(task_id)
+            turn = len(seen_task_ids)
+            if turn == 1:
+                # Mirrors AIAgent._compress_context ending the parent DB row
+                # and creating a continuation during the active turn.
+                self.session_id = "continuation-session"
+            messages = list(conversation_history or [])
+            messages.extend(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": f"reply-{turn}"},
+                ]
+            )
+            return {"final_response": f"reply-{turn}", "messages": messages}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    agent = _CompressingAgent()
+    session = _session(agent=agent)
+    session["session_key"] = "parent-session"
+    server._sessions["sid"] = session
+    emits: list[tuple] = []
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+        monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
+        monkeypatch.setattr(server, "_register_session_cwd", lambda *_a: None)
+        monkeypatch.setattr(server, "_wire_callbacks", lambda *_a: None)
+        monkeypatch.setattr(server, "_persist_session_history", lambda *_a: None)
+        monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a: None)
+        monkeypatch.setattr(server, "_transfer_active_session_slot", lambda *_a, **_kw: True)
+
+        first = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "first"},
+            }
+        )
+        second = server.handle_request(
+            {
+                "id": "2",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "second"},
+            }
+        )
+
+        assert first.get("result")
+        assert second.get("result")
+        assert seen_task_ids == ["parent-session", "continuation-session"]
+        assert session["session_key"] == "continuation-session"
+        assert session["running"] is False
+        completions = [
+            call[2]
+            for call in emits
+            if len(call) >= 3 and call[0] == "message.complete"
+        ]
+        assert [payload["text"] for payload in completions] == ["reply-1", "reply-2"]
+        assert session["history"][-1] == {"role": "assistant", "content": "reply-2"}
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     """Desktop user-message edits should restart the turn from the edited user."""
 
