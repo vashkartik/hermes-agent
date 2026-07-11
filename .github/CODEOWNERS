@@ -1,4 +1,3 @@
-# All protected changes require review from one of the two owner identities.
-# Branch rules also dismiss stale reviews and prevent the last pusher from
-# approving their own update.
+# All protected paths are owned by the two approved identities. Both identities
+# may push and merge; branch rules have no last-pusher restriction.
 * @vashkartik @vectorcmd
