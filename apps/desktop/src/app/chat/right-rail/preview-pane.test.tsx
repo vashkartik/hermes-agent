@@ -3,10 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $connection } from '@/store/session'
 
-import { PreviewPane } from './preview-pane'
+import { embeddedPreviewFrameSandbox, isAceEmbeddedRenderer, PreviewPane } from './preview-pane'
 
 describe('PreviewPane console state', () => {
   beforeEach(() => {
+    window.history.replaceState({}, '', '/')
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
       window.setTimeout(() => callback(Date.now()), 0)
     )
@@ -80,5 +81,36 @@ describe('PreviewPane console state', () => {
     })
 
     expect(setTitlebarToolGroup).toHaveBeenCalledTimes(initialCalls)
+  })
+
+  it('uses a sandboxed iframe for Ace-embedded local HTML previews', () => {
+    window.history.replaceState({}, '', '/?aceProfile=king')
+
+    const rendered = render(
+      <PreviewPane
+        target={{
+          kind: 'file',
+          label: 'demo.html',
+          path: '/tmp/demo.html',
+          previewKind: 'html',
+          source: '/tmp/demo.html',
+          url: 'file:///tmp/demo.html'
+        }}
+      />
+    )
+    const frame = rendered.container.querySelector('iframe')
+
+    expect(frame).toBeInstanceOf(HTMLIFrameElement)
+    expect(rendered.container.querySelector('webview')).toBeNull()
+    expect(frame?.getAttribute('sandbox')).toContain('allow-scripts')
+    expect(frame?.getAttribute('sandbox')).not.toContain('allow-same-origin')
+  })
+
+  it('detects Ace embedding and preserves HTTP preview origins only', () => {
+    expect(isAceEmbeddedRenderer('?aceProfile=king')).toBe(true)
+    expect(isAceEmbeddedRenderer('?capellaProfile=king')).toBe(true)
+    expect(isAceEmbeddedRenderer('')).toBe(false)
+    expect(embeddedPreviewFrameSandbox('file:///tmp/demo.html')).not.toContain('allow-same-origin')
+    expect(embeddedPreviewFrameSandbox('http://localhost:5173')).toContain('allow-same-origin')
   })
 })
