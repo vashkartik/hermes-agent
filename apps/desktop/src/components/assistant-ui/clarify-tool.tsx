@@ -173,6 +173,7 @@ function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const messageRunning = useAuiState(selectMessageRunning)
   const request = useStore($clarifyRequest)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
+
   const backendStillWaiting = Boolean(
     request && (!fromArgs.question || !request.question || fromArgs.question === request.question)
   )
@@ -251,6 +252,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
     () => fromArgs.choices ?? matchingRequest?.choices ?? [],
     [fromArgs.choices, matchingRequest?.choices]
   )
+
   const choices = useMemo(
     () => clarifyChoicesForDisplay(explicitChoices, question),
     [explicitChoices, question]

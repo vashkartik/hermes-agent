@@ -22,7 +22,7 @@ let mockMessageRunning = true
 // with a running message instead of mounting a whole Thread; the remount test
 // flips it to complete to cover backend-authoritative recovery.
 vi.mock('@assistant-ui/react', async importOriginal => {
-  const mod = await importOriginal<typeof import('@assistant-ui/react')>()
+  const mod = await importOriginal<Record<string, unknown>>()
 
   return {
     ...mod,
