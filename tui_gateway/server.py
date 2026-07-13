@@ -685,6 +685,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     except Exception:
         pass
 
+    run_thread = session.get("_run_thread")
+    if run_thread is None or not run_thread.is_alive():
+        _release_update_turn_if_idle(session)
+
 
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
@@ -4477,6 +4481,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     info = _session_info(new_agent, session)
     _emit("session.info", sid, info)
     _restart_slash_worker(sid, session)
+    _release_update_turn_if_idle(session)
     return info
 
 
@@ -5184,6 +5189,94 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
+def _claim_update_turn(session: dict, *, kind: str = "desktop") -> bool:
+    """Attach one update-guard lease to accepted work for this session.
+
+    Callers claim while holding ``history_lock`` before changing ``running``.
+    Chained/queued turns deliberately reuse the existing handle so there is no
+    updater-visible idle gap between work the server already accepted.
+    """
+    if session.get("_update_turn_lease") is not None:
+        return True
+    try:
+        from hermes_cli.update_guard import UpdateDrainActive, acquire_turn
+
+        session["_update_turn_lease"] = acquire_turn(kind)
+        return True
+    except UpdateDrainActive:
+        return False
+    except Exception as exc:
+        # Fail closed: an untracked turn could race an updater and be killed.
+        logger.warning("Hermes update guard could not claim a turn: %s", exc)
+        return False
+
+
+def _release_update_turn(session: dict) -> None:
+    """Release this session's update lease, if any (idempotent)."""
+    lease = session.pop("_update_turn_lease", None)
+    if lease is None:
+        return
+    try:
+        lease.release()
+    except Exception as exc:
+        logger.warning("Hermes update guard could not release a turn: %s", exc)
+
+
+def _release_update_turn_if_idle(session: dict) -> bool:
+    """Release only when no live or accepted queued work owns the session.
+
+    The handle is detached under ``history_lock`` before the file operation.
+    A prompt racing this release must then acquire a fresh lease after it gets
+    the lock, so an updater can never observe zero after that prompt is accepted.
+    """
+    lock = session.get("history_lock")
+    if lock is None:
+        if session.get("running") or session.get("queued_prompt"):
+            return False
+        _release_update_turn(session)
+        return True
+    with lock:
+        if session.get("running") or session.get("queued_prompt"):
+            return False
+        lease = session.pop("_update_turn_lease", None)
+    if lease is None:
+        return True
+    try:
+        lease.release()
+    except Exception as exc:
+        logger.warning("Hermes update guard could not release a turn: %s", exc)
+    return True
+
+
+def _start_update_guarded_daemon(kind: str, target) -> bool:
+    """Start hidden agent work under its own update lease.
+
+    Returns ``False`` when an update already owns drain. Other start failures
+    propagate after releasing the lease so callers can return their normal
+    internal-error response without leaking activity.
+    """
+    try:
+        from hermes_cli.update_guard import UpdateDrainActive, acquire_turn
+
+        lease = acquire_turn(kind)
+    except UpdateDrainActive:
+        return False
+
+    def guarded() -> None:
+        try:
+            target()
+        finally:
+            lease.release()
+
+    thread = threading.Thread(target=guarded, daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        lease.release()
+        raise
+    return True
+
+
 def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -5249,6 +5342,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
+        if not _claim_update_turn(session):
+            # The update won before this queued turn was accepted by the run
+            # loop. Leave it queued for reconnect/retry; never start untracked.
+            return False
         session["queued_prompt"] = None
         session["running"] = True
         if queued.get("transport") is not None:
@@ -5263,6 +5360,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+        _release_update_turn_if_idle(session)
     return True
 
 
@@ -8296,6 +8394,8 @@ def _(rid, params: dict) -> dict:
     # prompts on unrelated sessions sharing the same tui_gateway
     # process, silently resolving them to empty strings.
     _clear_pending(params.get("session_id", ""))
+    if not run_thread_alive:
+        _release_update_turn_if_idle(session)
     try:
         from tools.approval import resolve_gateway_approval
 
@@ -8600,6 +8700,7 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
+        truncated = None
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
@@ -8615,6 +8716,14 @@ def _(rid, params: dict) -> dict:
             if ordinal < 0 or ordinal >= len(user_indices):
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
+
+        # This claim and the updater's idle claim use the same cross-process
+        # lock. Acquire before mutating history or acknowledging the prompt, so
+        # a submitted message is either fully protected or cleanly retryable.
+        if not _claim_update_turn(session):
+            return _err(rid, 4091, "Hermes is applying an update; retry shortly")
+
+        if truncated is not None:
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
             if (db := _get_db()) is not None:
@@ -8627,12 +8736,19 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
-    # Persist the DB row lazily, now that the user has actually sent a message.
-    _ensure_session_db_row(session)
-    # A branch becomes real here: copy its parent's transcript into the row so it
-    # resumes with full context (the agent won't persist the seed itself).
-    _persist_branch_seed(session)
-    _start_agent_build(sid, session)
+    try:
+        # Persist the DB row lazily, now that the user has actually sent a message.
+        _ensure_session_db_row(session)
+        # A branch becomes real here: copy its parent's transcript into the row so it
+        # resumes with full context (the agent won't persist the seed itself).
+        _persist_branch_seed(session)
+        _start_agent_build(sid, session)
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        _release_update_turn_if_idle(session)
+        return _err(rid, 5032, f"agent initialization failed: {exc}")
 
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
@@ -8649,19 +8765,32 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)
+            _release_update_turn_if_idle(session)
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
-                return
+                release_idle = True
+            else:
+                release_idle = False
+        if release_idle:
+            _release_update_turn_if_idle(session)
+            return
         _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
-    run_thread.start()
+    try:
+        run_thread.start()
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        _release_update_turn_if_idle(session)
+        return _err(rid, 5032, f"turn start failed: {exc}")
     return _ok(rid, {"status": "streaming"})
 
 
@@ -8906,6 +9035,9 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
+            elif not _claim_update_turn(session):
+                process_registry.completion_queue.put(evt)
+                _requeued = True
             else:
                 session["running"] = True
         if _requeued:
@@ -8921,6 +9053,9 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            _release_update_turn_if_idle(session)
             continue
         try:
             _emit("message.start", sid)
@@ -8935,6 +9070,7 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+            _release_update_turn_if_idle(session)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -8973,6 +9109,9 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
+            if not _claim_update_turn(session):
+                process_registry.completion_queue.put(evt)
+                break
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
@@ -8981,6 +9120,9 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            _release_update_turn_if_idle(session)
             continue
         try:
             _emit("message.start", sid)
@@ -8995,6 +9137,7 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+            _release_update_turn_if_idle(session)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9061,12 +9204,21 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     with session["history_lock"]:
-        history = list(session["history"])
-        history_version = int(session.get("history_version", 0))
-        images = list(session.get("attached_images", []))
-        session["attached_images"] = []
-        if not isinstance(session.get("inflight_turn"), dict):
-            _start_inflight_turn(session, text)
+        if not _claim_update_turn(session):
+            session["running"] = False
+            _clear_inflight_turn(session)
+            update_blocked = True
+        else:
+            update_blocked = False
+            history = list(session["history"])
+            history_version = int(session.get("history_version", 0))
+            images = list(session.get("attached_images", []))
+            session["attached_images"] = []
+            if not isinstance(session.get("inflight_turn"), dict):
+                _start_inflight_turn(session, text)
+    if update_blocked:
+        _emit("error", sid, {"message": "Hermes is applying an update; retry shortly"})
+        return
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
@@ -9493,7 +9645,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
+                keep_update_lease = bool(
+                    session.get("queued_prompt") or goal_followup
+                )
             _emit("session.info", sid, _session_info(agent, session))
+            if not keep_update_lease:
+                _release_update_turn_if_idle(session)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -9513,10 +9670,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
+                if not _claim_update_turn(session):
+                    return
                 session["running"] = True
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
+                return
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -9525,6 +9685,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 )
                 with session["history_lock"]:
                     session["running"] = False
+                _release_update_turn_if_idle(session)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -9545,17 +9706,24 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     if session.get("running"):
                         process_registry.completion_queue.put(_evt)
                         break
+                    if not _claim_update_turn(session):
+                        process_registry.completion_queue.put(_evt)
+                        break
                     session["running"] = True
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
+                    _release_update_turn_if_idle(session)
                     continue
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
+                    return
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(
@@ -9565,6 +9733,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     )
                     with session["history_lock"]:
                         session["running"] = False
+                    _release_update_turn_if_idle(session)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -9572,9 +9741,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 file=sys.stderr,
             )
 
+        _release_update_turn_if_idle(session)
+
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
-    run_thread.start()
+    try:
+        run_thread.start()
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        _release_update_turn_if_idle(session)
+        _emit("error", sid, {"message": f"turn start failed: {exc}"})
 
 
 @method("clipboard.paste")
@@ -10233,7 +10411,11 @@ def _(rid, params: dict) -> dict:
         finally:
             _clear_session_context(session_tokens)
 
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        if not _start_update_guarded_daemon("desktop-background", run):
+            return _err(rid, 4091, "Hermes is applying an update; retry shortly")
+    except Exception as exc:
+        return _err(rid, 5000, f"background task start failed: {exc}")
     return _ok(rid, {"task_id": task_id})
 
 
@@ -10346,7 +10528,11 @@ def _(rid, params: dict) -> dict:
                 pass
             _clear_session_context(session_tokens)
 
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        if not _start_update_guarded_daemon("desktop-preview", run):
+            return _err(rid, 4091, "Hermes is applying an update; retry shortly")
+    except Exception as exc:
+        return _err(rid, 5000, f"preview restart task start failed: {exc}")
     return _ok(rid, {"task_id": task_id})
 
 
