@@ -46,6 +46,11 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
     "kartikvashisth675@gmail.com": "vashkartik",  # PR #3 (Ace runtime reliability integration)
+    "vector.hq@outlook.com": "vectorcmd",  # Ace persistent clarify recovery
+    "agent@agents-Mac-mini.local": "momomojo",  # PR #43692
+    "gigakun@agentmail.to": "gigakun3030",  # PR #61163
+    "jakub.wolniewicz@gmail.com": "frizikk",  # Desktop stale-prompt recovery
+    "markvlcek@gmail.com": "MarkVLK",  # Desktop fallback-model editor
     "VrtxOmega@pm.me": "VrtxOmega",  # PR #43809 salvage (desktop: WSL folder-picker path bridge)
     "jake.long.vu@vucar.net": "jakelongvu-bot",  # PR #36683 partial salvage (approval: honor canonical approvals.timeout in gateway waits)
     "luigi@users.noreply.github.com": "Tortugasaur",  # PR #43205 salvage (desktop: profile-aware three-way approval mode statusbar control)
