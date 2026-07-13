@@ -308,3 +308,33 @@ def test_hidden_agent_run_blocks_update_until_completion(
     finally:
         finish.set()
         server._sessions.pop("sid", None)
+
+
+def test_tui_entry_registers_guarded_runtime_before_ready(
+    isolated_home, monkeypatch
+):
+    import sys
+
+    from hermes_cli import config as hermes_config
+    from tui_gateway import entry
+
+    order = []
+    monkeypatch.setattr(
+        update_guard,
+        "register_runtime",
+        lambda kind: order.append(("register", kind)),
+    )
+    monkeypatch.setattr(hermes_config, "read_raw_config", lambda: {})
+    monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+    monkeypatch.setattr(
+        entry,
+        "write_json",
+        lambda payload: order.append(("ready", payload)) or True,
+    )
+    monkeypatch.setattr(entry, "_log_exit", lambda _reason: None)
+    monkeypatch.setattr(sys, "stdin", [])
+
+    entry.main()
+
+    assert order[0] == ("register", "tui-gateway")
+    assert order[1][0] == "ready"

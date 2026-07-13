@@ -153,7 +153,14 @@ def test_registry_contains_no_session_or_prompt_content(guard):
     state = json.loads(raw)
 
     assert "secret-session-name" not in raw
-    assert set(state) == {"turns", "update", "version"}
+    assert set(state) == {"participants", "turns", "update", "version"}
+    assert set(state["participants"][0]) == {
+        "id",
+        "kind",
+        "pid",
+        "process_start",
+        "started_at",
+    }
     assert set(state["turns"][0]) == {
         "id",
         "kind",
@@ -176,3 +183,149 @@ def test_corrupt_state_denies_update_but_does_not_brick_turns(guard):
     lease = guard.acquire_turn("desktop")
     assert list(state_path.parent.glob("update-guard.json.corrupt-*"))
     lease.release()
+
+
+def test_cli_busy_claim_is_machine_readable(guard):
+    lease = guard.acquire_turn("desktop")
+    env = os.environ.copy()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.update_guard",
+            "claim",
+            "--candidate",
+            "candidate-cli",
+            "--owner-pid",
+            str(os.getpid()),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "busy", "active_turns": 1}
+    lease.release()
+
+
+def test_legacy_runtime_refuses_update_claim(guard, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        guard,
+        "_discover_affected_processes",
+        lambda: [
+            {
+                "pid": 4242,
+                "process_start": "legacy-start",
+                "command": "python -m hermes_cli.main serve",
+            }
+        ],
+    )
+
+    result = guard.try_claim_idle_update("candidate", check_legacy=True)
+
+    assert result.status == "legacy_runtime"
+    assert result.active_turns == 0
+    assert result.claim is None
+
+
+def test_registered_runtime_is_not_misclassified_as_legacy(
+    guard, monkeypatch: pytest.MonkeyPatch
+):
+    guard.register_runtime("dashboard")
+    monkeypatch.setattr(
+        guard,
+        "_discover_affected_processes",
+        lambda: [
+            {
+                "pid": os.getpid(),
+                "process_start": guard._process_start(os.getpid()),
+                "command": "python -m hermes_cli.main serve",
+            }
+        ],
+    )
+
+    result = guard.try_claim_idle_update("candidate", check_legacy=True)
+
+    assert result.status == "claimed"
+    assert result.claim is not None
+    result.claim.release()
+
+
+def test_runtime_scan_error_denies_update_claim(
+    guard, monkeypatch: pytest.MonkeyPatch
+):
+    def fail_scan():
+        raise OSError("process table unavailable")
+
+    monkeypatch.setattr(guard, "_discover_affected_processes", fail_scan)
+
+    result = guard.try_claim_idle_update("candidate", check_legacy=True)
+
+    assert result.status == "legacy_runtime"
+    assert result.claim is None
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("/repo/venv/bin/hermes dashboard --no-open", True),
+        ("python -m hermes_cli.main serve --port 0", True),
+        ("python /repo/hermes_cli/main.py -p coder dashboard", True),
+        ("python -m tui_gateway.entry", True),
+        ("python /repo/tui_gateway/entry.py", True),
+        ("python -m gateway.run", True),
+        ("/repo/venv/bin/hermes gateway run --replace", True),
+        ("/repo/venv/bin/hermes gateway status", False),
+        ("python worker.py 'please run hermes dashboard later'", False),
+        ("rg -n 'hermes dashboard' hermes_cli", False),
+    ],
+)
+def test_affected_runtime_command_matching_is_entrypoint_exact(
+    guard, command: str, expected: bool
+):
+    assert guard._looks_like_affected_runtime_command(command) is expected
+
+
+def test_cli_release_clears_only_matching_claim(guard, capsys: pytest.CaptureFixture):
+    result = guard.try_claim_idle_update("candidate")
+    assert result.claim is not None
+
+    assert guard.main(["release", "--claim-id", "wrong-id"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"status": "released"}
+    assert guard.snapshot()["update"] is not None
+
+    assert guard.main(["release", "--claim-id", result.claim.id]) == 0
+    assert json.loads(capsys.readouterr().out) == {"status": "released"}
+    assert guard.snapshot()["update"] is None
+
+
+def test_cli_claimed_result_includes_releasable_claim_id(
+    guard,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    monkeypatch.setattr(guard, "_discover_affected_processes", lambda: [])
+
+    assert guard.main(
+        [
+            "claim",
+            "--candidate",
+            "candidate-cli",
+            "--owner-pid",
+            str(os.getpid()),
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "claimed"
+    assert payload["active_turns"] == 0
+    assert isinstance(payload["claim_id"], str) and payload["claim_id"]
+
+    assert guard.main(["release", "--claim-id", payload["claim_id"]]) == 0
+    capsys.readouterr()
+    assert guard.snapshot()["update"] is None

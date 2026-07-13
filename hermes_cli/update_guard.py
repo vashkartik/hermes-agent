@@ -8,8 +8,10 @@ session content: only opaque lease ids and process identity metadata.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -53,7 +55,7 @@ def _lock_path() -> Path:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": _VERSION, "turns": [], "update": None}
+    return {"version": _VERSION, "participants": [], "turns": [], "update": None}
 
 
 class _FileLock:
@@ -151,15 +153,29 @@ def _read_state() -> dict[str, Any]:
         raise _CorruptState("state is not valid JSON") from exc
     if not isinstance(state, dict) or state.get("version") != _VERSION:
         raise _CorruptState("state version is unsupported")
+    # ``participants`` was added before the first guarded release shipped.
+    # Accept a missing key so an interrupted dev rollout can self-migrate.
+    participants = state.get("participants", [])
     turns = state.get("turns")
     update = state.get("update")
-    if not isinstance(turns, list) or (update is not None and not isinstance(update, dict)):
+    if (
+        not isinstance(participants, list)
+        or not isinstance(turns, list)
+        or (update is not None and not isinstance(update, dict))
+    ):
         raise _CorruptState("state shape is invalid")
+    for row in participants:
+        _validate_owner(row)
     for row in turns:
         _validate_owner(row)
     if update is not None:
         _validate_owner(update, update=True)
-    return {"version": _VERSION, "turns": turns, "update": update}
+    return {
+        "version": _VERSION,
+        "participants": participants,
+        "turns": turns,
+        "update": update,
+    }
 
 
 def _write_state(state: dict[str, Any]) -> None:
@@ -255,9 +271,16 @@ def _owner_alive(row: dict[str, Any]) -> bool:
 
 
 def _prune(state: dict[str, Any]) -> bool:
+    participants_before = len(state["participants"])
+    state["participants"] = [
+        row for row in state["participants"] if _owner_alive(row)
+    ]
     before = len(state["turns"])
     state["turns"] = [row for row in state["turns"] if _owner_alive(row)]
-    changed = len(state["turns"]) != before
+    changed = (
+        len(state["participants"]) != participants_before
+        or len(state["turns"]) != before
+    )
     if state.get("update") is not None and not _owner_alive(state["update"]):
         state["update"] = None
         changed = True
@@ -273,6 +296,32 @@ def _new_owner(kind: str, *, pid: int | None = None) -> dict[str, Any]:
         "process_start": _process_start(owner_pid),
         "started_at": str(time.time_ns()),
     }
+
+
+def _same_process_identity(
+    row: dict[str, Any],
+    *,
+    pid: int,
+    process_start: str | None,
+) -> bool:
+    if row.get("pid") != pid:
+        return False
+    expected = row.get("process_start")
+    if expected is None or process_start is None:
+        return expected is None and process_start is None
+    return expected == process_start
+
+
+def _ensure_runtime_participant(state: dict[str, Any], kind: str) -> bool:
+    pid = os.getpid()
+    process_start = _process_start(pid)
+    if any(
+        _same_process_identity(row, pid=pid, process_start=process_start)
+        for row in state["participants"]
+    ):
+        return False
+    state["participants"].append(_new_owner(kind))
+    return True
 
 
 def _release_turn(lease_id: str) -> None:
@@ -299,6 +348,213 @@ def _release_update(claim_id: str) -> None:
             return
         state["update"] = None
         _write_state(state)
+
+
+def _strip_profile_selectors(args: list[str]) -> list[str]:
+    filtered: list[str] = []
+    skip_next = False
+    for token in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in {"--profile", "-p"}:
+            skip_next = True
+            continue
+        if token.startswith("--profile=") or token.startswith("-p="):
+            continue
+        filtered.append(token)
+    return filtered
+
+
+def _hermes_command_hosts_runtime(args: list[str]) -> bool:
+    filtered = _strip_profile_selectors(args)
+    if not filtered:
+        return False
+    command = filtered[0]
+    if command in {"dashboard", "serve"}:
+        return True
+    if command != "gateway":
+        return False
+    return len(filtered) == 1 or filtered[1] in {"run", "restart"}
+
+
+def _looks_like_affected_runtime_command(command: str | None) -> bool:
+    """Match only Hermes runtime entrypoints, never incidental prompt text."""
+    if not command:
+        return False
+    try:
+        tokens = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        tokens = command.split()
+    tokens = [token.strip("\"'").replace("\\", "/").lower() for token in tokens]
+    if not tokens:
+        return False
+
+    # Unwrap the small set of process launch prefixes used by service files.
+    index = 0
+    while index < len(tokens):
+        basename = tokens[index].rsplit("/", 1)[-1]
+        if basename == "nohup":
+            index += 1
+            continue
+        if basename == "env":
+            index += 1
+            while index < len(tokens) and "=" in tokens[index]:
+                index += 1
+            continue
+        break
+    if index >= len(tokens):
+        return False
+
+    executable = tokens[index]
+    basename = executable.rsplit("/", 1)[-1]
+    args = tokens[index + 1 :]
+
+    if basename in {"hermes-gateway", "hermes-gateway.exe"}:
+        return True
+    if basename in {"hermes", "hermes.exe"}:
+        return _hermes_command_hosts_runtime(args)
+
+    is_python = (
+        basename.startswith("python")
+        or basename.startswith("pypy")
+        or basename in {"py", "py.exe"}
+    )
+    if not is_python:
+        return False
+
+    # Python flags may precede ``-m`` (for example ``python -u -m ...``).
+    module_index = None
+    for offset, token in enumerate(args):
+        if token == "-m":
+            module_index = offset
+            break
+        if not token.startswith("-"):
+            break
+    if module_index is not None and module_index + 1 < len(args):
+        module = args[module_index + 1]
+        module_args = args[module_index + 2 :]
+        if module in {"tui_gateway.entry", "gateway.run"}:
+            return True
+        if module == "hermes_cli.main":
+            return _hermes_command_hosts_runtime(module_args)
+        return False
+
+    script = next((token for token in args if not token.startswith("-")), "")
+    if not script:
+        return False
+    if script == "gateway/run.py" or script.endswith("/gateway/run.py"):
+        return True
+    if script == "tui_gateway/entry.py" or script.endswith("/tui_gateway/entry.py"):
+        return True
+    if script == "hermes_cli/main.py" or script.endswith("/hermes_cli/main.py"):
+        try:
+            script_index = args.index(script)
+        except ValueError:
+            return False
+        return _hermes_command_hosts_runtime(args[script_index + 1 :])
+    return False
+
+
+def _discover_affected_processes() -> list[dict[str, Any]]:
+    """Return live dashboard/TUI/gateway processes from the OS process table.
+
+    This is called only by the controller-facing CLI claim path. Ordinary turn
+    acquisition never scans processes.
+    """
+    rows: list[tuple[int, str]] = []
+    if sys.platform == "win32":
+        try:
+            from hermes_cli._subprocess_compat import windows_hide_flags
+
+            result = subprocess.run(
+                ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=windows_hide_flags(),
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise OSError("unable to scan Windows process table") from exc
+        if result.returncode != 0 or result.stdout is None:
+            raise OSError("unable to scan Windows process table")
+        current_command = ""
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("CommandLine="):
+                current_command = stripped[len("CommandLine=") :]
+            elif stripped.startswith("ProcessId="):
+                try:
+                    rows.append((int(stripped[len("ProcessId=") :]), current_command))
+                except ValueError:
+                    continue
+    else:
+        try:
+            result = subprocess.run(
+                ["ps", "-A", "-o", "pid=,command="],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise OSError("unable to scan process table") from exc
+        if result.returncode != 0:
+            raise OSError("unable to scan process table")
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                rows.append((int(parts[0]), parts[1]))
+            except ValueError:
+                continue
+
+    affected: list[dict[str, Any]] = []
+    self_pid = os.getpid()
+    for pid, process_command in rows:
+        if pid == self_pid or not _looks_like_affected_runtime_command(process_command):
+            continue
+        affected.append(
+            {
+                "pid": pid,
+                "process_start": _read_process_start(pid),
+                "command": process_command,
+            }
+        )
+    return affected
+
+
+def _classify_affected_processes(
+    rows: list[dict[str, Any]],
+    guarded_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    classified: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            pid = int(row["pid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        process_start = row.get("process_start", row.get("start"))
+        guarded = any(
+            _same_process_identity(
+                owner,
+                pid=pid,
+                process_start=process_start,
+            )
+            for owner in guarded_rows
+        )
+        classified.append(
+            {
+                "pid": pid,
+                "process_start": process_start,
+                "guarded": guarded,
+            }
+        )
+    return classified
 
 
 @dataclass
@@ -331,6 +587,32 @@ class ClaimResult:
     active_turns: int
     claim: UpdateClaim | None = None
 
+    def to_json(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": self.status,
+            "active_turns": self.active_turns,
+        }
+        if self.claim is not None:
+            payload["claim_id"] = self.claim.id
+        return payload
+
+
+def register_runtime(kind: str) -> None:
+    """Mark this long-lived process as capable of the atomic update guard."""
+    normalized_kind = str(kind).strip()[:64]
+    if not normalized_kind:
+        raise ValueError("runtime kind is required")
+    with _LockedState():
+        try:
+            state = _read_state()
+        except _CorruptState:
+            _backup_corrupt_state()
+            state = _empty_state()
+        changed = _prune(state)
+        changed = _ensure_runtime_participant(state, normalized_kind) or changed
+        if changed:
+            _write_state(state)
+
 
 def acquire_turn(kind: str, session_id: str = "") -> TurnLease:
     """Register a live agent turn or raise when an update owns the drain.
@@ -349,6 +631,7 @@ def acquire_turn(kind: str, session_id: str = "") -> TurnLease:
             _backup_corrupt_state()
             state = _empty_state()
         changed = _prune(state)
+        changed = _ensure_runtime_participant(state, normalized_kind) or changed
         if state.get("update") is not None:
             if changed:
                 _write_state(state)
@@ -363,6 +646,7 @@ def try_claim_idle_update(
     candidate: str,
     *,
     owner_pid: int | None = None,
+    check_legacy: bool = False,
 ) -> ClaimResult:
     """Atomically claim update drain only when no live turn owns a lease."""
     normalized_candidate = str(candidate).strip()[:128]
@@ -382,6 +666,21 @@ def try_claim_idle_update(
             if changed:
                 _write_state(state)
             return ClaimResult("busy", 0)
+        if check_legacy:
+            try:
+                affected = _discover_affected_processes()
+            except Exception:
+                if changed:
+                    _write_state(state)
+                return ClaimResult("legacy_runtime", 0)
+            classified = _classify_affected_processes(
+                affected,
+                state["participants"],
+            )
+            if any(not row["guarded"] for row in classified):
+                if changed:
+                    _write_state(state)
+                return ClaimResult("legacy_runtime", 0)
         row = _new_owner("update", pid=owner_pid)
         row["candidate"] = normalized_candidate
         state["update"] = row
@@ -414,3 +713,40 @@ def snapshot() -> dict[str, Any]:
                 else None
             ),
         }
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Hermes atomic update guard")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    claim = subparsers.add_parser("claim")
+    claim.add_argument("--candidate", required=True)
+    claim.add_argument("--owner-pid", type=int)
+
+    release = subparsers.add_parser("release")
+    release.add_argument("--claim-id", required=True)
+
+    subparsers.add_parser("snapshot")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if args.command == "claim":
+        result = try_claim_idle_update(
+            args.candidate,
+            owner_pid=args.owner_pid,
+            check_legacy=True,
+        )
+        print(json.dumps(result.to_json(), sort_keys=True))
+        return 0
+    if args.command == "release":
+        UpdateClaim(args.claim_id).release()
+        print(json.dumps({"status": "released"}, sort_keys=True))
+        return 0
+    print(json.dumps(snapshot(), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

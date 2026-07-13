@@ -20591,6 +20591,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    try:
+        from hermes_cli.update_guard import register_runtime
+
+        register_runtime("gateway")
+    except Exception as exc:
+        logger.warning("Could not register gateway update-guard capability: %s", exc)
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
