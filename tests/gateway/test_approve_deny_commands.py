@@ -76,6 +76,14 @@ def _clear_approval_state():
     mod._pending.clear()
 
 
+@pytest.fixture(autouse=True)
+def _manual_approval_mode(monkeypatch):
+    """Keep this manual-gateway suite independent of the smart-mode default."""
+    from tools import approval as approval_module
+
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+
+
 # ------------------------------------------------------------------
 # Blocking gateway approval infrastructure (tools/approval.py)
 # ------------------------------------------------------------------
