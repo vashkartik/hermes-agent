@@ -39,6 +39,8 @@ check "$ROOT/tui_gateway/server.py" "timeout=None" "clarify: desktop wait has no
 check "$ROOT/tui_gateway/server.py" '@method("clarify.pending")' "clarify: backend exposes live pending requests"
 check "$DESK/src/app/gateway/hooks/use-gateway-boot.ts" "syncPendingClarifyRequests(gateway)" "clarify: primary sockets replay pending requests"
 check "$DESK/src/store/gateway.ts" "syncPendingClarifyRequests(entry.gateway)" "clarify: secondary profile sockets replay pending requests"
+check "$DESK/src/store/active-session.ts" 'atom<string | null>(null)' "clarify: cycle-free active-session leaf exists"
+check "$DESK/src/store/clarify.ts" "from './active-session'" "clarify: selector uses cycle-free active-session leaf"
 
 if [ "${CAPELLA_PATCH_GUARD_CLARIFY_ONLY:-0}" = "1" ]; then
   finish_guard "persistent clarify patch guard"

@@ -8,6 +8,10 @@ import { persistBoolean, persistString, storedBoolean, storedString } from '@/li
 import { $activeGatewayProfile, $gatewaySwapTarget, normalizeProfileKey } from '@/store/profile'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
+import { $activeSessionId } from './active-session'
+
+export { $activeSessionId, setActiveSessionId } from './active-session'
+
 type Updater<T> = T | ((current: T) => T)
 
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
@@ -230,7 +234,6 @@ export const $messagingTruncated = atom<boolean>(false)
 export const $sessionProfileTotals = atom<Record<string, number>>({})
 export const $sessionsLoading = atom(true)
 export const $workingSessionIds = atom<string[]>([])
-export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
 export const $messages = atom<ChatMessage[]>([])
 
@@ -304,7 +307,6 @@ export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =
   updateAtom($sessionProfileTotals, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
-export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 
 // ── Per-profile last active session ────────────────────────────────────────
 // Remember which session was open in each profile so switching profiles

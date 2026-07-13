@@ -2,9 +2,9 @@ import { atom } from 'nanostores'
 
 import { persistString, storedString } from '@/lib/storage'
 
+import { $activeSessionId } from './active-session'
 import { $gateway } from './gateway'
 import { clearApprovalRequest } from './prompts'
-import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
 // toast feed in `notifications.ts`. Each kind toggles independently.
