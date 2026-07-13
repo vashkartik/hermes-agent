@@ -911,12 +911,17 @@ def interrupt_for_session(
 
 
 def _reset_for_tests() -> None:
-    """Test-only: clear all state and tear down the executor."""
+    """Test-only: quiesce workers, then clear all state and the executor."""
     global _executor, _executor_max_workers
     with _executor_lock:
-        if _executor is not None:
-            _executor.shutdown(wait=False)
+        executor = _executor
         _executor = None
         _executor_max_workers = 0
+    # ``wait=False`` lets a just-released worker publish after the fixture has
+    # drained the shared queue, leaking its completion into the next test. Test
+    # runners are bounded and release their gates before teardown, so join them
+    # here and cancel only work that never started.
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=True)
     with _records_lock:
         _records.clear()
