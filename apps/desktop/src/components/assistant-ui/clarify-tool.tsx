@@ -171,9 +171,18 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
 
 function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const messageRunning = useAuiState(selectMessageRunning)
+  const request = useStore($clarifyRequest)
+  const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
+  const backendStillWaiting = Boolean(
+    request && (!fromArgs.question || !request.question || fromArgs.question === request.question)
+  )
 
-  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
-  if (!messageRunning) {
+  // A transcript restored after a renderer remount no longer marks its last
+  // assistant message as "running", even while the backend is still blocked on
+  // this live clarify request. Backend truth wins: reopen the interactive panel
+  // whenever clarify.pending rehydrates a matching request. Only fall back to a
+  // settled tool row when neither source says the question is live.
+  if (!messageRunning && !backendStillWaiting) {
     return <ToolFallback {...props} />
   }
 
