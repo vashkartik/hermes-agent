@@ -1,7 +1,7 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
+import { $activeSessionId } from './active-session'
 import { $clarifyRequest } from './clarify'
-import { $activeSessionId } from './session'
 
 // Blocking interactive prompts the gateway raises mid-turn. Each maps to a
 // `*.request` event the Python side emits while it blocks the agent thread

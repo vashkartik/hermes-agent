@@ -12,6 +12,7 @@ copy_sources() {
     "$TMP_ROOT/apps/desktop/src/store" \
     "$TMP_ROOT/apps/desktop/src/app/gateway/hooks"
   cp "$ROOT/tui_gateway/server.py" "$TMP_ROOT/tui_gateway/server.py"
+  cp "$ROOT/apps/desktop/src/store/active-session.ts" "$TMP_ROOT/apps/desktop/src/store/active-session.ts"
   cp "$ROOT/apps/desktop/src/store/clarify.ts" "$TMP_ROOT/apps/desktop/src/store/clarify.ts"
   cp "$ROOT/apps/desktop/src/store/gateway.ts" "$TMP_ROOT/apps/desktop/src/store/gateway.ts"
   cp \
@@ -67,5 +68,9 @@ assert_missing_marker_fails \
   "apps/desktop/src/store/gateway.ts" \
   "syncPendingClarifyRequests(entry.gateway)" \
   "clarify: secondary profile sockets replay pending requests"
+assert_missing_marker_fails \
+  "apps/desktop/src/store/clarify.ts" \
+  "from './active-session'" \
+  "clarify: selector uses cycle-free active-session leaf"
 
 echo "ok - patch guard protects persistent clarify recovery"

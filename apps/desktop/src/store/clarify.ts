@@ -1,6 +1,6 @@
 import { atom, computed } from 'nanostores'
 
-import { $activeSessionId } from './session'
+import { $activeSessionId } from './active-session'
 
 export interface ClarifyRequest {
   requestId: string
