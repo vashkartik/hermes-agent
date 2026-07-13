@@ -2,6 +2,7 @@ import { type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@h
 import { atom } from 'nanostores'
 
 import { HermesGateway } from '@/hermes'
+import { syncPendingClarifyRequests } from '@/store/clarify'
 import { setGatewayState } from '@/store/session'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
@@ -112,6 +113,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
   const conn = await desktop.getConnection(entry.profile)
   const wsUrl = await resolveGatewayWsUrl(desktop, conn)
   await entry.gateway.connect(wsUrl)
+  await syncPendingClarifyRequests(entry.gateway).catch(() => undefined)
   void desktop.touchBackend?.(entry.profile).catch(() => undefined)
 }
 
@@ -164,7 +166,7 @@ function createSecondary(profile: string): Secondary {
     wantOpen: true
   }
 
-  entry.offEvent = gateway.onEvent(event => config?.onEvent(event))
+  entry.offEvent = gateway.onEvent(event => config?.onEvent({ ...event, profile }))
   entry.offState = gateway.onState(state => {
     reportGatewayState(profile, state)
 
