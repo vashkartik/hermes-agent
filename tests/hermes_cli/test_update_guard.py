@@ -25,6 +25,24 @@ def guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return update_guard
 
 
+def test_pid_alive_never_uses_os_kill_on_windows(guard, monkeypatch):
+    checked: list[int] = []
+    monkeypatch.setattr(guard.os, "name", "nt")
+    monkeypatch.setattr(
+        guard.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("os.kill used")),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_windows_pid_alive",
+        lambda pid: checked.append(pid) or True,
+    )
+
+    assert guard._pid_alive(12345) is True
+    assert checked == [12345]
+
+
 def test_live_turn_makes_update_claim_busy(guard):
     lease = guard.acquire_turn("desktop")
 

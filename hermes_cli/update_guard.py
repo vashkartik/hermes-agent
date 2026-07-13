@@ -209,8 +209,10 @@ def _backup_corrupt_state() -> None:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — POSIX-only branch above
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -218,6 +220,33 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Probe a Windows PID without sending a console control event."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        process_query_limited_information = 0x1000
+        synchronize = 0x100000
+        wait_timeout = 0x00000102
+        error_access_denied = 5
+        handle = kernel32.OpenProcess(
+            process_query_limited_information | synchronize,
+            False,
+            int(pid),
+        )
+        if not handle:
+            return ctypes.get_last_error() == error_access_denied
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError):
+        return False
 
 
 def _read_process_start(pid: int) -> str | None:
