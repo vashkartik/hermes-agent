@@ -8,12 +8,12 @@
 #
 #   bash apps/desktop/scripts/capella-patch-guard.sh
 set -uo pipefail
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+ROOT="${CAPELLA_PATCH_GUARD_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 DESK="$ROOT/apps/desktop"
 fail=0
 
 check() { # <file> <marker> <description>
-  if grep -q "$2" "$1" 2>/dev/null; then
+  if grep -Fq "$2" "$1" 2>/dev/null; then
     echo "  ok   $3"
   else
     echo "  MISS $3  ($1 :: /$2/)"
@@ -21,7 +21,30 @@ check() { # <file> <marker> <description>
   fi
 }
 
+finish_guard() {
+  local label="$1"
+
+  if [ "$fail" -ne 0 ]; then
+    echo ""
+    echo "PATCH GUARD FAILED — a Capella patch is missing. A rebase likely dropped it."
+    echo "Re-apply from the capella/patches history before rebuilding/shipping."
+    return 1
+  fi
+
+  echo "$label passed — all protected patches present."
+}
+
 echo "Capella patch guard — verifying our fork patches survived:"
+check "$ROOT/tui_gateway/server.py" "timeout=None" "clarify: desktop wait has no wall-clock timeout"
+check "$ROOT/tui_gateway/server.py" '@method("clarify.pending")' "clarify: backend exposes live pending requests"
+check "$DESK/src/app/gateway/hooks/use-gateway-boot.ts" "syncPendingClarifyRequests(gateway)" "clarify: primary sockets replay pending requests"
+check "$DESK/src/store/gateway.ts" "syncPendingClarifyRequests(entry.gateway)" "clarify: secondary profile sockets replay pending requests"
+
+if [ "${CAPELLA_PATCH_GUARD_CLARIFY_ONLY:-0}" = "1" ]; then
+  finish_guard "persistent clarify patch guard"
+  exit $?
+fi
+
 check "$DESK/src/components/chat/intro.tsx"      "HERO_EMOJI_BY_KEY"  "hero: per-agent emoji + name (King/Rook)"
 check "$DESK/src/store/session.ts"               "hermes:last-session:" "persistence: last session per profile"
 check "$DESK/src/store/session.ts"               'selectedStoredSessionId.subscribe' "persistence: last-session stores STORED ids (not runtime ids)"
@@ -39,7 +62,12 @@ check "$DESK/src/app/memories/index.tsx"         "MemoriesView"       "memories:
 check "$DESK/src/app/routes.ts"                  "MEMORIES_ROUTE"     "memories: /memories route + sidebar nav entry"
 check "$DESK/tsconfig.json"                      "noEmit"             "build hygiene: tsc -b must not emit .js beside .ts sources"
 check "$DESK/scripts/bundle-electron-main.mjs"   "preload.cjs"        "ace embed: legacy electron/preload.cjs copy in the packaged app"
-[ -f "$DESK/CAPELLA_FORK.md" ] && echo "  ok   fork doc (CAPELLA_FORK.md)" || { echo "  MISS CAPELLA_FORK.md"; fail=1; }
+if [ -f "$DESK/CAPELLA_FORK.md" ]; then
+  echo "  ok   fork doc (CAPELLA_FORK.md)"
+else
+  echo "  MISS CAPELLA_FORK.md"
+  fail=1
+fi
 
 # Gateway patch — best-effort: only checks when upstream is fetched locally.
 if git -C "$ROOT" rev-parse --verify -q upstream/main >/dev/null 2>&1; then
@@ -53,10 +81,4 @@ else
   echo "  --   gateway: skipped (fetch 'upstream' to verify the gateway.py patch)"
 fi
 
-if [ "$fail" -ne 0 ]; then
-  echo ""
-  echo "PATCH GUARD FAILED — a Capella patch is missing. A rebase likely dropped it."
-  echo "Re-apply from the capella/patches history before rebuilding/shipping."
-  exit 1
-fi
-echo "patch guard passed — all Capella patches present."
+finish_guard "patch guard"
