@@ -40,6 +40,7 @@ def server():
         # via reload (which we don't do).
         mod._sessions.clear()
         mod._pending.clear()
+        mod._pending_prompt_payloads.clear()
         mod._answers.clear()
 
 
@@ -300,6 +301,172 @@ def test_close_session_releases_indefinite_desktop_prompt(server, monkeypatch):
     assert server._close_session_by_id("sid-live") is True
     assert event.is_set()
     assert server._answers["clarify-1"] == ""
+
+
+def test_clarify_pending_returns_only_live_clarify_requests(server):
+    clarify_a = threading.Event()
+    clarify_b = threading.Event()
+    sudo = threading.Event()
+    with server._prompt_lock:
+        server._pending.update(
+            {
+                "clarify-a": ("sid-a", clarify_a),
+                "sudo-a": ("sid-a", sudo),
+                "clarify-b": ("sid-b", clarify_b),
+            }
+        )
+        server._pending_prompt_payloads.update(
+            {
+                "clarify-a": (
+                    "clarify.request",
+                    {
+                        "request_id": "clarify-a",
+                        "question": "Where should this open?",
+                        "choices": ["Ace browser", "Chrome"],
+                    },
+                ),
+                "sudo-a": (
+                    "sudo.request",
+                    {"request_id": "sudo-a", "prompt": "Password:"},
+                ),
+                "clarify-b": (
+                    "clarify.request",
+                    {
+                        "request_id": "clarify-b",
+                        "question": "Ship this now?",
+                        "choices": None,
+                    },
+                ),
+            }
+        )
+        pending_before = dict(server._pending)
+        payloads_before = {
+            request_id: (event, dict(payload))
+            for request_id, (event, payload) in server._pending_prompt_payloads.items()
+        }
+
+    response = server.dispatch(
+        {"jsonrpc": "2.0", "id": "p1", "method": "clarify.pending", "params": {}}
+    )
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "p1",
+        "result": {
+            "requests": [
+                {
+                    "request_id": "clarify-a",
+                    "session_id": "sid-a",
+                    "question": "Where should this open?",
+                    "choices": ["Ace browser", "Chrome"],
+                },
+                {
+                    "request_id": "clarify-b",
+                    "session_id": "sid-b",
+                    "question": "Ship this now?",
+                    "choices": None,
+                },
+            ]
+        },
+    }
+    assert server._pending == pending_before
+    assert server._pending_prompt_payloads == payloads_before
+
+    response["result"]["requests"][0]["choices"].append("mutated")
+    assert server._pending_prompt_payloads["clarify-a"][1]["choices"] == [
+        "Ace browser",
+        "Chrome",
+    ]
+
+
+def test_clarify_pending_can_scope_to_one_session(server):
+    with server._prompt_lock:
+        server._pending.update(
+            {
+                "clarify-a": ("sid-a", threading.Event()),
+                "clarify-b": ("sid-b", threading.Event()),
+            }
+        )
+        server._pending_prompt_payloads.update(
+            {
+                "clarify-a": (
+                    "clarify.request",
+                    {"question": "Question A", "choices": ["A"]},
+                ),
+                "clarify-b": (
+                    "clarify.request",
+                    {"question": "Question B", "choices": ["B"]},
+                ),
+            }
+        )
+
+    response = server.dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": "p2",
+            "method": "clarify.pending",
+            "params": {"session_id": "sid-b"},
+        }
+    )
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "p2",
+        "result": {
+            "requests": [
+                {
+                    "request_id": "clarify-b",
+                    "session_id": "sid-b",
+                    "question": "Question B",
+                    "choices": ["B"],
+                }
+            ]
+        },
+    }
+
+
+def test_clarify_pending_drops_answered_request(server):
+    answered = threading.Event()
+    answered.set()
+    with server._prompt_lock:
+        server._pending.update(
+            {
+                "answered": ("sid-a", answered),
+                "live": ("sid-a", threading.Event()),
+            }
+        )
+        server._pending_prompt_payloads.update(
+            {
+                "answered": (
+                    "clarify.request",
+                    {"question": "Already answered", "choices": None},
+                ),
+                "live": (
+                    "clarify.request",
+                    {"question": "Still waiting", "choices": None},
+                ),
+            }
+        )
+        server._answers["answered"] = "done"
+
+    response = server.dispatch(
+        {"jsonrpc": "2.0", "id": "p3", "method": "clarify.pending", "params": {}}
+    )
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "p3",
+        "result": {
+            "requests": [
+                {
+                    "request_id": "live",
+                    "session_id": "sid-a",
+                    "question": "Still waiting",
+                    "choices": None,
+                }
+            ]
+        },
+    }
 
 
 @pytest.mark.parametrize("event", ["secret.request", "sudo.request"])

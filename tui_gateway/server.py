@@ -2127,6 +2127,36 @@ def _block(
     return answer
 
 
+def _pending_clarify_requests(session_id: str = "") -> list[dict]:
+    """Return a detached snapshot of live desktop clarify prompts."""
+    with _prompt_lock:
+        rows = []
+        for request_id, (owner_sid, pending_event) in _pending.items():
+            event, payload = _pending_prompt_payloads.get(request_id, ("", {}))
+            if event != "clarify.request":
+                continue
+            if session_id and owner_sid != session_id:
+                continue
+            if pending_event.is_set() or request_id in _answers:
+                continue
+
+            raw_choices = payload.get("choices")
+            choices = (
+                [str(choice) for choice in raw_choices]
+                if isinstance(raw_choices, list)
+                else None
+            )
+            rows.append(
+                {
+                    "request_id": request_id,
+                    "session_id": owner_sid,
+                    "question": str(payload.get("question") or ""),
+                    "choices": choices,
+                }
+            )
+        return rows
+
+
 def _clear_pending(sid: str | None = None) -> None:
     """Release pending prompts with an empty answer.
 
@@ -10340,6 +10370,18 @@ def _respond(rid, params, key, *, allow_expired=False):
 @method("clarify.respond")
 def _(rid, params: dict) -> dict:
     return _respond(rid, params, "answer")
+
+
+@method("clarify.pending")
+def _(rid, params: dict) -> dict:
+    return _ok(
+        rid,
+        {
+            "requests": _pending_clarify_requests(
+                str(params.get("session_id") or "")
+            )
+        },
+    )
 
 
 @method("terminal.read.respond")
