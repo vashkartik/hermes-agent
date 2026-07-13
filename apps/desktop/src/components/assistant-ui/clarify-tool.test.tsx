@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesGateway } from '@/hermes'
 import { I18nProvider } from '@/i18n'
-import { setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $activeSessionId } from '@/store/session'
 
@@ -15,17 +15,22 @@ vi.mock('@/lib/haptics', () => ({
   triggerHaptic: vi.fn()
 }))
 
-// ClarifyTool gates the interactive panel on the live message's running state
-// via useAuiState, which needs a full thread/message provider tree. These
-// tests exercise the yes/no-choice logic directly, so answer the selector
-// with a running message instead of mounting a whole Thread.
+let mockMessageRunning = true
+
+// ClarifyTool reads the live message's running state via useAuiState, which
+// needs a full thread/message provider tree. Most tests answer the selector
+// with a running message instead of mounting a whole Thread; the remount test
+// flips it to complete to cover backend-authoritative recovery.
 vi.mock('@assistant-ui/react', async importOriginal => {
-  const mod = await importOriginal<typeof import('@assistant-ui/react')>()
+  const mod = await importOriginal<Record<string, unknown>>()
 
   return {
     ...mod,
     useAuiState: (selector: (state: unknown) => unknown) =>
-      selector({ message: { status: { type: 'running' } }, thread: { isRunning: true } })
+      selector({
+        message: { status: { type: mockMessageRunning ? 'running' : 'complete' } },
+        thread: { isRunning: mockMessageRunning }
+      })
   }
 })
 
@@ -76,6 +81,8 @@ function settledClarifyProps(
 
 afterEach(() => {
   cleanup()
+  mockMessageRunning = true
+  clearClarifyRequest()
   $activeSessionId.set(null)
   $gateway.set(null)
 })
@@ -128,6 +135,24 @@ describe('ClarifyTool', () => {
     expect(screen.queryByRole('button', { name: /Yes$/ })).toBeNull()
     expect(screen.queryByRole('button', { name: /No$/ })).toBeNull()
     expect(screen.getByRole('textbox')).toBeTruthy()
+  })
+
+  it('reopens a backend-pending question after the transcript remounts as complete', () => {
+    mockGateway()
+    mockMessageRunning = false
+    $activeSessionId.set('sess-1')
+    setClarifyRequest({
+      requestId: 'req-remount',
+      question: 'Which option should I keep?',
+      choices: ['Alpha', 'Beta'],
+      sessionId: 'sess-1'
+    })
+
+    renderPendingClarify({ question: 'Which option should I keep?', choices: ['Alpha', 'Beta'] })
+
+    expect(screen.getByText('Which option should I keep?')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Alpha$/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Beta$/ })).toBeTruthy()
   })
 })
 
