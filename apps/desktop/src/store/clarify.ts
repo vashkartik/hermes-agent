@@ -26,8 +26,79 @@ export const $clarifyRequest = computed(
   (requests, activeId) => requests[keyFor(activeId)] ?? null
 )
 
+function sameClarifyRequest(left: ClarifyRequest, right: ClarifyRequest): boolean {
+  if (
+    left.requestId !== right.requestId ||
+    left.question !== right.question ||
+    left.sessionId !== right.sessionId
+  ) {
+    return false
+  }
+
+  if (left.choices === null || right.choices === null) {
+    return left.choices === right.choices
+  }
+
+  return (
+    left.choices.length === right.choices.length &&
+    left.choices.every((choice, index) => choice === right.choices?.[index])
+  )
+}
+
 export function setClarifyRequest(request: ClarifyRequest): void {
-  $clarifyRequests.set({ ...$clarifyRequests.get(), [keyFor(request.sessionId)]: request })
+  const requests = $clarifyRequests.get()
+  const key = keyFor(request.sessionId)
+  const current = requests[key]
+
+  if (current && sameClarifyRequest(current, request)) {
+    return
+  }
+
+  $clarifyRequests.set({ ...requests, [key]: request })
+}
+
+interface ClarifyGateway {
+  request<T>(method: string, params?: Record<string, unknown>): Promise<T>
+}
+
+interface PendingClarifyResponse {
+  requests?: Array<{
+    request_id?: unknown
+    session_id?: unknown
+    question?: unknown
+    choices?: unknown
+  } | null>
+}
+
+export async function syncPendingClarifyRequests(gateway: ClarifyGateway): Promise<void> {
+  const result = await gateway.request<PendingClarifyResponse>('clarify.pending', {})
+  const rows = Array.isArray(result?.requests) ? result.requests : []
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') {
+      continue
+    }
+
+    const requestId = typeof row.request_id === 'string' ? row.request_id.trim() : ''
+    const sessionId = typeof row.session_id === 'string' ? row.session_id : null
+    const question = typeof row.question === 'string' ? row.question : ''
+
+    if (!requestId || sessionId === null || !question.trim()) {
+      continue
+    }
+
+    let choices: string[] | null = null
+
+    if (row.choices !== null && row.choices !== undefined) {
+      if (!Array.isArray(row.choices) || !row.choices.every(choice => typeof choice === 'string')) {
+        continue
+      }
+
+      choices = [...row.choices]
+    }
+
+    setClarifyRequest({ requestId, sessionId, question, choices })
+  }
 }
 
 export function clearClarifyRequest(requestId?: string, sessionId?: string | null): void {

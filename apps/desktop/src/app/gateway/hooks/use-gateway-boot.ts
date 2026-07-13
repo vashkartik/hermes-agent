@@ -12,6 +12,7 @@ import {
   failDesktopBoot,
   setDesktopBootStep
 } from '@/store/boot'
+import { syncPendingClarifyRequests } from '@/store/clarify'
 import {
   $gateway,
   closeSecondaryGateways,
@@ -168,6 +169,7 @@ export function useGatewayBoot({
 
         reconnectAttempt = 0
         // Resync state that may have moved on the backend while we were asleep.
+        await syncPendingClarifyRequests(gateway).catch(() => undefined)
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
       } catch (err) {
@@ -295,6 +297,7 @@ export function useGatewayBoot({
           return
         }
 
+        await syncPendingClarifyRequests(gateway).catch(() => undefined)
         await adoptPrimaryProfile()
         await seedDefaultCwd()
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
@@ -468,6 +471,7 @@ export function useGatewayBoot({
           return
         }
 
+        await syncPendingClarifyRequests(gateway).catch(() => undefined)
         await adoptPrimaryProfile()
 
         setDesktopBootStep({
