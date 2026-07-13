@@ -17,6 +17,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
+from hermes_cli.update_guard import try_claim_idle_update
 
 
 class _FakeAdapter:
@@ -146,6 +147,66 @@ async def test_sentinel_cleaned_up_on_exception():
     assert session_key not in runner._running_agents, (
         "Sentinel must be removed even if handler raises"
     )
+
+
+@pytest.mark.asyncio
+async def test_update_claim_refuses_new_gateway_turn_without_mutating_session():
+    """An update that won the atomic claim must reject a new agent turn."""
+    runner = _make_runner()
+    event = _make_event()
+    session_key = build_session_key(event.source)
+    agent_started = False
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        nonlocal agent_started
+        agent_started = True
+        return "unexpected"
+
+    result = try_claim_idle_update("candidate-gateway-block")
+    assert result.status == "claimed"
+    assert result.claim is not None
+    try:
+        with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+            response = await runner._handle_message(event)
+    finally:
+        result.claim.release()
+
+    assert response == (
+        "⏳ Hermes is applying an update and isn't accepting new turns right now. "
+        "Please resend shortly."
+    )
+    assert agent_started is False
+    assert session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
+async def test_running_gateway_turn_holds_update_lease_until_handler_finishes():
+    """The guard covers slow setup, the full agent run, and final cleanup."""
+    runner = _make_runner()
+    event = _make_event(chat_id="lease-chat")
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        entered.set()
+        await finish.wait()
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        task = asyncio.create_task(runner._handle_message(event))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        blocked = try_claim_idle_update("candidate-during-gateway-turn")
+        assert blocked.status == "busy"
+        assert blocked.active_turns == 1
+
+        finish.set()
+        assert await task == "ok"
+
+    claimed = try_claim_idle_update("candidate-after-gateway-turn")
+    assert claimed.status == "claimed"
+    assert claimed.claim is not None
+    claimed.claim.release()
 
 
 # ------------------------------------------------------------------

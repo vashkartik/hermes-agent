@@ -1078,6 +1078,88 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_waits_while_update_owns_drain():
+    """Synthetic recovery turns must not start after an update wins the claim."""
+    from hermes_cli.update_guard import try_claim_idle_update
+
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-during-update")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:resume-during-update",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    claimed = try_claim_idle_update("candidate-before-auto-resume")
+    assert claimed.status == "claimed"
+    assert claimed.claim is not None
+    try:
+        scheduled = runner._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
+    finally:
+        claimed.claim.release()
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert pending_entry.session_key not in runner._running_agents
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_holds_update_lease_until_dispatch_finishes():
+    """A scheduled recovery dispatch participates in the same atomic guard."""
+    from hermes_cli.update_guard import try_claim_idle_update
+
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="guarded-resume")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:guarded-resume",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    finish = asyncio.Event()
+
+    async def slow_handle_message(event):
+        await finish.wait()
+
+    adapter.handle_message = slow_handle_message
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+
+    blocked = try_claim_idle_update("candidate-during-auto-resume")
+    assert blocked.status == "busy"
+    assert blocked.active_turns == 1
+
+    finish.set()
+    for _ in range(20):
+        if pending_entry.session_key not in runner._running_agents:
+            break
+        await asyncio.sleep(0.01)
+
+    claimed = try_claim_idle_update("candidate-after-auto-resume")
+    assert claimed.status == "claimed"
+    assert claimed.claim is not None
+    claimed.claim.release()
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_includes_crash_recovery():
     """Crash-recovered sessions (reason=restart_interrupted) are also auto-resumed.
 
