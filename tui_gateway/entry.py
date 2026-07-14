@@ -291,6 +291,13 @@ def join_mcp_discovery(timeout: float | None = None) -> bool:
 
 
 def main():
+    try:
+        from hermes_cli.update_guard import register_runtime
+
+        register_runtime("tui-gateway")
+    except Exception:
+        logger.warning("Could not register TUI update-guard capability", exc_info=True)
+
     _install_sidecar_publisher()
 
     # MCP tool discovery — runs in a background daemon thread so a slow or

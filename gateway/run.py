@@ -5179,6 +5179,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None, None
 
     @staticmethod
+    def _try_acquire_update_turn_lease(kind: str) -> Any:
+        """Claim the shared turn/update exclusion guard, failing closed."""
+        try:
+            from hermes_cli.update_guard import acquire_turn
+
+            return acquire_turn(kind)
+        except Exception as exc:
+            try:
+                from hermes_cli.update_guard import UpdateDrainActive
+
+                if isinstance(exc, UpdateDrainActive):
+                    logger.info("Refusing %s turn while an update owns the drain", kind)
+                else:
+                    logger.warning("Failed to claim Hermes update guard: %s", exc)
+            except Exception:
+                logger.warning("Failed to claim Hermes update guard: %s", exc)
+            return None
+
+    @staticmethod
+    def _release_update_turn_lease(lease: Any) -> None:
+        if lease is None:
+            return
+        try:
+            lease.release()
+        except Exception:
+            logger.warning("Failed to release Hermes update guard", exc_info=True)
+
+    @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
         """Return True when *running_agent* is currently driving subagents
         via the ``delegate_task`` tool.
@@ -6493,6 +6521,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: BasePlatformAdapter,
         event: MessageEvent,
         session_key: str,
+        update_turn_lease: Any,
     ) -> None:
         """Dispatch one synthetic startup resume and wait for its agent turn.
 
@@ -6514,8 +6543,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before spawning this task.  If adapter.handle_message raises
             # before _handle_message takes ownership, release that pre-claim;
             # otherwise the real run's normal cleanup owns the slot.
-            if self._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(session_key)
+            try:
+                if self._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
+                    self._release_running_agent_state(session_key)
+            finally:
+                self._release_update_turn_lease(update_turn_lease)
 
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
@@ -6678,6 +6710,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
+            update_turn_lease = self._try_acquire_update_turn_lease("gateway-resume")
+            if update_turn_lease is None:
+                logger.info(
+                    "Deferring auto-resume for %s while an update owns the drain",
+                    entry.session_key,
+                )
+                continue
+
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
             # first await (where _process_message_background sets the real
@@ -6696,9 +6736,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
             )
-            task = asyncio.create_task(
-                self._run_startup_resume_event(adapter, event, entry.session_key)
-            )
+            try:
+                task = asyncio.create_task(
+                    self._run_startup_resume_event(
+                        adapter,
+                        event,
+                        entry.session_key,
+                        update_turn_lease,
+                    )
+                )
+            except Exception:
+                self._release_running_agent_state(entry.session_key)
+                self._release_update_turn_lease(update_turn_lease)
+                raise
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
             if getattr(self, "_startup_restore_in_progress", False):
@@ -10287,6 +10337,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        update_turn_lease = self._try_acquire_update_turn_lease("gateway")
+        if update_turn_lease is None:
+            return (
+                "⏳ Hermes is applying an update and isn't accepting new turns right now. "
+                "Please resend shortly."
+            )
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -10303,6 +10360,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
             )
+            self._release_update_turn_lease(update_turn_lease)
             return _limit_message
         if _active_session_lease is not None:
             if not hasattr(self, "_active_session_leases"):
@@ -10361,7 +10419,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            try:
+                self._release_running_agent_state(_quick_key)
+            finally:
+                self._release_update_turn_lease(update_turn_lease)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -20530,6 +20591,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    try:
+        from hermes_cli.update_guard import register_runtime
+
+        register_runtime("gateway")
+    except Exception as exc:
+        logger.warning("Could not register gateway update-guard capability: %s", exc)
+
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale

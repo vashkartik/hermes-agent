@@ -177,6 +177,41 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_start_gateway_registers_guarded_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    registered = []
+
+    class _CleanExitRunner:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit_cleanly = True
+            self.exit_reason = None
+            self.exit_code = None
+            self.adapters = {}
+
+        async def start(self):
+            return True
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run.GatewayRunner", _CleanExitRunner)
+    monkeypatch.setattr(
+        "hermes_cli.update_guard.register_runtime",
+        lambda kind: registered.append(kind),
+    )
+
+    from gateway.run import start_gateway
+
+    assert await start_gateway(config=GatewayConfig(), replace=False, verbosity=1)
+    assert registered == ["gateway"]
+
+
+@pytest.mark.asyncio
 async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

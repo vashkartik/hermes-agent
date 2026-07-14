@@ -17305,6 +17305,13 @@ def start_server(
     import uvicorn
 
     try:
+        from hermes_cli.update_guard import register_runtime
+
+        register_runtime("dashboard")
+    except Exception as exc:
+        _log.warning("Could not register dashboard update-guard capability: %s", exc)
+
+    try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
 
         start_nous_auth_keepalive()
