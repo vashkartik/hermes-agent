@@ -10143,7 +10143,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                             process_registry.completion_queue.put(pending_evt)
                         break
                     if not _claim_update_turn(session):
-                        process_registry.completion_queue.put(_evt)
+                        # Update drain holds the turn lease: requeue the WHOLE
+                        # remaining batch, not just this event — everything in
+                        # drained[] was already removed from the queue.
+                        for pending_evt, _pending_synth in drained[index:]:
+                            process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
                 from tools.async_delegation import (

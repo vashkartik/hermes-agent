@@ -3303,6 +3303,62 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             process_registry._poll_observed.discard(event["session_id"])
 
 
+def test_run_prompt_submit_requeues_whole_batch_when_update_turn_claim_fails(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    # First claim (the main turn's own lease) succeeds; the post-turn drain's
+    # claim is denied, simulating an update drain grabbing the lease mid-batch.
+    claims = iter([True])
+    monkeypatch.setattr(
+        server, "_claim_update_turn", lambda _session, **_kw: next(claims, False)
+    )
+    turns = []
+    session = _session(
+        session_key="session-a",
+        agent=_RecordingAgent(turns),
+        running=True,
+    )
+    events = [
+        {
+            "type": "completion",
+            "session_id": f"proc_claim_{index}",
+            "session_key": "session-a",
+            "command": "safe-test-command",
+            "exit_code": 0,
+            "output": f"owned-{index}",
+        }
+        for index in range(1, 4)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
+
+        # An update drain holds the turn lease: no notification turn may start,
+        # and EVERY drained event must go back on the queue — losing the tail
+        # of the batch (drained but never requeued) is the regression guarded
+        # here.
+        assert turns == ["session-a-turn"]
+        requeued = []
+        while not isolated_queue.empty():
+            requeued.append(isolated_queue.get_nowait()["session_id"])
+        assert sorted(requeued) == ["proc_claim_1", "proc_claim_2", "proc_claim_3"]
+    finally:
+        server._sessions.pop("sid_a", None)
+        for event in events:
+            process_registry._completion_consumed.discard(event["session_id"])
+            process_registry._poll_observed.discard(event["session_id"])
+
+
 def test_run_prompt_submit_delivers_completion_owned_through_compression_lineage(
     monkeypatch, tmp_path
 ):
