@@ -5,6 +5,10 @@ import type { DesktopUpdateStatus } from '@/global'
 const storage = new Map<string, string>()
 
 vi.mock('@/lib/storage', () => ({
+  // Extra exports beyond what updates.ts itself touches: our patched
+  // session.ts imports @/store/profile, which pulls the full storage surface
+  // into this test's module graph at load time.
+  arraysEqual: (a: unknown[], b: unknown[]) => a.length === b.length && a.every((v, i) => v === b[i]),
   persistBoolean: (key: string, value: boolean) => {
     storage.set(key, String(value))
   },
@@ -15,12 +19,16 @@ vi.mock('@/lib/storage', () => ({
       storage.set(key, value)
     }
   },
+  persistStringArray: () => {},
+  persistStringRecord: () => {},
   storedBoolean: (key: string, fallback: boolean) => {
     const value = storage.get(key)
 
     return value === undefined ? fallback : value === 'true'
   },
-  storedString: (key: string) => storage.get(key) ?? null
+  storedString: (key: string) => storage.get(key) ?? null,
+  storedStringArray: () => [],
+  storedStringRecord: () => ({})
 }))
 
 const notifySpy = vi.fn()
@@ -38,7 +46,11 @@ const getActionStatusSpy = vi.fn()
 vi.mock('@/hermes', () => ({
   checkHermesUpdate: (...args: unknown[]) => checkHermesUpdateSpy(...args),
   updateHermes: (...args: unknown[]) => updateHermesSpy(...args),
-  getActionStatus: (...args: unknown[]) => getActionStatusSpy(...args)
+  getActionStatus: (...args: unknown[]) => getActionStatusSpy(...args),
+  // @/store/profile reaches this mock through our patched session.ts import.
+  getProfiles: vi.fn().mockResolvedValue([]),
+  setApiRequestProfile: vi.fn(),
+  STARTUP_REQUEST_TIMEOUT_MS: 15000
 }))
 
 const {

@@ -50,7 +50,9 @@ fi
 check "$DESK/src/components/chat/intro.tsx"      "HERO_EMOJI_BY_KEY"  "hero: per-agent emoji + name (King/Rook)"
 check "$DESK/src/store/session.ts"               "hermes:last-session:" "persistence: last session per profile"
 check "$DESK/src/store/session.ts"               'selectedStoredSessionId.subscribe' "persistence: last-session stores STORED ids (not runtime ids)"
-check "$DESK/src/app/desktop-controller.tsx"     "lastSessionFor"     "persistence: restore chat on profile switch"
+# desktop-controller.tsx was retired upstream for the contribution shell; the
+# profile-switch restore effect now lives in contrib/wiring.tsx.
+check "$DESK/src/app/contrib/wiring.tsx"         "lastSessionFor"     "persistence: restore chat on profile switch"
 # Upstream absorbed our needsReattach patch as an inline gate (with their own
 # stuckOnRoutedSession improvement); guard the behavior, not our old variable.
 check "$DESK/src/app/session/hooks/use-route-resume.ts" "gatewayBecameOpen || !alreadyActive" "gateway client: re-attach session stream on every fresh socket"

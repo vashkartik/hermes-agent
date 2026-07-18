@@ -9,8 +9,12 @@ import { $currentCwd, setCurrentCwd } from '@/store/session'
 import { useHermesConfig } from './use-hermes-config'
 
 vi.mock('@/hermes', () => ({
+  // @/store/profile reaches this mock through our patched session.ts import.
   getHermesConfig: vi.fn(),
-  getHermesConfigDefaults: vi.fn().mockResolvedValue({})
+  getHermesConfigDefaults: vi.fn().mockResolvedValue({}),
+  getProfiles: vi.fn().mockResolvedValue([]),
+  setApiRequestProfile: vi.fn(),
+  STARTUP_REQUEST_TIMEOUT_MS: 15000
 }))
 
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'

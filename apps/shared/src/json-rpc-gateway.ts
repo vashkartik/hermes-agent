@@ -181,6 +181,7 @@ export class JsonRpcGatewayClient {
 
           settled = true
           cleanup()
+
           // Drop the half-open socket so the next connect() starts clean
           // instead of short-circuiting on a zombie 'connecting' state.
           if (this.socket === socket) {
@@ -192,6 +193,7 @@ export class JsonRpcGatewayClient {
 
             this.socket = null
           }
+
           this.setState('error')
           reject(new Error(this.options.connectErrorMessage))
         }, this.options.connectTimeoutMs)
@@ -329,6 +331,7 @@ export class JsonRpcGatewayClient {
 
     return new Promise<T>((resolve, reject) => {
       let onAbort: (() => void) | undefined
+
       const detach = () => {
         if (onAbort && signal) {
           signal.removeEventListener('abort', onAbort)
@@ -360,13 +363,16 @@ export class JsonRpcGatewayClient {
       if (signal) {
         onAbort = () => {
           const call = this.pending.get(id)
+
           if (call?.timer) {
             clearTimeout(call.timer)
           }
+
           this.pending.delete(id)
           detach()
           reject(new DOMException('Aborted', 'AbortError'))
         }
+
         signal.addEventListener('abort', onAbort, { once: true })
       }
 

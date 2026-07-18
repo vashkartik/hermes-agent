@@ -1,5 +1,4 @@
-import assert from 'node:assert/strict'
-import test from 'node:test'
+import { expect, test } from 'vitest'
 
 import { createMicrophoneAccessRequester } from './microphone-access'
 
@@ -14,8 +13,8 @@ test('non-macOS platforms do not request macOS media access', async () => {
     }
   })
 
-  assert.equal(await request(), true)
-  assert.equal(asks, 0)
+  expect(await request()).toBe(true)
+  expect(asks).toBe(0)
 })
 
 test('an existing grant returns without requesting again', async () => {
@@ -30,8 +29,8 @@ test('an existing grant returns without requesting again', async () => {
     }
   })
 
-  assert.equal(await request(), true)
-  assert.equal(asks, 0)
+  expect(await request()).toBe(true)
+  expect(asks).toBe(0)
 })
 
 test('denied and restricted statuses do not re-prompt', async () => {
@@ -47,10 +46,10 @@ test('denied and restricted statuses do not re-prompt', async () => {
     }
   })
 
-  assert.equal(await request(), false)
+  expect(await request()).toBe(false)
   status = 'restricted'
-  assert.equal(await request(), false)
-  assert.equal(asks, 0)
+  expect(await request()).toBe(false)
+  expect(asks).toBe(0)
 })
 
 test('concurrent first-use requests share one OS prompt', async () => {
@@ -72,7 +71,7 @@ test('concurrent first-use requests share one OS prompt', async () => {
   const first = request()
   const second = request()
   await Promise.resolve()
-  assert.equal(asks, 1)
+  expect(asks).toBe(1)
   resolveAccess(true)
-  assert.deepEqual(await Promise.all([first, second]), [true, true])
+  expect(await Promise.all([first, second])).toEqual([true, true])
 })

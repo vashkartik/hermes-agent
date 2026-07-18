@@ -14,6 +14,8 @@ import {
 } from '@/store/composer-popout'
 import { isSecondaryWindow } from '@/store/windows'
 
+import { useComposerScope } from '../scope'
+
 import { useComposerPopoutGestures } from './use-popout-drag'
 
 interface UseComposerPopoutOptions {
@@ -31,7 +33,12 @@ interface UseComposerPopoutOptions {
  */
 export function useComposerPopout({ composerRef }: UseComposerPopoutOptions) {
   const popoutViewportEligible = useMediaQuery(COMPOSER_POPOUT_MEDIA_QUERY)
-  const popoutAllowed = canUseComposerPopout(isSecondaryWindow(), popoutViewportEligible)
+  // The floating composer is a window-level singleton: only the main scope
+  // (not tiles) in a primary window may pop out. Pop-out also stays a desktop
+  // pointer affordance: mobile/coarse-pointer embeds remain docked so a saved
+  // desktop float position cannot shrink or offset the phone composer.
+  const scope = useComposerScope()
+  const popoutAllowed = scope.popoutAllowed && canUseComposerPopout(isSecondaryWindow(), popoutViewportEligible)
   const poppedOut = useStore($composerPoppedOut) && popoutAllowed
   const popoutPosition = useStore($composerPopoutPosition)
 
