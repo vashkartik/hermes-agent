@@ -19,8 +19,12 @@ const setGlobalModel = vi.fn()
 const notifyError = vi.fn()
 
 vi.mock('@/hermes', () => ({
+  // @/store/profile reaches this mock through our patched session.ts import.
   getGlobalModelInfo: vi.fn(),
-  setGlobalModel: (...args: Parameters<typeof setGlobalModel>) => setGlobalModel(...args)
+  getProfiles: vi.fn().mockResolvedValue([]),
+  setApiRequestProfile: vi.fn(),
+  setGlobalModel: (...args: Parameters<typeof setGlobalModel>) => setGlobalModel(...args),
+  STARTUP_REQUEST_TIMEOUT_MS: 15000
 }))
 
 vi.mock('@/i18n', () => ({

@@ -58,10 +58,15 @@ describe('useComposerQueue send now', () => {
     })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
-    expect(onSubmit).toHaveBeenCalledWith('check the new logs', {
-      attachments: [],
-      fromQueue: true
-    })
+    // Tile-scoped composers pin sessionId/storedSessionId on queued submits;
+    // this test only cares that the queued text goes out atomically.
+    expect(onSubmit).toHaveBeenCalledWith(
+      'check the new logs',
+      expect.objectContaining({
+        attachments: [],
+        fromQueue: true
+      })
+    )
     expect(onCancel).not.toHaveBeenCalled()
     expect(getQueuedPrompts(SESSION_ID)).toEqual([])
   })
