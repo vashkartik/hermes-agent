@@ -18,6 +18,7 @@
     "noEmit": true,
     "paths": {
       "@/*": ["./src/*"],
+      "@hermes/plugin-sdk": ["./src/sdk/index.ts"],
       "@hermes/shared": ["../shared/src/index.ts"]
     }
   },
