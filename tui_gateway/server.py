@@ -10159,7 +10159,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
-                    return
+                    # No early return: the next loop iteration sees running=True
+                    # and requeues the remaining drained events — returning here
+                    # would drop them (drained but never redelivered). The
+                    # trailing release below is if-idle, so the nested turn's
+                    # update lease is never stolen.
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(

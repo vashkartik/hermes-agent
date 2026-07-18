@@ -172,7 +172,11 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
 
 function ClarifyToolLive(props: ToolCallMessagePartProps) {
   const messageRunning = useAuiState(selectMessageRunning)
-  const request = useStore($clarifyRequest)
+  // The tool row is in whichever session's transcript rendered it — read THAT
+  // session's clarify (primary or tile), not the globally-active one.
+  const sessionId = useStore(useSessionView().$runtimeId)
+  const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
+  const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
 
   const backendStillWaiting = Boolean(
