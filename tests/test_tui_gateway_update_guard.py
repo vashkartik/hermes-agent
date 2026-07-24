@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import threading
 import types
 from pathlib import Path
@@ -332,7 +333,7 @@ def test_tui_entry_registers_guarded_runtime_before_ready(
         lambda payload: order.append(("ready", payload)) or True,
     )
     monkeypatch.setattr(entry, "_log_exit", lambda _reason: None)
-    monkeypatch.setattr(sys, "stdin", [])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
 
     entry.main()
 
