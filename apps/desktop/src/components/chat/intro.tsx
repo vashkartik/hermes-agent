@@ -2,8 +2,8 @@ import { useStore } from '@nanostores/react'
 import { type CSSProperties, useState } from 'react'
 
 import { resolveProfileColor } from '@/lib/profile-color'
-import { $activeGatewayProfile, $profileColors, $profiles, normalizeProfileKey } from '@/store/profile'
 import { capitalize, normalize } from '@/lib/text'
+import { $activeGatewayProfile, $profileColors, $profiles, normalizeProfileKey } from '@/store/profile'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
 
