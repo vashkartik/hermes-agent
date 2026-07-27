@@ -1,6 +1,12 @@
 import { useAuiState } from '@assistant-ui/react'
 import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 
+import {
+  clearSurfaceVar,
+  COMPOSER_HEIGHT_VAR,
+  COMPOSER_SURFACE_HEIGHT_VAR,
+  setSurfaceVar
+} from '@/app/chat/surface-vars'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 
@@ -91,19 +97,21 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
 
     // Floating composer is out of the thread's flow — it must not reserve any
     // bottom clearance. Zero the measured vars so the thread reclaims the space.
+    // poppedOutRef (set above) keeps the callback stable AND tracks the full
+    // eligibility gate. Upstream's inline $composerPoppedOut.get() &&
+    // !isSecondaryWindow() covers only secondary windows; the ref also forces
+    // docked metrics for mobile/coarse-pointer embeds, so keep the ref.
     if (poppedOutRef.current) {
-      const root = document.documentElement
       lastBucketedHeightRef.current = 0
       lastBucketedSurfaceHeightRef.current = 0
-      root.style.setProperty('--composer-measured-height', '0px')
-      root.style.setProperty('--composer-surface-measured-height', '0px')
+      setSurfaceVar(composer, COMPOSER_HEIGHT_VAR, '0px')
+      setSurfaceVar(composer, COMPOSER_SURFACE_HEIGHT_VAR, '0px')
 
       return
     }
 
     const { height, width } = composer.getBoundingClientRect()
     const surfaceHeight = composerSurfaceRef.current?.getBoundingClientRect().height
-    const root = document.documentElement
 
     if (width > 0) {
       const nextTight = width < COMPOSER_STACK_BREAKPOINT_PX
@@ -138,7 +146,7 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
 
       if (bucket !== lastBucketedHeightRef.current) {
         lastBucketedHeightRef.current = bucket
-        root.style.setProperty('--composer-measured-height', `${bucket}px`)
+        setSurfaceVar(composer, COMPOSER_HEIGHT_VAR, `${bucket}px`)
       }
     }
 
@@ -147,7 +155,7 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
 
       if (bucket !== lastBucketedSurfaceHeightRef.current) {
         lastBucketedSurfaceHeightRef.current = bucket
-        root.style.setProperty('--composer-surface-measured-height', `${bucket}px`)
+        setSurfaceVar(composer, COMPOSER_SURFACE_HEIGHT_VAR, `${bucket}px`)
       }
     }
   }, [composerRef, composerSurfaceRef, editorRef])
@@ -163,12 +171,13 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
   }, [poppedOut, syncComposerMetrics])
 
   useEffect(() => {
+    const composer = composerRef.current
+
     return () => {
-      const root = document.documentElement
-      root.style.removeProperty('--composer-measured-height')
-      root.style.removeProperty('--composer-surface-measured-height')
+      clearSurfaceVar(composer, COMPOSER_HEIGHT_VAR)
+      clearSurfaceVar(composer, COMPOSER_SURFACE_HEIGHT_VAR)
     }
-  }, [])
+  }, [composerRef])
 
   // Pill compacts on real width (tile/pane), OR when stacked for any reason
   // (viewport-narrow / wrapped) so the controls row never over-runs.

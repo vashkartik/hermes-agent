@@ -9,6 +9,7 @@ export const SETTINGS_ROUTE = '/settings'
 export const COMMAND_CENTER_ROUTE = '/command-center'
 export const SKILLS_ROUTE = '/skills'
 export const MESSAGING_ROUTE = '/messaging'
+export const WEBHOOKS_ROUTE = '/webhooks'
 export const ARTIFACTS_ROUTE = '/artifacts'
 export const MEMORIES_ROUTE = '/memories'
 export const CRON_ROUTE = '/cron'
@@ -33,6 +34,7 @@ export type AppView =
   | 'settings'
   | 'skills'
   | 'starmap'
+  | 'webhooks'
 
 export type AppRouteId =
   | 'agents'
@@ -46,6 +48,7 @@ export type AppRouteId =
   | 'settings'
   | 'skills'
   | 'starmap'
+  | 'webhooks'
 
 export interface AppRoute {
   id: AppRouteId
@@ -59,6 +62,7 @@ export const APP_ROUTES = [
   { id: 'command-center', path: COMMAND_CENTER_ROUTE, view: 'command-center' },
   { id: 'skills', path: SKILLS_ROUTE, view: 'skills' },
   { id: 'messaging', path: MESSAGING_ROUTE, view: 'messaging' },
+  { id: 'webhooks', path: WEBHOOKS_ROUTE, view: 'webhooks' },
   { id: 'artifacts', path: ARTIFACTS_ROUTE, view: 'artifacts' },
   { id: 'memories', path: MEMORIES_ROUTE, view: 'memories' },
   { id: 'cron', path: CRON_ROUTE, view: 'cron' },
@@ -125,7 +129,8 @@ export const OVERLAY_VIEWS: ReadonlySet<AppView> = new Set([
   'cron',
   'profiles',
   'settings',
-  'starmap'
+  'starmap',
+  'webhooks'
 ])
 
 export function isOverlayView(view: AppView): boolean {
@@ -144,6 +149,23 @@ export function routeSessionId(pathname: string): string | null {
   const id = pathname.slice(SESSION_ROUTE_PREFIX.length)
 
   return id && !id.includes('/') ? decodeURIComponent(id) : null
+}
+
+/**
+ * The primary composer's durable scope key candidate: the route is the source
+ * of truth for which chat is on screen, so prefer its (stable) stored session
+ * id over a store selection that can be momentarily null/stale mid-switch
+ * (#59305). A genuine new-chat route always wins with `null`, never falling
+ * back to a leftover selection from the chat just left. A non-chat route
+ * (settings, an overlay) has no session opinion, so the store selection passes
+ * through unchanged.
+ */
+export function primaryRouteSelectedSessionId(pathname: string, storeSelectedSessionId: string | null): string | null {
+  if (isNewChatRoute(pathname)) {
+    return null
+  }
+
+  return routeSessionId(pathname) ?? storeSelectedSessionId
 }
 
 export function sessionRoute(sessionId: string): string {

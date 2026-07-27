@@ -128,7 +128,12 @@ interface GatewayEventDeps {
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
   appendAssistantDelta: (sessionId: string, delta: string) => void
   appendReasoningDelta: (sessionId: string, delta: string, replace?: boolean) => void
-  completeAssistantMessage: (sessionId: string, text: string, responsePreviewed?: boolean) => void
+  completeAssistantMessage: (
+    sessionId: string,
+    text: string,
+    responsePreviewed?: boolean,
+    failure?: { error: string; partial: boolean }
+  ) => void
   failAssistantMessage: (sessionId: string, errorMessage: string) => void
   flushQueuedDeltas: (sessionId?: string) => void
   finalizeInterimAssistantMessage: (sessionId: string, text: string) => void
@@ -527,6 +532,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const header = idx && cnt ? `◇ Reference ${idx}/${cnt} — ${label}` : `◇ Reference — ${label}`
           const body = coerceThinkingText(payload?.text)
           const text = `${header}\n${body}\n\n`
+
           if (idx === undefined || idx <= 1) {
             // First reference: clear any stale reasoning left over from
             // before this turn's references start, same as before.
@@ -564,9 +570,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // block, so the progress trail is self-cleaning.
         if (sessionId && typeof payload?.refs_done === 'number' && typeof payload?.refs_total === 'number') {
           const label = coerceGatewayText(payload?.label)
+
           const line = label
             ? `◇ MoA refs ${payload.refs_done}/${payload.refs_total} — ${label}\n`
             : `◇ MoA refs ${payload.refs_done}/${payload.refs_total}\n`
+
           appendReasoningDelta(sessionId, line, payload.refs_done <= 1)
           flushQueuedDeltas(sessionId)
         }
@@ -609,7 +617,19 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         playCompletionSound(sessionId)
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
-        completeAssistantMessage(sessionId, finalText, payload?.response_previewed)
+
+        // Terminal error frames (status "error") carry the failure in
+        // structured fields: `error` is the message, and `partial` marks
+        // `text` as streamed output to keep rather than the error string.
+        const failure =
+          payload?.status === 'error'
+            ? {
+                error: coerceGatewayText(payload.error).trim() || finalText || 'Hermes reported an error',
+                partial: Boolean(payload.partial)
+              }
+            : undefined
+
+        completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure)
 
         // Structured billing wall forwarded by the gateway (out of credits /
         // payment required) — cache it + raise a billing-specific toast.

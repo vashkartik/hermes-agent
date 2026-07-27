@@ -14,6 +14,7 @@ import {
   toChatMessages
 } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
@@ -89,6 +90,7 @@ import {
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  resolveSessionProfile,
   resolveStoredSession,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -230,6 +232,7 @@ export function useSessionActions({
   // by A's delayed session.info event and visibly jump back to A.
   const storedIdRotation = useStore($activeSessionStoredIdRotation)
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (!storedIdRotation) {
       return
@@ -480,13 +483,14 @@ export function useSessionActions({
    *  list (Cursor-style draft tab); it surfaces on the next refresh once the
    *  first message persists a turn. "Open in split" keeps the listed behavior. */
   const openNewSessionTile = useCallback(
-    async (dir: TileDock = 'right', options?: { listed?: boolean }) => {
+    async (dir: TileDock = 'right', options?: { cwd?: null | string; listed?: boolean }) => {
       const listed = options?.listed ?? true
 
       try {
-        // Fresh tile → the resolved new-session cwd (project/default), not the
-        // primary composer's live cwd.
-        const params = await desktopSessionCreateParams(resolveNewSessionCwd().trim())
+        // Fresh tile → the caller's workspace when one was named (the sidebar
+        // "+" on a project/worktree lane), else the resolved new-session cwd
+        // (project/default) — never the primary composer's live cwd.
+        const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id
 
@@ -827,6 +831,10 @@ export function useSessionActions({
       }
 
       let resumedRunning = false
+      // A recovered in-flight tail means the turn already produced output, so
+      // it resumes into the streaming state rather than the "awaiting first
+      // token" spinner.
+      let recoveredInFlightTail = false
 
       try {
         const watchWindow = isWatchWindow()
@@ -918,13 +926,30 @@ export function useSessionActions({
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
 
+        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+
+        // Crash-survivable turn progress: fold a journaled in-flight tail
+        // (persisted by use-session-state-cache while the turn streamed;
+        // survives renderer/app death) back onto the restored transcript. The
+        // backend's own inflight projection is already inside
+        // `preferredMessages` (appendLiveSessionProjection), so this merge only
+        // adds the locally recorded structure — tool calls, sealed interim
+        // rows — that the backend's text-only snapshot cannot carry. A no-op
+        // returns `preferredMessages` by reference, keeping the fast path
+        // below intact.
+        const inFlightRecovery = recoverInFlightTurnJournal(storedSessionId, preferredMessages, {
+          keepPending: resumedRunning
+        })
+
+        recoveredInFlightTail = inFlightRecovery.applied
+
         // Prefetch-hit fast path: `preferredMessages` IS the live `$messages`
         // array (already error-merged when `localSnapshot` was built), so reuse
         // the ref instead of rebuilding a throwaway transcript+Map every switch.
         const messagesForView =
-          preferredMessages === currentMessages
+          inFlightRecovery.messages === currentMessages
             ? currentMessages
-            : preserveLocalAssistantErrors(preferredMessages, currentMessages)
+            : preserveLocalAssistantErrors(inFlightRecovery.messages, currentMessages)
 
         // A turn still streaming when the client dropped keeps running on the
         // gateway, which accumulates the in-progress prompt + partial answer
@@ -937,7 +962,7 @@ export function useSessionActions({
         let inflightStreamId: null | string = null
         let messagesWithInflight = messagesForView
 
-        if (inflight?.streaming) {
+        if (!recoveredInFlightTail && inflight?.streaming) {
           const additions: ChatMessage[] = []
           const inflightUser = (inflight.user ?? '').trim()
 
@@ -964,9 +989,18 @@ export function useSessionActions({
           messagesWithInflight = [...messagesForView, ...additions]
         }
 
-        // Checked against the inflight-seeded view: a live in-flight turn is
-        // real content to paint, not the stranded empty-resume this bails on.
-        if (sessionShouldHaveTranscript(stored) && messagesWithInflight.length === 0) {
+        // Did the SERVER hand us a live in-flight turn to paint? (Only true when
+        // the local journal recovery did not already restore the tail.)
+        const seededServerInflight = messagesWithInflight !== messagesForView
+
+        // Fail-latch on the PRE-recovery transcript (upstream): an orphan journal
+        // tail must not mask a lost transcript. But a real server-side in-flight
+        // turn IS content to paint (Ace), so it suppresses the bail.
+        if (
+          sessionShouldHaveTranscript(stored) &&
+          preferredMessages.length === 0 &&
+          !seededServerInflight
+        ) {
           setActiveSessionId(null)
           activeSessionIdRef.current = null
           setResumeFailedSessionId(storedSessionId)
@@ -990,7 +1024,20 @@ export function useSessionActions({
             ...(runtimeInfo ?? {}),
             messages: messagesWithInflight,
             busy: resumedRunning,
-            awaitingResponse: resumedRunning,
+            awaitingResponse: resumedRunning && !recoveredInFlightTail,
+            ...(inFlightRecovery.applied
+              ? {
+                  sawAssistantPayload: true,
+                  // Point live deltas at the recovered row when the backend is
+                  // still mid-turn; a settled recovery keeps the stream idle.
+                  streamId: resumedRunning ? inFlightRecovery.streamId : null,
+                  turnStartedAt: resumedRunning
+                    ? (inFlightRecovery.turnStartedAt ?? state.turnStartedAt ?? Date.now())
+                    : state.turnStartedAt
+                }
+              : {}),
+            // Server-seeded in-flight bubble (mutually exclusive with the
+            // journal recovery above): aim live deltas at that same bubble.
             ...(inflightStreamId ? { streamId: inflightStreamId } : {})
           }),
           storedSessionId
@@ -1029,7 +1076,14 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          setMessages(reconcileAuthoritativeMessages(fallback.messages, previousMessages))
+          // Resume failed, so there is no live projection — the journal is the
+          // only carrier of a crashed turn's progress on this path.
+          const fallbackRecovery = recoverInFlightTurnJournal(
+            storedSessionId,
+            reconcileAuthoritativeMessages(fallback.messages, previousMessages)
+          )
+
+          setMessages(fallbackRecovery.messages)
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so
@@ -1081,7 +1135,7 @@ export function useSessionActions({
         if (isCurrentResume()) {
           busyRef.current = resumedRunning
           setBusy(resumedRunning)
-          setAwaitingResponse(resumedRunning)
+          setAwaitingResponse(resumedRunning && !recoveredInFlightTail)
         }
       }
     },
@@ -1104,15 +1158,30 @@ export function useSessionActions({
   // `parentStoredId` so it nests under its parent, then open it as its own tab
   // and switch to it — the parent chat stays put (mirrors openNewSessionTile).
   const forkBranch = useCallback(
-    async (branchMessages: BranchMessage[], parentStoredId: null | string, cwd?: string): Promise<boolean> => {
+    async (
+      branchMessages: BranchMessage[],
+      parentStoredId: null | string,
+      cwd?: string,
+      profile?: null | string
+    ): Promise<boolean> => {
       creatingSessionRef.current = true
 
       try {
+        // A branch belongs to its parent's OWNING profile. Swapping the live
+        // gateway first AND passing `profile` on the create mirrors
+        // desktopSessionCreateParams/resumeSession: in app-global remote mode
+        // one backend serves every profile, so an omitted profile silently
+        // lands the branch on the launch (default) profile — the "session
+        // jumps between profiles after branching" bug. The swap also makes
+        // upsertOptimisticSession's $activeGatewayProfile stamp correct.
+        await ensureGatewayProfile(profile)
+
         // No title: the backend auto-names the branch from its parent's lineage.
         const branched = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
           source: 'desktop',
           ...(cwd && { cwd }),
+          ...(profile ? { profile } : {}),
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
           ...(parentStoredId && { parent_session_id: parentStoredId })
         })
@@ -1213,7 +1282,12 @@ export function useSessionActions({
 
       clearNotifications()
 
-      return forkBranch(branchMessages, selectedStoredSessionIdRef.current, $currentCwd.get().trim())
+      // The open chat's owning profile, NOT the picker's / launch profile —
+      // /profile only retargets new chats, so a branch of an existing thread
+      // must stay on that thread's backend (cache hit for an open session).
+      const profile = await resolveSessionProfile(selectedStoredSessionIdRef.current)
+
+      return forkBranch(branchMessages, selectedStoredSessionIdRef.current, $currentCwd.get().trim(), profile)
     },
     [activeSessionIdRef, busyRef, copy, forkBranch, selectedStoredSessionIdRef]
   )
@@ -1245,7 +1319,7 @@ export function useSessionActions({
           return false
         }
 
-        return await forkBranch(branchMessages, stored?.id ?? storedSessionId, stored?.cwd?.trim())
+        return await forkBranch(branchMessages, stored?.id ?? storedSessionId, stored?.cwd?.trim(), profile)
       } catch (err) {
         notifyError(err, copy.branchFailed)
 
