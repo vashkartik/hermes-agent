@@ -1406,6 +1406,15 @@ def _start_queue_sweeper() -> None:
     def _loop():
         while True:
             time.sleep(_QUEUE_SWEEP_S)
+            # Unit-test processes import this module and run hundreds of tests
+            # in one interpreter; a background sweep firing mid-test against a
+            # leaked session writes frames into whatever stdout the current
+            # test has patched in (observed: an extra line in upstream's
+            # write_json concurrency test on CI). The durability tests drive
+            # _sweep_queued_prompts() directly, so skipping the timer under
+            # pytest costs no coverage.
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                continue
             try:
                 _sweep_queued_prompts()
             except Exception:
