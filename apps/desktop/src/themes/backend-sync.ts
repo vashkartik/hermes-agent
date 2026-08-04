@@ -19,6 +19,8 @@
 import type { HermesSkin } from '@hermes/shared/skin'
 import { atom } from 'nanostores'
 
+import { applyAgentBranding } from '@/i18n/branding'
+
 import { BUILTIN_THEMES } from './presets'
 import { skinToDesktopTheme } from './skin'
 import type { DesktopTheme } from './types'
@@ -50,6 +52,12 @@ export function __resetBackendSkinSync(): void {
  * change. Built-in names keep the desktop's own palette but can still be applied.
  */
 export function ingestBackendSkin(skin: HermesSkin | undefined | null, { apply }: { apply: boolean }): void {
+  // Agent-name branding is independent of the palette flow below: any skin
+  // (including `default` and built-ins) may carry branding.agent_name, and it
+  // must land even on the connect-time seed so the very first paint says the
+  // user's agent name. See i18n/branding.ts.
+  applyAgentBranding(skin && typeof skin === 'object' ? skin.branding?.agent_name : undefined)
+
   const name = (skin && typeof skin === 'object' ? (skin.name ?? '') : '').trim()
 
   if (!name) {
