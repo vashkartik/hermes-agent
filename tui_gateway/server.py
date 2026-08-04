@@ -1156,6 +1156,33 @@ def _close_sessions_for_transport(
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
         else:
+            with _live_transports_lock:
+                successor = None
+                for candidate in _live_transports:
+                    if candidate is transport or _transport_is_dead(candidate):
+                        continue
+                    claim = getattr(candidate, "promote_session_if_subscribed", None)
+                    if not callable(claim):
+                        continue
+
+                    def assign_successor() -> bool:
+                        # Keep assignment inside the candidate's subscription
+                        # lock and the live registry lock. A concurrent switch
+                        # or disconnect lands wholly before or after this claim.
+                        with _sessions_lock:
+                            if (
+                                _sessions.get(sid) is session
+                                and session.get("transport") is transport
+                            ):
+                                session["transport"] = candidate
+                                return True
+                        return False
+
+                    if claim(sid, assign_successor):
+                        successor = candidate
+                        break
+            if successor is not None:
+                continue
             # Point detached sessions at the drop sentinel (NOT real stdio) so
             # _ws_session_is_orphaned recognizes them and the grace-reap can
             # actually fire; a standalone `hermes --tui` keeps real _stdio.
@@ -1650,8 +1677,9 @@ def write_json(obj: dict) -> bool:
     Precedence:
 
     1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+       plus connected WebSocket clients subscribed to that same live session.
+       The owner remains the authoritative write result, while observers mirror
+       the live stream without crossing session or profile boundaries.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -1670,7 +1698,30 @@ def write_json(obj: dict) -> bool:
                 _note_stream_activity(sid, obj)
                 return delivered
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+            with _live_transports_lock:
+                candidates = [transport for transport in _live_transports if transport is not t]
+            delivered = False
+            for transport in candidates:
+                observes_session = getattr(transport, "observes_session", None)
+                if not callable(observes_session) or not observes_session(sid):
+                    continue
+                try:
+                    write_observer = getattr(transport, "write_observer", None)
+                    if callable(write_observer):
+                        delivered = write_observer(obj) or delivered
+                except Exception:
+                    # Mirroring is best-effort: one stale observer must not
+                    # break the authoritative session stream.
+                    logger.debug(
+                        "session-event observer write failed sid=%s type=%s",
+                        sid,
+                        (obj.get("params") or {}).get("type"),
+                        exc_info=True,
+                    )
+            # Mirror first: a suspended authoritative socket may wait up to the
+            # transport timeout, but a healthy observer still sees the frame.
+            owner_delivered = t.write(obj)
+            return owner_delivered or delivered
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -2266,6 +2317,48 @@ def handle_request(req: dict) -> dict | None:
     return fn(rid, params)
 
 
+_SESSION_SUBSCRIPTION_METHODS = frozenset(
+    {
+        "prompt.submit",
+        "session.activate",
+        "session.branch",
+        "session.create",
+        "session.resume",
+    }
+)
+
+
+def _record_transport_subscription(
+    transport: Transport,
+    method_name: str,
+    params: dict,
+    response: dict | None,
+    generation: object | None,
+) -> None:
+    """Bind a WebSocket transport to the live session returned by an attach RPC."""
+    if method_name not in _SESSION_SUBSCRIPTION_METHODS or not isinstance(response, dict):
+        return
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return
+    sid = result.get("session_id") or params.get("session_id")
+    complete_subscription = getattr(transport, "complete_session_subscription", None)
+    if sid and generation is not None and callable(complete_subscription):
+        complete_subscription(generation, str(sid))
+        return
+    subscribe_session = getattr(transport, "subscribe_session", None)
+    if sid and callable(subscribe_session):
+        subscribe_session(str(sid))
+
+
+def _begin_transport_subscription(transport: Transport, method_name: str) -> object | None:
+    """Reserve attach-response ordering for transports that support it."""
+    if method_name not in _SESSION_SUBSCRIPTION_METHODS:
+        return None
+    begin_subscription = getattr(transport, "begin_session_subscription", None)
+    return begin_subscription() if callable(begin_subscription) else None
+
+
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
@@ -2286,8 +2379,13 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        subscription_generation = _begin_transport_subscription(t, method)
         if method not in _LONG_HANDLERS:
-            return handle_request(req)
+            response = handle_request(req)
+            _record_transport_subscription(
+                t, method, _params, response, subscription_generation
+            )
+            return response
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
@@ -2298,6 +2396,9 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
+                _record_transport_subscription(
+                    t, method, _params, resp, subscription_generation
+                )
                 t.write(resp)
 
         _pool.submit(lambda: ctx.run(run))
