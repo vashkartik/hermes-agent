@@ -105,6 +105,39 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onCancel).not.toHaveBeenCalled()
   })
 
+  it('keeps queueing while compaction is active even if the backend busy flag drops', () => {
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: false,
+      compacting: true,
+      text: 'wait for the summary'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it('does nothing for an empty submit while compaction owns the turn', () => {
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: false,
+      compacting: true
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
   it('runs slash commands immediately while busy', async () => {
     const { clearDraft, hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
       busy: true,

@@ -9,6 +9,7 @@ import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
+import { setSessionCompacting } from '@/store/compaction'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -741,6 +742,17 @@ export function useSessionActions({
                   : cachedViewState.messages
 
               const running = Boolean(activated.running ?? cachedViewState.busy)
+
+              // A renderer latch can outlive the socket that carried the normal
+              // resume/terminal edge. session.activate reads `session["running"]`
+              // under the backend's history lock, where it stays true for the
+              // complete original turn (including its busy=false compaction UI
+              // interval) and flips false only during turn finalization. Clear
+              // only on that explicit authoritative idle value; an omitted value
+              // or a live activation must preserve the latch.
+              if (activated.running === false) {
+                setSessionCompacting(cachedRuntimeId, false)
+              }
 
               // While idle, the persisted REST transcript is the display
               // authority: session.activate returns the runtime's compressed

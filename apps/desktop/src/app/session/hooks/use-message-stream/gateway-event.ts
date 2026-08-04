@@ -278,6 +278,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       // whole turn to complete.
       if (sessionId && COMPACTION_RESUME_EVENT_TYPES.has(event.type) && compactedTurnRef.current.has(sessionId)) {
         setSessionCompacting(sessionId, false)
+        compactedTurnRef.current.delete(sessionId)
       }
 
       if (sessionId && DRAFT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
@@ -359,6 +360,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const modelChanged = typeof payload?.model === 'string'
         const providerChanged = typeof payload?.provider === 'string'
         const runningChanged = typeof payload?.running === 'boolean'
+
         // The backend stamps model/provider (as strings) on EVERY session.info,
         // so the presence flags above are true on every heartbeat/turn edge —
         // fine for the cheap atom writes below (nanostores skips identical
@@ -711,6 +713,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // last item stuck pending/in_progress. Finished lists keep their linger.
         clearActiveSessionTodos(sessionId)
         setSessionCompacting(sessionId, false)
+        compactedTurnRef.current.delete(sessionId)
 
         flushQueuedDeltas(sessionId)
 
@@ -1076,7 +1079,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId && payload?.kind === 'compacting') {
           setSessionCompacting(sessionId, true)
           compactedTurnRef.current.add(sessionId)
-        } else if (sessionId && payload?.kind === 'compacted') {
+        } else if (sessionId && payload?.kind === 'ready') {
+          // The gateway emits ready only when a standalone manual
+          // session.compress operation has settled. Unlike automatic
+          // compaction, there is no original model turn left to resume.
           setSessionCompacting(sessionId, false)
           compactedTurnRef.current.delete(sessionId)
         } else if (sessionId && payload?.kind === 'process') {
@@ -1086,6 +1092,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         } else if (sessionId && payload?.kind === 'goal') {
           applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
         }
+        // `compacted` closes only the compression operation; the original turn
+        // explicitly continues afterward. Keep the latch until the first model,
+        // tool, or text event above proves that continuation is visible, or a
+        // terminal event clears it.
       } else if (event.type === 'review.summary') {
         // Self-improvement background review saved something to memory/skills
         // and emitted a persistent summary (Python formats it as

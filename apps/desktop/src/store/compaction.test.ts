@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { $compactingSessions, sessionCompacting, setSessionCompacting } from './compaction'
+import { $compactingSessions, isSessionCompacting, sessionCompacting, setSessionCompacting } from './compaction'
+import { $activeSessionId } from './session'
 
 describe('compaction store', () => {
   beforeEach(() => $compactingSessions.set({}))
@@ -19,6 +20,15 @@ describe('compaction store', () => {
 
     expect(sessionCompacting('session-a').get()).toBe(true)
     expect(sessionCompacting('session-b').get()).toBe(false)
+  })
+
+  it('resolves compaction for each rendered session instead of global focus', () => {
+    setSessionCompacting('session-a', true)
+    $activeSessionId.set('session-b')
+
+    expect(isSessionCompacting('session-a')).toBe(true)
+    expect(isSessionCompacting('session-b')).toBe(false)
+    expect(isSessionCompacting(null)).toBe(false)
   })
 
   it('clears a session without disturbing the others', () => {

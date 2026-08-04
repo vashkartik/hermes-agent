@@ -17,6 +17,7 @@ import {
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
+import { setSessionCompacting } from '@/store/compaction'
 import { setComposerDraft } from '@/store/composer'
 import { enqueueQueuedPrompt } from '@/store/composer-queue'
 import { applyGoalStatusText } from '@/store/goals'
@@ -615,6 +616,10 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           } finally {
             compressInFlightRef.current.delete(sessionId)
+            // Manual /compress is a self-contained RPC, not a mid-turn
+            // compaction followed by more model/tool output. Its settled RPC is
+            // therefore the terminal lifecycle edge that releases the composer.
+            setSessionCompacting(sessionId, false)
           }
         },
         // /yolo maps to the status-bar YOLO control — a per-session approval

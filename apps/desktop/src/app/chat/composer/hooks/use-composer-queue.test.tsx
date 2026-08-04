@@ -73,6 +73,19 @@ describe('useComposerQueue park integration', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
   })
 
+  it('does not auto-drain while the composer still treats the turn as busy', async () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'wait for compaction' })
+
+    const { onSubmit } = renderQueueHook({ busy: true })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+  })
+
   it('holds a parked queue at the idle settle (the Stop edge)', async () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'halted' })
     parkQueuedPrompts(SESSION_KEY)
