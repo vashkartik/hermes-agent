@@ -20111,6 +20111,15 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
+            # Discovery record for out-of-process health checks (the gateway
+            # heartbeat probes the dashboard through this — ports change on
+            # every respawn, so a portfile is the source of truth).
+            try:
+                from gateway.heartbeat import write_dashboard_portfile
+
+                write_dashboard_portfile(actual_port)
+            except Exception:
+                logger.debug("dashboard portfile write skipped", exc_info=True)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.

@@ -23985,6 +23985,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     housekeeping_thread.start()
 
+    # Built-in health heartbeat (config-gated, off by default). Watches the
+    # adapter surface, the dashboard backend, and the nightly-sync status,
+    # and reports to the configured chat channel — see gateway/heartbeat.py.
+    heartbeat_service = None
+    try:
+        from gateway.heartbeat import start_heartbeat_service
+        from hermes_cli.config import load_config_readonly
+
+        heartbeat_service = start_heartbeat_service(
+            load_config_readonly(),
+            adapters_provider=lambda: dict(runner.adapters or {}),
+        )
+    except Exception:
+        logger.debug("heartbeat service failed to start", exc_info=True)
+
     # READY is emitted only after adapters, cron, and housekeeping have all
     # reached their running boundary. Missing config/systemd runtime state
     # leaves the watchdog disabled without changing gateway behavior.
