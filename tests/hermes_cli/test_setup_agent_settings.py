@@ -1,5 +1,11 @@
 """Tests for agent-settings copy in the interactive setup wizard."""
 
+from argparse import Namespace
+
+import pytest
+
+from hermes_cli import config as config_mod
+from hermes_cli import setup as setup_mod
 from hermes_cli.setup import setup_agent_settings
 
 
@@ -12,6 +18,47 @@ def _patch_agent_settings_interactions(monkeypatch):
     monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda *args, **kwargs: None)
     monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda *args, **kwargs: None)
     monkeypatch.setattr("hermes_cli.setup.save_config", lambda *args, **kwargs: None)
+
+
+@pytest.mark.parametrize(
+    "setup_mode",
+    [pytest.param(1, id="full-setup"), pytest.param(0, id="quick-setup")],
+)
+def test_first_install_recommended_budget_is_persisted_and_displayed(
+    setup_mode, tmp_path, monkeypatch, capsys
+):
+    """Both first-install entry points persist the advertised runtime default."""
+    choices = iter([setup_mode] + ([1] if setup_mode == 0 else []))
+    args = Namespace(
+        non_interactive=False,
+        portal=False,
+        quick=False,
+        reconfigure=False,
+        reset=False,
+        section=None,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(config_mod, "is_managed", lambda: False)
+    monkeypatch.setattr(setup_mod, "ensure_hermes_home", lambda: None)
+    monkeypatch.setattr(setup_mod, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda _key: "")
+    monkeypatch.setattr(setup_mod, "is_interactive_stdin", lambda: True)
+    monkeypatch.setattr(setup_mod, "_offer_openclaw_migration", lambda _home: False)
+    monkeypatch.setattr(setup_mod, "prompt_choice", lambda *args, **kwargs: next(choices))
+    monkeypatch.setattr(setup_mod, "setup_model_provider", lambda *args, **kwargs: None)
+    monkeypatch.setattr(setup_mod, "setup_terminal_backend", lambda *args, **kwargs: None)
+    monkeypatch.setattr(setup_mod, "setup_gateway", lambda *args, **kwargs: None)
+    monkeypatch.setattr(setup_mod, "setup_tools", lambda *args, **kwargs: None)
+    monkeypatch.setattr(setup_mod, "remove_env_value", lambda _key: None)
+    monkeypatch.setattr(setup_mod, "_print_setup_summary", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: None)
+    monkeypatch.setattr("hermes_cli.main._model_flow_nous", lambda _config: None)
+
+    setup_mod.run_setup_wizard(args)
+
+    assert config_mod.load_config()["agent"]["max_turns"] == 500
+    assert "Max iterations: 500" in capsys.readouterr().out
 
 
 def test_setup_agent_settings_enter_accepts_500_when_unconfigured(

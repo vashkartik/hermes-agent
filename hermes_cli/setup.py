@@ -1659,7 +1659,7 @@ def setup_terminal_backend(config: dict):
 
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
-    config.setdefault("agent", {})["max_turns"] = 150
+    config.setdefault("agent", {})["max_turns"] = 500
     # config.yaml is the authoritative source for max_turns; the gateway
     # bridges it into HERMES_MAX_ITERATIONS at startup. We no longer write
     # to .env to avoid the dual-source inconsistency that caused the
@@ -1678,7 +1678,7 @@ def _apply_default_agent_settings(config: dict):
 
     save_config(config)
     print_success("Applied recommended defaults:")
-    print_info("  Max iterations: 150")
+    print_info("  Max iterations: 500")
     print_info("  Tool progress: all")
     print_info("  Compression threshold: 0.50")
     print_info("  Session reset: never (use /reset or compression)")
