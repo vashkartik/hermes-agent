@@ -68,6 +68,7 @@ function QueueHarness({ onSubmit }: { onSubmit: ChatBarProps['onSubmit'] }) {
     draftRef: { current: '' },
     focusInput: () => undefined,
     loadIntoComposer: () => undefined,
+    onCancel: () => undefined,
     onSubmit,
     queueEditRef,
     queueSessionKey: SID,
