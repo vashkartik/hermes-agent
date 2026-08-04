@@ -20,7 +20,7 @@ import json
 import logging
 import time
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
@@ -56,7 +56,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
     """
-    agent.session_api_calls += 1
+    agent.session_api_calls = getattr(agent, "session_api_calls", 0) + 1
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
@@ -69,9 +69,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             # Consume the marker so a later unrelated reading is not charged to
             # it and preflight deferral cannot stay latched indefinitely.
             compressor.update_from_response({})
-        if agent._session_db and agent.session_id:
+        if getattr(agent, "_session_db", None) and getattr(agent, "session_id", None):
             try:
-                if not agent._session_db_created:
+                if not getattr(agent, "_session_db_created", False):
                     agent._ensure_db_session()
                 # Enqueued for the SessionDB background writer — keeps the
                 # per-call accounting write off the turn thread (see
@@ -191,6 +191,136 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _codex_tool_descriptor(item: dict) -> Optional[Tuple[str, str, dict]]:
+    """(call_id, tool_name, args) for a tool-shaped codex item.
+
+    Mirrors codex_event_projector's naming and deterministic call ids so
+    live tool.start/tool.complete events correlate with the tool_calls the
+    projector later writes into history. Non-tool items return None.
+    """
+    from agent.transports.codex_event_projector import _deterministic_call_id
+
+    item_type = item.get("type") or ""
+    item_id = item.get("id") or ""
+    if item_type == "commandExecution":
+        return (
+            _deterministic_call_id("exec", item_id),
+            "exec_command",
+            {"command": item.get("command") or "", "cwd": item.get("cwd") or ""},
+        )
+    if item_type == "fileChange":
+        changes = [
+            {
+                "kind": (change.get("kind") or {}).get("type") or "update",
+                "path": change.get("path") or "",
+            }
+            for change in item.get("changes") or []
+        ]
+        return (
+            _deterministic_call_id("apply_patch", item_id),
+            "apply_patch",
+            {"changes": changes},
+        )
+    if item_type == "mcpToolCall":
+        server = item.get("server") or "mcp"
+        tool = item.get("tool") or "unknown"
+        args = item.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {"arguments": args}
+        return (
+            _deterministic_call_id(f"mcp_{server}_{tool}", item_id),
+            f"mcp.{server}.{tool}",
+            args,
+        )
+    if item_type == "dynamicToolCall":
+        tool = item.get("tool") or "unknown"
+        args = item.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {"arguments": args}
+        return (_deterministic_call_id(f"dyn_{tool}", item_id), tool, args)
+    return None
+
+
+def _codex_tool_result(item: dict) -> str:
+    """Result string for a completed tool-shaped codex item (projector parity)."""
+    item_type = item.get("type") or ""
+    if item_type == "commandExecution":
+        output = item.get("aggregatedOutput") or ""
+        exit_code = item.get("exitCode")
+        if exit_code is not None and exit_code != 0:
+            output = f"[exit {exit_code}]\n{output}"
+        return output
+    if item_type == "fileChange":
+        status = item.get("status") or "unknown"
+        n = len(item.get("changes") or [])
+        return f"apply_patch status={status}, {n} change(s)"
+    if item_type == "mcpToolCall":
+        error = item.get("error")
+        if error:
+            return f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+        result = item.get("result")
+        return json.dumps(result, ensure_ascii=False)[:4000] if result is not None else ""
+    if item_type == "dynamicToolCall":
+        content_items = item.get("contentItems") or []
+        if isinstance(content_items, list) and content_items:
+            return json.dumps(content_items, ensure_ascii=False)[:4000]
+        return f"success={item.get('success')}"
+    return ""
+
+
+def _codex_live_event(agent, note: dict) -> None:
+    """Bridge codex app-server notifications to the agent's live display
+    callbacks so connected clients see streaming text, reasoning, and tool
+    activity DURING a codex turn instead of only the final answer.
+
+    The gateway wires _stream_callback / reasoning_callback /
+    tool_start_callback / tool_complete_callback onto the agent before
+    every turn; the default chat_completions loop fires them but the codex
+    path historically consumed every notification silently. Display is
+    best-effort: nothing here may break a turn.
+    """
+    try:
+        method = note.get("method", "")
+        params = note.get("params", {}) or {}
+        if method == "item/agentMessage/delta":
+            delta = params.get("delta")
+            if delta:
+                agent._fire_stream_delta(str(delta))
+            return
+        if method in ("item/reasoning/delta", "item/reasoning/summaryDelta"):
+            delta = params.get("delta")
+            if delta:
+                agent._fire_reasoning_delta(str(delta))
+            return
+        if method == "thread/tokenUsage/updated":
+            # Cumulative thread totals → the session_* attrs _get_usage()
+            # reads. Without this every codex turn reports zero tokens and
+            # the desktop statusbar shows 0/<context> forever.
+            usage = (params.get("tokenUsage") or {}).get("total") or {}
+            if usage:
+                agent.session_input_tokens = usage.get("inputTokens", 0) or 0
+                agent.session_prompt_tokens = agent.session_input_tokens
+                agent.session_output_tokens = usage.get("outputTokens", 0) or 0
+                agent.session_completion_tokens = agent.session_output_tokens
+                agent.session_cache_read_tokens = usage.get("cachedInputTokens", 0) or 0
+                agent.session_reasoning_tokens = usage.get("reasoningOutputTokens", 0) or 0
+                agent.session_total_tokens = usage.get("totalTokens", 0) or 0
+            return
+        if method in ("item/started", "item/completed"):
+            descriptor = _codex_tool_descriptor(params.get("item") or {})
+            if descriptor is None:
+                return
+            call_id, name, args = descriptor
+            if method == "item/started":
+                cb = getattr(agent, "tool_start_callback", None)
+                if cb is not None:
+                    cb(call_id, name, args)
+            else:
+                cb = getattr(agent, "tool_complete_callback", None)
+                if cb is not None:
+                    cb(call_id, name, args, _codex_tool_result(params.get("item") or {}))
+    except Exception:
+        logger.debug("codex live event bridge raised", exc_info=True)
 def _record_codex_app_server_compaction(
     agent,
     turn,
@@ -622,6 +752,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    conversation_history: List[Dict[str, Any]] | None = None,
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -765,7 +896,20 @@ def run_codex_app_server_turn(
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
     if turn.projected_messages:
-        messages.extend(turn.projected_messages)
+        projected = list(turn.projected_messages)
+        # Codex echoes the submitted input back as its own userMessage event,
+        # but run_conversation already appended the user message before
+        # handing us the turn — splicing both stores every user message
+        # twice, which shows up as doubled user bubbles in any persisted /
+        # resumed transcript.
+        if (
+            projected
+            and isinstance(projected[0], dict)
+            and projected[0].get("role") == "user"
+            and projected[0].get("content") == user_message
+        ):
+            projected = projected[1:]
+        messages.extend(projected)
 
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
@@ -859,11 +1003,55 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
-    return {
+    completed = not turn.interrupted and turn.error is None
+    _cleanup_errors = []
+
+    try:
+        from agent.codex_responses_adapter import _summarize_user_message_for_log
+
+        agent._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+        )
+    except Exception as exc:
+        _cleanup_errors.append(f"save_trajectory: {exc}")
+        logger.error("codex app-server: _save_trajectory failed: %s", exc, exc_info=True)
+
+    try:
+        agent._cleanup_task_resources(effective_task_id)
+    except Exception as exc:
+        _cleanup_errors.append(f"cleanup_task_resources: {exc}")
+        logger.error("codex app-server: _cleanup_task_resources failed: %s", exc, exc_info=True)
+
+    try:
+        agent._persist_session(messages, conversation_history)
+    except Exception as exc:
+        _cleanup_errors.append(f"persist_session: {exc}")
+        logger.error("codex app-server: _persist_session failed: %s", exc, exc_info=True)
+
+    # Final reasoning for the turn: the projector stashes it on the spliced
+    # assistant messages, but the codex dispatch early-returns before
+    # run_conversation's last_reasoning back-walk — without this the gateway
+    # never gets payload["reasoning"] on message.complete and the UI shows
+    # no thinking at all. Walk back to the current turn's first user row.
+    last_reasoning = None
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            break
+        if msg.get("role") == "assistant":
+            reasoning = msg.get("reasoning")
+            if isinstance(reasoning, str) and reasoning.strip():
+                last_reasoning = reasoning.strip()
+                break
+
+    result = {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
+        "completed": completed,
         "partial": turn.interrupted or turn.error is not None,
         "interrupted": _user_interrupted,
         **(
@@ -872,6 +1060,7 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        "last_reasoning": last_reasoning,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
@@ -888,6 +1077,10 @@ def run_codex_app_server_turn(
         "codex_turn_id": turn.turn_id,
         **usage_result,
     }
+    if _cleanup_errors:
+        result["cleanup_errors"] = _cleanup_errors
+
+    return result
 
 
 # ---------------------------------------------------------------------------

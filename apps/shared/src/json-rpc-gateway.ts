@@ -56,6 +56,14 @@ export interface GatewayClientOptions {
   createRequestId?: (nextId: number) => GatewayRequestId
   /** Return true to intercept the default closed-state transition. */
   onSocketClose?: (event: CloseEvent) => boolean | void
+  // App-level liveness heartbeat. iOS suspends a backgrounded PWA's WebSocket
+  // without firing 'close', leaving a zombie socket that still reads
+  // readyState===OPEN. Periodically pinging `heartbeatMethod` and dropping the
+  // socket when the reply times out makes connectionState truthful so the
+  // reconnect path can replace the dead pipe. 0 disables (the default).
+  heartbeatIntervalMs?: number
+  heartbeatMethod?: string
+  heartbeatTimeoutMs?: number
   requestIdPrefix?: string
   requestTimeoutMs?: number
   socketFactory?: (url: string) => WebSocketLike
@@ -74,6 +82,7 @@ export class JsonRpcGatewayClient {
   private pending = new Map<GatewayRequestId, PendingCall>()
   private socket: WebSocketLike | null = null
   private state: ConnectionState = 'idle'
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
   private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory'>> &
@@ -85,6 +94,9 @@ export class JsonRpcGatewayClient {
       connectErrorMessage: options.connectErrorMessage ?? 'WebSocket connection failed',
       connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
       createRequestId: options.createRequestId ?? ((nextId: number) => `${options.requestIdPrefix ?? 'r'}${nextId}`),
+      heartbeatIntervalMs: options.heartbeatIntervalMs ?? 0,
+      heartbeatMethod: options.heartbeatMethod ?? 'gateway.ping',
+      heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? 8_000,
       notConnectedErrorMessage: options.notConnectedErrorMessage ?? 'gateway not connected',
       onSocketClose: options.onSocketClose ?? (() => false),
       requestIdPrefix: options.requestIdPrefix ?? 'r',
@@ -149,6 +161,7 @@ export class JsonRpcGatewayClient {
       }
 
       this.socket = null
+      this.stopHeartbeat()
       this.setState('closed')
       this.rejectAllPending(new Error(this.options.closedErrorMessage))
     })
@@ -174,6 +187,7 @@ export class JsonRpcGatewayClient {
         settled = true
         cleanup()
         this.setState('open')
+        this.startHeartbeat()
         resolve()
       }
 
@@ -220,6 +234,8 @@ export class JsonRpcGatewayClient {
   }
 
   close(): void {
+    this.stopHeartbeat()
+
     const socket = this.socket
 
     if (!socket) {
@@ -232,6 +248,70 @@ export class JsonRpcGatewayClient {
       this.socket = null
       this.setState('closed')
       this.rejectAllPending(new Error(this.options.closedErrorMessage))
+    }
+  }
+
+  // Probe the socket with a cheap request. Resolves true if a reply lands in
+  // time. A timeout/error means the socket is a zombie (iOS suspended the PWA's
+  // WS without firing 'close'); force it closed so the boot hook's
+  // onState('closed') handler reconnects against a fresh socket. Safe to call
+  // from a wake handler before trusting connectionState==='open'.
+  async checkLiveness(): Promise<boolean> {
+    const socket = this.socket
+
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false
+    }
+
+    try {
+      await this.request(this.options.heartbeatMethod, {}, this.options.heartbeatTimeoutMs)
+
+      return true
+    } catch {
+      this.forceClose()
+
+      return false
+    }
+  }
+
+  private forceClose(): void {
+    const socket = this.socket
+
+    if (!socket) {
+      return
+    }
+
+    try {
+      socket.close()
+    } catch {
+      // ignore
+    }
+
+    // A truly dead socket may never fire its own 'close' after close(), so
+    // synthesize the teardown here rather than wait on an event that never comes.
+    if (this.socket === socket) {
+      this.socket = null
+      this.stopHeartbeat()
+      this.setState('closed')
+      this.rejectAllPending(new Error(this.options.closedErrorMessage))
+    }
+  }
+
+  private startHeartbeat(): void {
+    if (this.options.heartbeatIntervalMs <= 0) {
+      return
+    }
+
+    this.stopHeartbeat()
+    this.heartbeatTimer = setInterval(() => {
+      void this.checkLiveness()
+    }, this.options.heartbeatIntervalMs)
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
     }
   }
 

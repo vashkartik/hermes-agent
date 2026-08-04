@@ -306,6 +306,46 @@ def test_gateway_install_noninteractive_skips_legacy_unit_prompt(monkeypatch, tm
     assert all(c[0] != "prompt" for c in calls)
 
 
+def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkeypatch):
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+    monkeypatch.setattr(gateway, "is_windows", lambda: False)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+
+    # /proc walk is the first path tried (#22693). Force os.listdir on /proc
+    # to raise so the function falls back to ps, where fake_run takes over.
+    _real_listdir = gateway.os.listdir
+    def _no_proc_listdir(path):
+        if path == "/proc":
+            raise OSError("test stub: /proc unavailable")
+        return _real_listdir(path)
+    monkeypatch.setattr(gateway.os, "listdir", _no_proc_listdir)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:4] in (["ps", "-A", "eww", "-o"], ["ps", "-AEww", "-o", "pid=,command="]):
+            return SimpleNamespace(returncode=1, stdout="", stderr="ps failed")
+        if cmd[:3] == ["ps", "-o", "ppid="]:
+            # _get_ancestor_pids() walks up the tree; return "no parent" so
+            # the loop terminates cleanly.
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    assert gateway.find_gateway_pids() == [321]
+
+
+def test_find_gateway_pids_includes_restart_managers_without_systemd(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+
+    def fake_scan(exclude_pids, all_profiles=False, include_restart_managers=False):
+        calls.append((set(exclude_pids), all_profiles, include_restart_managers))
+        return [708] if include_restart_managers else []
+
+    monkeypatch.setattr(gateway, "_scan_gateway_pids", fake_scan)
 
 
 

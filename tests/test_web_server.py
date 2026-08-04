@@ -10,6 +10,7 @@ import contextlib
 import uvicorn
 
 from hermes_cli import web_server
+from hermes_cli import update_guard
 
 
 def _stub_uvicorn(monkeypatch):
@@ -119,6 +120,18 @@ def test_start_server_accepts_base64_desktop_attachments_above_preview_limit(mon
     raw_attachment_bytes = 256 * 1024 * 1024
     base64_bytes = ((raw_attachment_bytes + 2) // 3) * 4
     assert captured["ws_max_size"] > base64_bytes
+def test_start_server_registers_guarded_runtime(monkeypatch):
+    _stub_uvicorn(monkeypatch)
+    registered = []
+    monkeypatch.setattr(
+        update_guard,
+        "register_runtime",
+        lambda kind: registered.append(kind),
+    )
+
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    assert registered == ["dashboard"]
 
 
 def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):

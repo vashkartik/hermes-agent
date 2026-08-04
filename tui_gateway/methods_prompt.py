@@ -123,11 +123,59 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
-    # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+
+    # ── Only the session owner mutates ──────────────────────────────
+    # Two devices can WATCH one session, but exactly one drives it. A viewer
+    # that submits is told to claim first (session.claim) rather than silently
+    # racing the owner into an interleaved transcript. Sessions with no
+    # attached stream (stdio Ink, in-process callers) are unrestricted, as
+    # are clients that never opted into the durable-session contract.
+    t = current_transport()
+    if not session_is_owned_by(sid, t):
+        return _err(
+            rid, 4092,
+            "session is owned by another client — call session.claim to take over",
+        )
+    if t is not None:
+        # Re-bind to the current client transport for this request. This keeps
+        # streaming events on the active websocket even if an earlier
+        # disconnect or fallback moved the session transport to stdio. The
+        # guard above already established that this client may drive the
+        # session; the peer it displaces stays attached to the fan-out.
+        if _session_streams.get(sid) is not None:
+            subscribe_session(sid, t, owner=True, force=True)
+        else:
+            session["transport"] = t
+
+    # ── Execute-once on retry ───────────────────────────────────────
+    # A client that reconnects mid-turn resubmits with the same request_id
+    # (or its production alias client_request_id). The ledger answers
+    # "already running / already finished" instead of running the turn a
+    # second time, and rejects an id reused for different text. No id keeps
+    # the historical behaviour.
+    request_id, rid_err = _coerce_request_id(rid, params)
+    if rid_err is not None:
+        return rid_err
+    if request_id:
+        outcome = _request_ledger.begin(
+            sid, request_id, fingerprint_prompt(text, (truncate_user_ordinal,))
+        )
+        if outcome.outcome == "conflict":
+            return _err(
+                rid, 4094,
+                "request_id already used for a different prompt in this session",
+            )
+        if outcome.outcome == "duplicate":
+            record = outcome.record
+            return _ok(rid, {
+                "status": "duplicate",
+                "request_id": request_id,
+                "client_request_id": request_id,
+                "deduplicated": True,
+                "request_status": record["status"],
+                "result": record["result"],
+            })
+
     while True:
         busy_transport = None
         with session["history_lock"]:
@@ -144,7 +192,12 @@ def _(rid, params: dict) -> dict:
             queued=bool(params.get("queued")),
         )
         if busy_response is not None:
-            return busy_response
+            if request_id and ((busy_response.get("result") or {}).get("status")) == "queued":
+                # The accepted-but-not-yet-running prompt carries its request
+                # id to the drain so the turn it eventually starts settles the
+                # right ledger record.
+                session["_queued_request_id"] = request_id
+            return _settle_request_response(sid, request_id, busy_response)
         # The old turn finished between the two lock acquisitions. Retry the
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
@@ -156,7 +209,10 @@ def _(rid, params: dict) -> dict:
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
-            return _err(rid, 4009, "subagent still running — wait for it to finish")
+            return _settle_request_response(
+                sid, request_id,
+                _err(rid, 4009, "subagent still running — wait for it to finish"),
+            )
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
@@ -238,15 +294,30 @@ def _(rid, params: dict) -> dict:
                     )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+        # This claim and the updater's idle claim use the same cross-process
+        # lock. Acquire before mutating state or acknowledging the prompt, so
+        # a submitted message is either fully protected or cleanly retryable —
+        # there is no unguarded window during the agent build.
+        # (_run_prompt_submit's own claim reuses this lease, idempotently.)
+        if not _claim_update_turn(session):
+            return _settle_request_response(
+                sid, request_id,
+                _err(rid, 4091, "Hermes is applying an update; retry shortly"),
+            )
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
+    # Arm the turn on the fan-out: re-enables exactly one terminal event for
+    # every attached client and binds this request id to that terminal, which
+    # is what settles the ledger record.
+    begin_session_turn(sid, request_id or None)
+
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
         if not isolated_response.get("error"):
-            return isolated_response
+            return _settle_request_response(sid, request_id, isolated_response)
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
             sid,
@@ -275,10 +346,9 @@ def _(rid, params: dict) -> dict:
                 "disk full: session storage could not be written — free some disk space and try again",
             )
         logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
-        return _err(
-            rid,
-            5071,
-            f"session storage could not be written: {exc}",
+        return _settle_request_response(
+            sid, request_id,
+            _err(rid, 5071, f"session storage could not be written: {exc}"),
         )
     _start_agent_build(sid, session)
 
@@ -330,7 +400,11 @@ def _(rid, params: dict) -> dict:
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(rid, {"status": "streaming"})
+    result = {"status": "streaming"}
+    if request_id:
+        result["request_id"] = request_id
+        result["client_request_id"] = request_id
+    return _ok(rid, result)
 
 
 @method("clipboard.paste")
@@ -759,7 +833,11 @@ def _(rid, params: dict) -> dict:
         finally:
             _clear_session_context(session_tokens)
 
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        if not _start_update_guarded_daemon("desktop-background", run):
+            return _err(rid, 4091, "Hermes is applying an update; retry shortly")
+    except Exception as exc:
+        return _err(rid, 5000, f"background task start failed: {exc}")
     return _ok(rid, {"task_id": task_id})
 
 
@@ -872,8 +950,31 @@ def _(rid, params: dict) -> dict:
                 pass
             _clear_session_context(session_tokens)
 
-    threading.Thread(target=run, daemon=True).start()
+    try:
+        if not _start_update_guarded_daemon("desktop-preview", run):
+            return _err(rid, 4091, "Hermes is applying an update; retry shortly")
+    except Exception as exc:
+        return _err(rid, 5000, f"preview restart failed to start: {exc}")
     return _ok(rid, {"task_id": task_id})
+
+
+@method("clarify.pending")
+def _(rid, params: dict) -> dict:
+    """Outstanding clarify requests for a session (or all sessions).
+
+    A renderer that remounts mid-clarify (reconnect, desktop restart) lost the
+    clarify card with the socket; this lets it re-render every question still
+    waiting for an answer instead of leaving the turn stuck on an invisible
+    prompt.
+    """
+    return _ok(
+        rid,
+        {
+            "requests": _pending_clarify_requests(
+                str(params.get("session_id") or "")
+            )
+        },
+    )
 
 
 @method("clarify.respond")

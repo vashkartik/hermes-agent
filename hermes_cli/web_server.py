@@ -12765,6 +12765,154 @@ async def reset_memory(body: MemoryReset):
 
 
 # ---------------------------------------------------------------------------
+# Memory facts browser — read-only REST view into the holographic provider's
+# SQLite fact store (plugins/memory/holographic) for the desktop Memories
+# page.  [capella] memory facts browser endpoint.
+#
+# The ACTIVE db path is resolved exactly the way the plugin runtime does
+# (HolographicMemoryProvider.initialize): config.yaml
+# ``plugins.hermes-memory-store.db_path`` with ``$HERMES_HOME`` expansion,
+# falling back to the provider default ``<home>/memory_store.db``.  The db is
+# opened with a ``mode=ro`` URI so browsing can never mutate, migrate, or
+# write-lock the live store — notably it does NOT bump ``retrieval_count``
+# the way the plugin's own ``search_facts`` does.
+# ---------------------------------------------------------------------------
+
+_MEMORY_FACTS_MAX_LIMIT = 500
+
+
+def _holographic_db_path() -> Path:
+    """Resolve the holographic fact store path the way the plugin does."""
+    home = get_hermes_home()
+    plugin_cfg = cfg_get(load_config(), "plugins", "hermes-memory-store", default={})
+    db_path = plugin_cfg.get("db_path") if isinstance(plugin_cfg, dict) else None
+    if not isinstance(db_path, str) or not db_path.strip():
+        return home / "memory_store.db"
+    db_path = db_path.replace("$HERMES_HOME", str(home))
+    db_path = db_path.replace("${HERMES_HOME}", str(home))
+    return Path(db_path).expanduser()
+
+
+def _fts_match_expr(q: str) -> str:
+    """Build a safe FTS5 MATCH expression from free-form user input.
+
+    The raw query can contain FTS5 operators (quotes, ``-``, ``NEAR``…) that
+    raise OperationalError mid-request, so reduce it to AND-ed quoted prefix
+    terms: ``deploy proc`` → ``"deploy"* "proc"*``.
+    """
+    tokens = re.findall(r"[A-Za-z0-9_]+", q or "")
+    return " ".join(f'"{t}"*' for t in tokens[:16])
+
+
+def _query_memory_facts(
+    db_path,
+    q: str = "",
+    category: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Read-only browse/search over a holographic fact store sqlite file.
+
+    Pure function over ``db_path`` (testable against a temp db). Returns
+    ``{facts, total, categories}`` on success or ``{error, facts: [],
+    total: 0, categories: {}}`` when the store is missing/locked/corrupt.
+    ``total`` counts rows matching the current q/category filter (for
+    pagination); ``categories`` is the unfiltered per-category histogram
+    (for the chips + stats strip).
+    """
+    import sqlite3
+
+    limit = max(1, min(int(limit), _MEMORY_FACTS_MAX_LIMIT))
+    offset = max(0, int(offset))
+    empty = {"facts": [], "total": 0, "categories": {}}
+
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {"error": f"memory store not found at {db_path}", **empty}
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error as exc:
+        return {"error": f"could not open memory store: {exc}", **empty}
+
+    try:
+        conn.row_factory = sqlite3.Row
+        params: List[Any] = []
+        category_clause = ""
+        if category:
+            category_clause = "f.category = ?"
+            params.append(category)
+
+        match_expr = _fts_match_expr(q) if q.strip() else ""
+        if match_expr:
+            base = (
+                "FROM facts f JOIN facts_fts fts ON fts.rowid = f.fact_id "
+                "WHERE facts_fts MATCH ?"
+            )
+            params.insert(0, match_expr)
+            if category_clause:
+                base += f" AND {category_clause}"
+            order = "ORDER BY fts.rank, f.trust_score DESC"
+        else:
+            base = "FROM facts f"
+            if category_clause:
+                base += f" WHERE {category_clause}"
+            order = "ORDER BY f.updated_at DESC, f.fact_id DESC"
+
+        total = conn.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score,
+                   f.retrieval_count, f.helpful_count, f.created_at, f.updated_at
+            {base} {order} LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+        categories = {
+            str(row["category"] or "general"): row["n"]
+            for row in conn.execute(
+                "SELECT category, COUNT(*) AS n FROM facts GROUP BY category ORDER BY n DESC"
+            )
+        }
+        facts = [
+            {
+                "id": row["fact_id"],
+                "content": row["content"],
+                "category": row["category"],
+                "tags": row["tags"],
+                "trust_score": row["trust_score"],
+                "retrieval_count": row["retrieval_count"],
+                "helpful_count": row["helpful_count"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+        return {"facts": facts, "total": int(total), "categories": categories}
+    except sqlite3.Error as exc:
+        return {"error": f"memory store query failed: {exc}", **empty}
+    finally:
+        conn.close()
+
+
+@app.get("/api/memory/facts")
+async def get_memory_facts(q: str = "", category: str = "", limit: int = 100, offset: int = 0):
+    """Browse/search the holographic fact store (read-only, never trains it)."""
+    cfg = load_config()
+    provider = str(cfg_get(cfg, "memory", "provider", default="") or "")
+    db_path = _holographic_db_path()
+    db_mtime: Optional[float] = None
+    try:
+        db_mtime = db_path.stat().st_mtime
+    except OSError:
+        pass
+    result = _query_memory_facts(db_path, q=q, category=category, limit=limit, offset=offset)
+    result["provider"] = provider
+    result["db_mtime"] = db_mtime
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Operations endpoints — doctor / security audit / backup / import /
 # checkpoints / hooks.
 #
@@ -17418,6 +17566,13 @@ def start_server(
     import uvicorn
 
     try:
+        from hermes_cli.update_guard import register_runtime
+
+        register_runtime("dashboard")
+    except Exception as exc:
+        _log.warning("Could not register dashboard update-guard capability: %s", exc)
+
+    try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
 
         start_nous_auth_keepalive()
@@ -17597,6 +17752,15 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
+            # Discovery record for out-of-process health checks (the gateway
+            # heartbeat probes the dashboard through this — ports change on
+            # every respawn, so a portfile is the source of truth).
+            try:
+                from gateway.heartbeat import write_dashboard_portfile
+
+                write_dashboard_portfile(actual_port)
+            except Exception:
+                logger.debug("dashboard portfile write skipped", exc_info=True)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.

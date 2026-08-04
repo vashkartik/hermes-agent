@@ -38,7 +38,6 @@ class TestOpenRouterModels:
 
 class TestFetchOpenRouterModels:
 
-
     def test_falls_back_to_static_snapshot_on_fetch_failure(self, monkeypatch):
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
         # Pin the remote manifest out too — otherwise the fallback silently

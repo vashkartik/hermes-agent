@@ -374,7 +374,6 @@ def join_mcp_discovery(timeout: float | None = None) -> bool:
 _recovery_times: list[float] = []
 
 
-
 def _has_configured_mcp_servers() -> bool:
     """Return whether startup should attempt MCP discovery.
 
@@ -428,6 +427,13 @@ def ensure_mcp_discovery_started() -> None:
 
 
 def main():
+    try:
+        from hermes_cli.update_guard import register_runtime
+
+        register_runtime("tui-gateway")
+    except Exception:
+        logger.warning("Could not register TUI update-guard capability", exc_info=True)
+
     _install_sidecar_publisher()
 
     # MCP tool discovery — backgrounded so a slow or unreachable MCP server

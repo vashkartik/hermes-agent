@@ -6861,12 +6861,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
+        include_compacted: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
         By default only active messages are returned. Pass
-        ``include_inactive=True`` to load soft-deleted rows (e.g. for
-        audit / debug views of rewound history). See
+        ``include_compacted=True`` for a user-visible transcript containing
+        active rows plus history preserved by in-place compression, while
+        still hiding rewound/undone rows. Pass ``include_inactive=True`` to
+        load every soft-deleted row for audit/debug views. See
         :meth:`rewind_to_message` for the soft-delete mechanic.
 
         Ordered by AUTOINCREMENT id (true insertion order) rather than
@@ -6878,7 +6881,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``offset`` alone (without ``limit``) also pages — SQLite requires a
         LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1`` (unbounded).
         """
-        active_clause = "" if include_inactive else " AND active = 1"
+        if include_inactive:
+            active_clause = ""
+        elif include_compacted:
+            active_clause = " AND (active = 1 OR compacted = 1)"
+        else:
+            active_clause = " AND active = 1"
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
             f"{active_clause} ORDER BY id"
@@ -7088,9 +7096,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Load messages in the OpenAI conversation format (role + content dicts).
         Used by the gateway to restore conversation history.
 
-        By default only active messages are returned. Pass
-        ``include_inactive=True`` to load soft-deleted (rewound) rows
-        as well. See :meth:`rewind_to_message`.
+        By default only active messages are returned. ``include_ancestors``
+        is the user-visible display projection: it also includes rows kept by
+        in-place compression (``compacted = 1``), but not rewound/undone rows.
+        Pass ``include_inactive=True`` to load every soft-deleted row. See
+        :meth:`rewind_to_message`.
 
         ``repair_alternation=True`` runs ``repair_message_sequence`` over the
         loaded list before returning it. Callers that restore a session for
@@ -7106,7 +7116,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
-        active_clause = "" if include_inactive else " AND active = 1"
+        if include_inactive:
+            active_clause = ""
+        elif include_ancestors:
+            # Ancestor-inclusive reads feed the DISPLAY transcript: rows
+            # soft-archived by in-place compression (compacted = 1) must stay
+            # visible there even though the model-fed history drops them.
+            active_clause = " AND (active = 1 OR compacted = 1)"
+        else:
+            active_clause = " AND active = 1"
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
@@ -7285,8 +7303,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         - ``model_history`` — the tip session's active rows, alternation-repaired
           (the live-replay working conversation). Equivalent to
           ``get_messages_as_conversation(session_id, repair_alternation=True)``.
-        - ``display_history`` — the full lineage (ancestors → tip), verbatim, with
-          replayed-user dedup. Equivalent to
+        - ``display_history`` — the full visible lineage (ancestors → tip),
+          including in-place compaction archives, verbatim, with replayed-user dedup. Equivalent to
           ``get_messages_as_conversation(session_id, include_ancestors=True)``.
 
         The display fetch already reads a superset of the model fetch (the tip
@@ -7298,8 +7316,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                f"SELECT session_id, active, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                "AND (active = 1 OR compacted = 1) "
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
                 # for why timestamp ordering is unsafe.
                 "ORDER BY id",
@@ -7309,7 +7328,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Tip rows are exactly the model-fed set (get_messages_as_conversation
         # with session_ids=[session_id]); filtering the lineage fetch preserves
         # their relative id order.
-        tip_rows = [r for r in rows if r["session_id"] == session_id]
+        tip_rows = [
+            r for r in rows if r["session_id"] == session_id and r["active"] == 1
+        ]
         model_history = self._rows_to_conversation(
             tip_rows,
             session_id=session_id,
@@ -7327,13 +7348,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return model_history, display_history
 
     def get_ancestor_display_prefix(self, session_id: str) -> List[Dict[str, Any]]:
-        """Return the ancestor-only display messages for a session lineage.
+        """Return display-only messages that precede the tip's live model history.
 
-        These are messages from parent/grandparent sessions (compression
-        ancestors) that appear in the display transcript but NOT in the
-        tip session's model-fed history. Used by ``session.resume`` to
-        build the ``display_history_prefix`` that ``_live_session_payload``
-        prepends to the live model history.
+        This includes messages from parent/grandparent sessions plus rows
+        soft-archived by in-place compression in the tip session. They appear
+        in the display transcript but NOT in the tip's model-fed history. Used
+        by ``session.resume`` to build the ``display_history_prefix`` that
+        ``_live_session_payload`` prepends to the live model history.
 
         Previously the prefix was calculated as
         ``display_history[:len(display) - len(raw)]``, but that overcounts
@@ -7343,21 +7364,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ancestor messages AND repair-removed tip messages, but the slice
         only captures the first N display messages (which are tip messages
         when there are no ancestors), causing duplication. This method
-        returns ONLY the genuine ancestor messages, identified by
-        ``session_id != tip_session_id``. (#65919)
+        returns only genuine ancestors plus compacted tip rows, identified by
+        ``session_id != tip_session_id OR active = 0``. (#65919)
         """
         session_ids = self._session_lineage_root_to_tip(session_id)
-        if len(session_ids) <= 1:
-            return []
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                f"SELECT session_id, active, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                "AND (active = 1 OR compacted = 1) "
                 "ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
-        ancestor_rows = [r for r in rows if r["session_id"] != session_id]
+        ancestor_rows = [
+            r
+            for r in rows
+            if r["session_id"] != session_id or r["active"] == 0
+        ]
         if not ancestor_rows:
             return []
         return self._rows_to_conversation(

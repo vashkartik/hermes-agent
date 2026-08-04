@@ -109,6 +109,7 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+    _bind_creator_as_owner(sid)
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -2749,6 +2750,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
+    if (owner_err := _require_session_owner(rid, str(params.get("session_id") or ""))):
+        return owner_err
     # Keypress barge-in: stopping the turn also silences its streaming TTS
     # (voice is process-global, so no per-session scoping is needed).
     _tts_stream_stop()
@@ -2990,6 +2993,8 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    if (owner_err := _require_session_owner(rid, str(params.get("session_id") or ""))):
+        return owner_err
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -3017,6 +3022,8 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    if (owner_err := _require_session_owner(rid, str(params.get("session_id") or ""))):
+        return owner_err
     session, err = _sess_nowait(params, rid)
     if err:
         return err

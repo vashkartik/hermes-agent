@@ -38,6 +38,12 @@ from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
+from tui_gateway.session_stream import (
+    TERMINAL_EVENT_TYPES,
+    RequestLedger,
+    SessionStreamRegistry,
+    fingerprint_prompt,
+)
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -794,6 +800,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     except Exception:
         pass
 
+    run_thread = session.get("_run_thread")
+    # getattr-guarded: tests drive turns through duck-typed immediate threads
+    # that don't implement is_alive; treat those as not-running.
+    if run_thread is None or not getattr(run_thread, "is_alive", lambda: False)():
+        _release_update_turn_if_idle(session)
+
 
 # End reasons where the BACKEND reclaimed a session the client never asked to
 # close: the idle-TTL reaper, the LRU cap, and the WS-orphan reap. A client
@@ -890,6 +902,16 @@ def _pop_session_by_id(sid: str) -> dict | None:
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
     session["_sid"] = sid
+    # Release any blocking prompt before teardown/agent.close so a closed
+    # session never strands its run thread.
+    _clear_pending(sid)
+    # The session id is gone; drop its fan-out and request bookkeeping so a
+    # later id reuse can never inherit another session's peers or results.
+    try:
+        _session_streams.drop(sid)
+        _request_ledger.forget_session(sid)
+    except Exception:
+        logger.debug("session stream cleanup failed sid=%s", sid, exc_info=True)
     return session
 
 
@@ -932,16 +954,31 @@ def _close_session_by_id(
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
+def _session_has_pending_work(session: dict) -> bool:
+    """True when this session owns work the server must still run or deliver.
+
+    An accepted-but-not-started prompt (``queued_prompt``) lives only in this
+    dict — reaping the session silently drops a message the server already
+    said yes to. That is the "I sent it from my phone and nothing happened
+    until I opened the session again" bug: the client walked away trusting
+    the queue, and the 20-second orphan reaper threw it away.
+    """
+    return bool(session.get("queued_prompt"))
+
+
 def _ws_session_is_orphaned(session: dict | None) -> bool:
     """True if a WS session has no live transport and no in-flight turn.
 
     After ``handle_ws`` detaches a disconnected client it points the session at
     ``_detached_ws_transport``. A session left on that transport (and not
-    mid-turn) is genuinely orphaned and safe to reap.
+    mid-turn, with no accepted-but-unstarted work) is genuinely orphaned and
+    safe to reap.
     """
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
+        return False
+    if _session_has_pending_work(session):
         return False
     return session.get("transport") is _detached_ws_transport
 
@@ -1077,12 +1114,41 @@ def _close_sessions_for_transport(
     the single WS-disconnect teardown entry point — there is no second
     independent reap loop in ``handle_ws``.
 
+    A peer that was only VIEWING a session (Desktop still owns it while mobile
+    watches) is simply detached from the fan-out: its departure must not reap
+    or detach a session it never owned, which is what kept the surviving
+    client's stream alive across the other device going away.
+
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
+    # Leave the fan-out first so no in-flight emit can touch this dead socket,
+    # and so a session that still has another live peer keeps streaming.
+    try:
+        _session_streams.detach_transport(transport)
+    except Exception:
+        logger.debug("session stream detach failed", exc_info=True)
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
     reaped = 0
     detached = 0
     for sid, session in owned:
+        # Another device is still attached: hand it the session instead of
+        # orphaning one that demonstrably still has a live client. This is the
+        # unattended half of the handoff story (desktop sleeps, phone keeps the
+        # turn) and it settles immediately, inside this teardown.
+        heir = None
+        try:
+            stream = _session_streams.get(sid)
+            heir = stream.promote_next_owner() if stream is not None else None
+        except Exception:
+            logger.debug("session stream owner promotion failed sid=%s", sid, exc_info=True)
+        if heir is not None and not _transport_is_dead(heir):
+            session["transport"] = heir
+            _emit(
+                "session.owner_changed",
+                sid,
+                {"reason": end_reason, "client": _stream_client_label(heir)},
+            )
+            continue
         if session.get("close_on_disconnect"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
@@ -1135,6 +1201,8 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     if session.get("running") or _session_pending_kind(sid):
         return False
     if _session_has_active_delegations(sid, session):
+        return False
+    if _session_has_pending_work(session):
         return False
     ready = session.get("agent_ready")
     # Lazy watch sessions (subagent spectator windows) never start a build,
@@ -1229,6 +1297,8 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
         return False
     if _session_has_active_delegations(sid, session):
         return False
+    if _session_has_pending_work(session):
+        return False
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set() and not session.get("lazy"):
         return False
@@ -1288,8 +1358,65 @@ def _start_idle_reaper() -> None:
     threading.Thread(target=_loop, daemon=True).start()
 
 
+# How often the queue sweeper looks for accepted-but-unstarted prompts. Short:
+# this is the ceiling on how long a queued message can sit after its turn
+# SHOULD have started, when every event-driven drain hook missed it.
+_QUEUE_SWEEP_S = 15.0
+
+
+def _sweep_queued_prompts() -> None:
+    """Start any accepted prompt whose session is idle. Client-independent.
+
+    The normal drain runs at end-of-turn, in whatever thread finished the
+    turn. Two real gaps let an accepted prompt sit forever with no client
+    attached to nudge it:
+
+    * the drain lost its ``_claim_update_turn`` race (updater active) and
+      deliberately left the prompt queued "for retry" — but the only retry
+      triggers were client-driven;
+    * the turn thread died between clearing ``running`` and draining.
+
+    A queued prompt is work the server accepted; it must run whether or not
+    anyone is watching. ``_drain_queued_prompt`` claims under the history
+    lock, so racing a concurrent event-driven drain is harmless — one wins,
+    the other no-ops.
+    """
+    with _sessions_lock:
+        candidates = [
+            (sid, s)
+            for sid, s in _sessions.items()
+            if s.get("queued_prompt") and not s.get("running") and not s.get("_finalized")
+        ]
+    for sid, session in candidates:
+        try:
+            # A prompt can be queued while the agent is still building (the
+            # redirect turn-build window). Drain needs a live agent, so kick
+            # the build and let the next sweep start the turn.
+            if session.get("agent") is None:
+                ready = session.get("agent_ready")
+                if ready is None or not ready.is_set():
+                    _start_agent_build(sid, session)
+                    continue
+            _drain_queued_prompt("queue-sweep", sid, session)
+        except Exception:
+            logger.debug("queued prompt sweep failed sid=%s", sid, exc_info=True)
+
+
+def _start_queue_sweeper() -> None:
+    def _loop():
+        while True:
+            time.sleep(_QUEUE_SWEEP_S)
+            try:
+                _sweep_queued_prompts()
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, daemon=True, name="tui-queue-sweeper").start()
+
+
 atexit.register(_shutdown_sessions)
 _start_idle_reaper()
+_start_queue_sweeper()
 
 
 # ── Plumbing ──────────────────────────────────────────────────────────
@@ -1520,10 +1647,240 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
+        if sid:
+            # Multi-client fan-out: every peer attached to THIS session gets
+            # the frame, in one shared order, with a seq stamp it can replay
+            # from. Returns None when no peer is attached, in which case the
+            # historical single-transport route below still applies (stdio
+            # Ink, tests, and any session created before a client attached).
+            delivered = _session_streams.deliver(sid, obj)
+            if delivered is not None:
+                _note_stream_activity(sid, obj)
+                return delivered
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
             return t.write(obj)
 
     return (current_transport() or _stdio_transport).write(obj)
+
+
+# ── Durable multi-client session streaming ───────────────────────────
+#
+# One Hermes session can be open on Desktop and on mobile at the same time.
+# The registry below fans every session-scoped event out to all attached
+# peers in one order, while ownership (who may MUTATE the session) stays
+# single-holder and is mirrored into the legacy ``session["transport"]``
+# slot so every existing liveness / orphan-reap / eviction rule is unchanged.
+_session_streams = SessionStreamRegistry()
+_request_ledger = RequestLedger()
+
+
+def request_ledger() -> RequestLedger:
+    """Process-wide request ledger (execute-once + queryable status)."""
+    return _request_ledger
+
+
+def session_streams() -> SessionStreamRegistry:
+    """Process-wide session fan-out registry."""
+    return _session_streams
+
+
+def reset_session_streams() -> None:
+    """Drop all stream/ledger state. Test hook and shutdown helper."""
+    _session_streams.clear()
+    _request_ledger.clear()
+
+
+def _stream_client_label(transport: Any) -> str:
+    peer = getattr(transport, "_peer", None)
+    return str(peer) if peer else type(transport).__name__
+
+
+def subscribe_session(
+    sid: str,
+    transport: Any,
+    *,
+    owner: bool = False,
+    force: bool = False,
+    explicit: bool = False,
+) -> bool:
+    """Attach ``transport`` to session ``sid``. Returns True when it owns it.
+
+    A live owner is never displaced silently: a second client asking for
+    ownership becomes a read-only viewer unless the current owner's socket is
+    dead/detached (reconnect) or ``force`` is set (explicit handoff). The
+    winning owner is mirrored onto ``session["transport"]`` so the legacy
+    routing/liveness paths keep agreeing with the stream.
+
+    ``explicit`` records that the client attached through the durable-session
+    RPCs; see :class:`~tui_gateway.session_stream.Subscriber`.
+    """
+    if not sid or transport is None:
+        return False
+    session = _sessions.get(sid)
+    stream = _session_streams.ensure(
+        sid,
+        session_key=str((session or {}).get("session_key") or ""),
+        profile_key=str((session or {}).get("profile_home") or ""),
+    )
+    became_owner = stream.attach(
+        transport,
+        owner=owner,
+        force=force,
+        explicit=explicit,
+        client=_stream_client_label(transport),
+        is_dead=_transport_is_dead,
+    )
+    if became_owner and session is not None:
+        session["transport"] = transport
+    return became_owner
+
+
+def unsubscribe_session(sid: str, transport: Any) -> bool:
+    """Detach one client. Returns True when it had been the owner."""
+    stream = _session_streams.get(sid)
+    if stream is None:
+        return False
+    return stream.detach(transport)
+
+
+def session_owner(sid: str) -> Any:
+    stream = _session_streams.get(sid)
+    return stream.owner() if stream is not None else None
+
+
+def session_is_owned_by(sid: str, transport: Any) -> bool:
+    """True when ``transport`` may mutate ``sid``.
+
+    Unrestricted for:
+
+    * sessions with no attached stream (stdio Ink, tests, in-process callers);
+    * a dead/detached owner — a reconnecting client must never be wedged out
+      of its own session by a socket the OS has not torn down yet;
+    * clients that never opted into the durable-session contract. Those keep
+      the historical "the newest client drives" behaviour, so a Desktop build
+      older than this change cannot be stranded behind an ownership error it
+      has no RPC to clear. They no longer *blank* the other device though —
+      the displaced peer stays attached and keeps receiving the stream.
+    """
+    stream = _session_streams.get(sid)
+    if stream is None or transport is None:
+        return True
+    owner = stream.owner()
+    if owner is None or owner is transport:
+        return True
+    if _transport_is_dead(owner):
+        return True
+    return not stream.is_explicit(transport)
+
+
+def _coerce_request_id(rid, params: dict) -> tuple[str, dict | None]:
+    """Read the submit's idempotency key from either accepted field name.
+
+    ``request_id`` is the durable-session contract's name; ``client_request_id``
+    is the alias an earlier production hotfix established, kept so clients
+    already sending it stay retry-safe. Returns ``("", None)`` when neither is
+    present (legacy behaviour), or ``("", error_frame)`` on a malformed value —
+    a client asking for idempotency must never silently lose it.
+    """
+    value = params.get("request_id")
+    if value in (None, ""):
+        value = params.get("client_request_id")
+    if value in (None, ""):
+        return "", None
+    if not isinstance(value, str) or value != value.strip() or len(value) > 200:
+        return "", _err(
+            rid, 4004, "request_id must be a non-empty string up to 200 characters"
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return "", _err(rid, 4004, "request_id contains control characters")
+    return value, None
+
+
+def _require_session_owner(rid, sid: str) -> dict | None:
+    """Return an error frame when the calling client may not drive ``sid``.
+
+    Two devices may WATCH a session; exactly one drives it. A viewer that
+    tries to steer/redirect/interrupt is told to claim ownership first rather
+    than racing the owner into an interleaved turn.
+    """
+    if session_is_owned_by(sid, current_transport()):
+        return None
+    return _err(
+        rid, 4092,
+        "session is owned by another client — call session.claim to take over",
+    )
+
+
+def _settle_request_response(sid: str, request_id: str, resp: dict) -> dict:
+    """Settle a ledger record from an immediate ``prompt.submit`` response.
+
+    An error settles the request straight away (a retry then replays the same
+    error instead of executing). A prompt that was *queued* stays ``running``:
+    its turn has not started yet, so the drain arms it and the eventual
+    terminal event settles it. A prompt that was redirected/steered into the
+    live turn is already applied, so it settles here — re-sending it must not
+    inject the text a second time.
+    """
+    if not request_id or not isinstance(resp, dict):
+        return resp
+    if (err := resp.get("error")):
+        _request_ledger.finish(sid, request_id, status="error", result=err)
+        return resp
+    status = str(((resp.get("result") or {}).get("status")) or "")
+    if status and status not in ("queued", "streaming", "started", "ok"):
+        _request_ledger.finish(sid, request_id, status=status, result=resp.get("result"))
+    return resp
+
+
+def _bind_creator_as_owner(sid: str) -> None:
+    """Register the creating client as the session's first owner.
+
+    Only real client transports join the fan-out; a standalone stdio/Ink
+    gateway keeps the historical single-transport route untouched (no stream,
+    no ``seq`` stamping, no ownership checks).
+    """
+    t = current_transport()
+    if t is None or t is _stdio_transport or t is _detached_ws_transport:
+        return
+    try:
+        subscribe_session(sid, t, owner=True)
+    except Exception:
+        logger.debug("session owner bind failed sid=%s", sid, exc_info=True)
+
+
+def begin_session_turn(sid: str, request_id: str | None = None) -> None:
+    """Arm a turn: re-enable exactly one terminal event for this session."""
+    stream = _session_streams.get(sid)
+    if stream is not None:
+        stream.begin_turn(request_id)
+
+
+def _note_stream_activity(sid: str, frame: dict) -> None:
+    """Keep the request ledger in step with the frames on the wire.
+
+    Any delivered frame refreshes the running request's clock (so a long,
+    actively-streaming turn is never settled by the stall bound), and the
+    turn's single terminal frame settles the request — which is what makes a
+    reconnecting client's ``request.status`` return a real answer instead of
+    hanging.
+    """
+    stream = _session_streams.get(sid)
+    if stream is None:
+        return
+    request_id = stream.turn_request_id()
+    if not request_id:
+        return
+    params = frame.get("params") or {}
+    event_type = params.get("type")
+    if event_type not in TERMINAL_EVENT_TYPES:
+        _request_ledger.touch(sid, request_id)
+        return
+    payload = params.get("payload")
+    if event_type == "error":
+        status = "error"
+    else:
+        status = str((payload or {}).get("status") or "complete")
+    _request_ledger.finish(sid, request_id, status=status, result=payload)
 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
@@ -2269,8 +2626,54 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
+def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
+    """Upgrade a stdio-parked session to the calling WS transport.
+
+    When a websocket drops mid-turn, ``handle_ws`` points every session it
+    owned at ``_stdio_transport`` — in dashboard mode a black hole with no
+    reader, so the rest of the turn (deltas, message.complete) vanishes.
+    Any session-scoped RPC arriving over a live WS proves the rightful
+    client is back, so re-bind the stream to it. Only sessions parked on
+    the stdio transport are upgraded: a second live client cannot hijack
+    another websocket's stream, and real stdio gateways (Ink TUI, where
+    stdio has a genuine peer) dispatch with ``_stdio_transport`` as the
+    current transport and are left untouched.
+    """
+    if not session:
+        return
+    t = current_transport()
+    if t is None or t is _stdio_transport:
+        return
+    sid = sid or str(session.get("_sid") or "") or _sid_for_session(session)
+    if session.get("transport") in (_stdio_transport, _detached_ws_transport):
+        # No live owner — the returning client takes the session back and the
+        # fan-out registry is updated in the same step so both agree.
+        if sid:
+            subscribe_session(sid, t, owner=True)
+        else:
+            session["transport"] = t
+        return
+    # A live owner exists: attach as a viewer so this peer still sees the
+    # stream. Ownership is unchanged — stealing it here is what blanked the
+    # other device mid-turn.
+    if sid:
+        subscribe_session(sid, t)
+
+
+def _sid_for_session(session: dict) -> str:
+    """Reverse-lookup a session's live id. Cheap: the registry is tiny."""
+    with _sessions_lock:
+        for sid, candidate in _sessions.items():
+            if candidate is session:
+                return sid
+    return ""
+
+
 def _sess_nowait(params, rid):
-    s = _sessions.get(params.get("session_id") or "")
+    sid = params.get("session_id") or ""
+    s = _sessions.get(sid)
+    if s is not None:
+        _rebind_ws_transport(s, sid)
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
@@ -3142,6 +3545,36 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
             {"request_id": rid},
         )
     return answer
+
+
+def _pending_clarify_requests(session_id: str = "") -> list[dict]:
+    """Return a detached snapshot of live desktop clarify prompts."""
+    with _prompt_lock:
+        rows = []
+        for request_id, (owner_sid, pending_event) in _pending.items():
+            event, payload = _pending_prompt_payloads.get(request_id, ("", {}))
+            if event != "clarify.request":
+                continue
+            if session_id and owner_sid != session_id:
+                continue
+            if pending_event.is_set() or request_id in _answers:
+                continue
+
+            raw_choices = payload.get("choices")
+            choices = (
+                [str(choice) for choice in raw_choices]
+                if isinstance(raw_choices, list)
+                else None
+            )
+            rows.append(
+                {
+                    "request_id": request_id,
+                    "session_id": owner_sid,
+                    "question": str(payload.get("question") or ""),
+                    "choices": choices,
+                }
+            )
+        return rows
 
 
 def _clarify_timeout_seconds() -> float | None:
@@ -6137,6 +6570,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     info = _session_info(new_agent, session)
     _emit("session.info", sid, info)
     _restart_slash_worker(sid, session)
+    _release_update_turn_if_idle(session)
     return info
 
 
@@ -6546,6 +6980,7 @@ def _init_session(
             except Exception:
                 pass
     _register_session_cwd(_sessions[sid])
+    _bind_creator_as_owner(sid)
     # No eager slash-worker pre-warm — the session dict already carries
     # slash_worker=None and slash.exec builds one on demand. See the
     # deferred-build path in _start_agent_build for the full rationale
@@ -7123,6 +7558,94 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
+def _claim_update_turn(session: dict, *, kind: str = "desktop") -> bool:
+    """Attach one update-guard lease to accepted work for this session.
+
+    Callers claim while holding ``history_lock`` before changing ``running``.
+    Chained/queued turns deliberately reuse the existing handle so there is no
+    updater-visible idle gap between work the server already accepted.
+    """
+    if session.get("_update_turn_lease") is not None:
+        return True
+    try:
+        from hermes_cli.update_guard import UpdateDrainActive, acquire_turn
+
+        session["_update_turn_lease"] = acquire_turn(kind)
+        return True
+    except UpdateDrainActive:
+        return False
+    except Exception as exc:
+        # Fail closed: an untracked turn could race an updater and be killed.
+        logger.warning("Hermes update guard could not claim a turn: %s", exc)
+        return False
+
+
+def _release_update_turn(session: dict) -> None:
+    """Release this session's update lease, if any (idempotent)."""
+    lease = session.pop("_update_turn_lease", None)
+    if lease is None:
+        return
+    try:
+        lease.release()
+    except Exception as exc:
+        logger.warning("Hermes update guard could not release a turn: %s", exc)
+
+
+def _release_update_turn_if_idle(session: dict) -> bool:
+    """Release only when no live or accepted queued work owns the session.
+
+    The handle is detached under ``history_lock`` before the file operation.
+    A prompt racing this release must then acquire a fresh lease after it gets
+    the lock, so an updater can never observe zero after that prompt is accepted.
+    """
+    lock = session.get("history_lock")
+    if lock is None:
+        if session.get("running") or session.get("queued_prompt"):
+            return False
+        _release_update_turn(session)
+        return True
+    with lock:
+        if session.get("running") or session.get("queued_prompt"):
+            return False
+        lease = session.pop("_update_turn_lease", None)
+    if lease is None:
+        return True
+    try:
+        lease.release()
+    except Exception as exc:
+        logger.warning("Hermes update guard could not release a turn: %s", exc)
+    return True
+
+
+def _start_update_guarded_daemon(kind: str, target) -> bool:
+    """Start hidden agent work under its own update lease.
+
+    Returns ``False`` when an update already owns drain. Other start failures
+    propagate after releasing the lease so callers can return their normal
+    internal-error response without leaking activity.
+    """
+    try:
+        from hermes_cli.update_guard import UpdateDrainActive, acquire_turn
+
+        lease = acquire_turn(kind)
+    except UpdateDrainActive:
+        return False
+
+    def guarded() -> None:
+        try:
+            target()
+        finally:
+            lease.release()
+
+    thread = threading.Thread(target=guarded, daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        lease.release()
+        raise
+    return True
+
+
 def _fail_inflight_turn(session: dict, error: Any) -> None:
     """Mark the in-flight turn terminal-error but keep it replayable.
 
@@ -7473,14 +7996,27 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
+        if not _claim_update_turn(session):
+            # The update won before this queued turn was accepted by the run
+            # loop. Leave it queued for retry; never start untracked. The
+            # background queue sweeper re-attempts it client-independently.
+            return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None:
+        if queued.get("transport") is not None and _session_streams.get(sid) is None:
             session["transport"] = queued["transport"]
+    if queued.get("transport") is not None and _session_streams.get(sid) is not None:
+        # Fan-out sessions re-attach through the registry so the queuing client
+        # never displaces a live owner (the other device may be driving now).
+        subscribe_session(sid, queued["transport"], owner=True)
+    # Arm the drained turn with the request id that accepted it, so its
+    # terminal event settles the right ledger record (the client that queued
+    # the prompt may have reconnected since and be polling request.status).
+    begin_session_turn(sid, session.pop("_queued_request_id", None))
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -7535,6 +8071,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+        _release_update_turn_if_idle(session)
         dispatch_failed = True
     if dispatch_failed:
         with session["history_lock"]:
@@ -7625,6 +8162,22 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
         return None
     user = _inflight_text(queued.get("text"))
     return {"user": user} if user else None
+
+
+# ── Methods: gateway ─────────────────────────────────────────────────
+
+
+@method("gateway.ping")
+def _(rid, params: dict) -> dict:
+    """Liveness probe for the renderer's WebSocket heartbeat.
+
+    iOS suspends a backgrounded PWA's WebSocket without firing ``onclose``,
+    leaving a zombie socket that still reads ``readyState === OPEN``. The client
+    pings this method and, when the reply times out, drops the dead socket and
+    reconnects against a fresh one. Intentionally trivial and side-effect free
+    so it stays cheap at the heartbeat cadence.
+    """
+    return _ok(rid, {"ok": True})
 
 
 # ── Methods: session ─────────────────────────────────────────────────
@@ -7724,6 +8277,7 @@ def _claim_or_reuse_live(
         with _sessions_lock:
             _sessions[sid] = record
             _register_session_cwd(_sessions[sid])
+    _bind_creator_as_owner(sid)
     return None
 
 
@@ -7925,11 +8479,16 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
+    if transport is not None:
+        # Attach the resuming client to the fan-out. It takes ownership only
+        # when nobody live holds it (reconnect); otherwise it joins as a viewer
+        # so the device that already owns the session keeps streaming. Done
+        # outside history_lock: subscribe_session touches the stream registry,
+        # never this session's history.
+        subscribe_session(sid, transport, owner=True)
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
@@ -7962,6 +8521,180 @@ def _live_session_payload(
     if queued:
         payload["queued"] = queued
     return payload
+
+
+# ── Methods: durable multi-client session ────────────────────────────
+#
+# Desktop and mobile can hold ONE session open together. These four methods
+# are the whole contract:
+#
+#   session.subscribe  attach this client to a session's live stream
+#   session.claim      take over the right to drive the session (handoff)
+#   session.replay     fetch the frames missed while disconnected
+#   request.status     ask what happened to a submitted request id
+#
+# Everything else about the session (history, prompts, tools) is unchanged.
+
+
+@method("session.subscribe")
+def _(rid, params: dict) -> dict:
+    """Attach this client to a session's event stream.
+
+    ``owner: true`` asks to drive it as well; the request is granted only when
+    no live client currently owns it (that is the reconnect case). Otherwise
+    the caller joins as a read-only viewer and still receives every delta and
+    the single terminal event, in the same order as the owner.
+    """
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4005, "session.subscribe requires a client transport")
+    owner = subscribe_session(
+        sid, transport, owner=bool(params.get("owner")), explicit=True
+    )
+    stream = _session_streams.get(sid)
+    return _ok(rid, {
+        "session_id": sid,
+        "session_key": _session_lookup_key(session, fallback=sid),
+        "owner": owner,
+        "seq": stream.latest_seq() if stream is not None else 0,
+        "running": bool(session.get("running")),
+        "clients": stream.clients() if stream is not None else [],
+    })
+
+
+@method("session.unsubscribe")
+def _(rid, params: dict) -> dict:
+    """Detach this client from a session's stream without closing it."""
+    sid = str(params.get("session_id") or "")
+    transport = current_transport()
+    was_owner = unsubscribe_session(sid, transport) if transport is not None else False
+    if was_owner:
+        # Explicit release: hand the session to whoever is still watching so a
+        # deliberate handoff settles immediately rather than via the reaper.
+        stream = _session_streams.get(sid)
+        heir = stream.promote_next_owner() if stream is not None else None
+        session = _sessions.get(sid)
+        if heir is not None and session is not None:
+            session["transport"] = heir
+            _emit("session.owner_changed", sid,
+                  {"reason": "released", "client": _stream_client_label(heir)})
+    return _ok(rid, {"session_id": sid, "released_ownership": was_owner})
+
+
+@method("session.claim")
+def _(rid, params: dict) -> dict:
+    """Take over the right to drive a session (explicit device handoff).
+
+    Unlike ``session.subscribe``, this displaces a live owner — the user asked
+    for it on this device. The previous owner stays attached as a viewer and is
+    told through ``session.owner_changed``, so its stream never goes dark.
+    """
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4005, "session.claim requires a client transport")
+    owner = subscribe_session(sid, transport, owner=True, force=True, explicit=True)
+    if owner:
+        _emit("session.owner_changed", sid,
+              {"reason": "claimed", "client": _stream_client_label(transport)})
+    stream = _session_streams.get(sid)
+    return _ok(rid, {
+        "session_id": sid,
+        "owner": owner,
+        "seq": stream.latest_seq() if stream is not None else 0,
+        "running": bool(session.get("running")),
+    })
+
+
+@method("session.replay")
+def _(rid, params: dict) -> dict:
+    """Return the session frames newer than ``after_seq``.
+
+    This is how a client that dropped its socket mid-turn catches up without
+    re-rendering the whole conversation. ``truncated: true`` means the missed
+    span has aged out of the ring and the client must do a full
+    ``session.resume`` instead of stitching a gap.
+    """
+    sid = str(params.get("session_id") or "")
+    _, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    try:
+        after_seq = int(params.get("after_seq") or 0)
+    except (TypeError, ValueError):
+        return _err(rid, 4004, "after_seq must be an integer")
+    stream = _session_streams.get(sid)
+    if stream is None:
+        return _ok(rid, {"session_id": sid, "frames": [], "truncated": False, "seq": 0})
+    frames, truncated, latest = stream.replay_since(max(0, after_seq))
+    return _ok(rid, {
+        "session_id": sid,
+        "frames": frames,
+        "truncated": truncated,
+        "seq": latest,
+    })
+
+
+def _request_status_response(rid, sid: str, request_id: str) -> dict:
+    record = _request_ledger.status(sid, request_id)
+    if record is None:
+        return _ok(rid, {
+            "session_id": sid,
+            "request_id": request_id,
+            "client_request_id": request_id,
+            "status": "unknown",
+            "result": None,
+        })
+    return _ok(rid, {
+        "session_id": sid,
+        "request_id": request_id,
+        "client_request_id": request_id,
+        "status": record["status"],
+        "result": record["result"],
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+    })
+
+
+@method("request.status")
+def _(rid, params: dict) -> dict:
+    """Report what happened to a ``prompt.submit`` request id.
+
+    Answers ``running`` / ``complete`` / ``error`` / ``stalled`` / a busy
+    disposition, plus the terminal payload once there is one. A request that
+    stops producing output settles as ``stalled`` within a bounded window, so
+    this never leaves a reconnected client waiting forever.
+    """
+    sid = str(params.get("session_id") or "")
+    request_id, rid_err = _coerce_request_id(rid, params)
+    if rid_err is not None:
+        return rid_err
+    if not sid or not request_id:
+        return _err(rid, 4006, "session_id and request_id required")
+    return _request_status_response(rid, sid, request_id)
+
+
+@method("prompt.status")
+def _(rid, params: dict) -> dict:
+    """Alias of ``request.status`` under the earlier production hotfix's name.
+
+    Clients taught to poll ``prompt.status`` with ``client_request_id`` by the
+    hand-applied bridge fix keep working against the ledger unchanged.
+    """
+    sid = str(params.get("session_id") or "")
+    request_id, rid_err = _coerce_request_id(rid, params)
+    if rid_err is not None:
+        return rid_err
+    if not sid or not request_id:
+        return _err(rid, 4006, "session_id and client_request_id required")
+    return _request_status_response(rid, sid, request_id)
 
 
 def _main_runtime_from_agent(agent) -> dict | None:
@@ -9104,6 +9837,9 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
+            elif not _claim_update_turn(session):
+                process_registry.completion_queue.put(evt)
+                _requeued = True
             else:
                 session["running"] = True
         if _requeued:
@@ -9119,6 +9855,9 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            _release_update_turn_if_idle(session)
             continue
         try:
             _emit("message.start", sid)
@@ -9143,6 +9882,7 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+            _release_update_turn_if_idle(session)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9189,6 +9929,9 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
+            if not _claim_update_turn(session):
+                process_registry.completion_queue.put(evt)
+                break
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
@@ -9197,6 +9940,9 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            _release_update_turn_if_idle(session)
             continue
         try:
             _emit("message.start", sid)
@@ -9221,6 +9967,7 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+            _release_update_turn_if_idle(session)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9353,22 +10100,33 @@ def _run_prompt_submit(
         ):
             session["running"] = False
             return
-        if image_paths is None:
-            images = list(session.get("attached_images", []))
-            session["attached_images"] = []
+        # Cross-process exclusion with the updater: a turn either runs fully
+        # tracked under an update-guard lease or is refused for retry.
+        if not _claim_update_turn(session):
+            session["running"] = False
+            _clear_inflight_turn(session)
+            update_blocked = True
         else:
-            images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        agent = session["agent"]
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                agent.clear_interrupt()
-            except Exception:
-                pass
+            update_blocked = False
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            agent = session["agent"]
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    agent.clear_interrupt()
+                except Exception:
+                    pass
+    if update_blocked:
+        _emit("error", sid, {"message": "Hermes is applying an update; retry shortly"})
+        return
     _emit("message.start", sid)
 
     def run():
@@ -9711,6 +10469,7 @@ def _run_prompt_submit(
 
             last_reasoning = None
             status_note = None
+            turn_history = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
                     with session["history_lock"]:
@@ -9718,6 +10477,7 @@ def _run_prompt_submit(
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            turn_history = list(result["messages"])
                         else:
                             # History mutated externally during the turn.
                             # Check if the only mutation was a model-switch
@@ -10083,11 +10843,19 @@ def _run_prompt_submit(
                 session["last_active"] = time.time()
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
+                # Keep the update-guard lease when accepted work continues
+                # immediately (queued prompt / goal follow-up) so an updater
+                # never sees a fake idle gap between chained turns.
+                keep_update_lease = bool(
+                    session.get("queued_prompt") or goal_followup
+                )
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
+            if not keep_update_lease:
+                _release_update_turn_if_idle(session)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -10117,10 +10885,13 @@ def _run_prompt_submit(
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
+                if not _claim_update_turn(session):
+                    return
                 session["running"] = True
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
+                return
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -10129,6 +10900,7 @@ def _run_prompt_submit(
                 )
                 with session["history_lock"]:
                     session["running"] = False
+                _release_update_turn_if_idle(session)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -10157,17 +10929,32 @@ def _run_prompt_submit(
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
+                    if not _claim_update_turn(session):
+                        # Update drain holds the turn lease: requeue the WHOLE
+                        # remaining batch, not just this event — everything in
+                        # drained[] was already removed from the queue.
+                        for pending_evt, _pending_synth in drained[index:]:
+                            process_registry.completion_queue.put(pending_evt)
+                        break
                     session["running"] = True
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
+                    _release_update_turn_if_idle(session)
                     continue
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
+                    # No early return: the next loop iteration sees running=True
+                    # and requeues the remaining drained events — returning here
+                    # would drop them (drained but never redelivered). The
+                    # trailing release below is if-idle, so the nested turn's
+                    # update lease is never stolen.
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(
@@ -10177,6 +10964,7 @@ def _run_prompt_submit(
                     )
                     with session["history_lock"]:
                         session["running"] = False
+                    _release_update_turn_if_idle(session)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -10186,7 +10974,14 @@ def _run_prompt_submit(
 
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
-    run_thread.start()
+    try:
+        run_thread.start()
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        _release_update_turn_if_idle(session)
+        _emit("error", sid, {"message": f"turn start failed: {exc}"})
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25
@@ -13703,17 +14498,29 @@ def _normalize_cdp_url(parsed) -> str:
 
 
 def _failure_messages(url: str, port: int, system: str) -> list[str]:
-    from hermes_cli.browser_connect import manual_chrome_debug_command
+    from hermes_cli.browser_connect import (
+        get_chrome_debug_candidates,
+        manual_chrome_debug_command,
+    )
 
+    candidates = get_chrome_debug_candidates(system)
     command = manual_chrome_debug_command(port, system)
-    hint = (
-        ["Start a Chromium-family browser with remote debugging, then retry /browser connect:", command]
-        if command
-        else [
+    if command and candidates:
+        hint = [
+            "Start a Chromium-family browser with remote debugging, then retry /browser connect:",
+            command,
+        ]
+    elif command:
+        hint = [
+            "No supported Chromium-family browser executable was found in this environment.",
+            "Try launching one by app name with remote debugging, then retry /browser connect:",
+            command,
+        ]
+    else:
+        hint = [
             "No supported Chromium-family browser executable was found in this environment.",
             f"Install one or start a Chromium-family browser with --remote-debugging-port={port}, then retry /browser connect.",
         ]
-    )
     return [
         f"Browser CDP is not reachable at {url}.",
         *hint,

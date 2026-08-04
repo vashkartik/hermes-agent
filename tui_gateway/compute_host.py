@@ -527,6 +527,8 @@ class ComputeHost:
         session = server._sessions.get(sid)
         if session is not None:
             session["transport"] = self._transport
+            if frame.get("client_request_id"):
+                session["_bridge_active_client_request_id"] = str(frame.get("client_request_id"))
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
             if frame.get("cwd"):
@@ -617,6 +619,8 @@ class ComputeHost:
             }
         session = server._sessions[sid]
         session["transport"] = self._transport
+        if frame.get("client_request_id"):
+            session["_bridge_active_client_request_id"] = str(frame.get("client_request_id"))
         session["profile_home"] = profile_home or session.get("profile_home")
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])

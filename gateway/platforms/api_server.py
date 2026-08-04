@@ -3456,8 +3456,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
+        assert db is not None  # _get_existing_session_or_404 already proved DB availability
         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
-        messages = await asyncio.to_thread(db.get_messages, resolved_id)
+        messages = await asyncio.to_thread(
+            db.get_messages, resolved_id, include_compacted=True
+        )
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,

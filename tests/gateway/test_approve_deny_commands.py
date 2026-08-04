@@ -94,6 +94,12 @@ def _wait_until(predicate, timeout=30.0, interval=0.02):
         time.sleep(interval)
         result = predicate()
     return result
+@pytest.fixture(autouse=True)
+def _manual_approval_mode(monkeypatch):
+    """Keep this manual-gateway suite independent of the smart-mode default."""
+    from tools import approval as approval_module
+
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
 
 # ------------------------------------------------------------------
