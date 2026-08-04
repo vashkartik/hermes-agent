@@ -295,3 +295,56 @@ class TestDesktopEmbedShim:
         assert web_server._desktop_embed_shim_script() != ""
         monkeypatch.setattr(web_server, "WEB_DIST", web)
         assert web_server._desktop_embed_shim_script() == ""
+
+
+class TestDesktopPasteImage:
+    """Serve-mode paste-image endpoint: bytes in, attachable host path out."""
+
+    def _client(self, monkeypatch, tmp_path):
+        from starlette.testclient import TestClient
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(web_server, "get_hermes_home", lambda: tmp_path)
+        return TestClient(web_server.app, base_url="http://127.0.0.1")
+
+    def _headers(self):
+        return {"x-hermes-session-token": web_server._SESSION_TOKEN}
+
+    def test_writes_image_and_returns_path(self, tmp_path, monkeypatch):
+        import base64
+
+        client = self._client(monkeypatch, tmp_path)
+        payload = {"bytes": base64.b64encode(b"\x89PNG fakedata").decode(), "ext": "png"}
+        resp = client.post("/api/desktop/paste-image", json=payload, headers=self._headers())
+        assert resp.status_code == 200, resp.text
+        path = resp.json()["path"]
+        assert path.endswith(".png")
+        from pathlib import Path
+
+        assert Path(path).read_bytes() == b"\x89PNG fakedata"
+
+    def test_rejects_unauthenticated(self, tmp_path, monkeypatch):
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post("/api/desktop/paste-image", json={"bytes": "aGk=", "ext": "png"})
+        assert resp.status_code == 401
+
+    def test_rejects_bad_base64_and_empty(self, tmp_path, monkeypatch):
+        client = self._client(monkeypatch, tmp_path)
+        assert client.post(
+            "/api/desktop/paste-image", json={"bytes": "!!!", "ext": "png"}, headers=self._headers()
+        ).status_code == 400
+        assert client.post(
+            "/api/desktop/paste-image", json={"ext": "png"}, headers=self._headers()
+        ).status_code == 400
+
+    def test_unknown_extension_falls_back_to_png(self, tmp_path, monkeypatch):
+        import base64
+
+        client = self._client(monkeypatch, tmp_path)
+        resp = client.post(
+            "/api/desktop/paste-image",
+            json={"bytes": base64.b64encode(b"x").decode(), "ext": "exe"},
+            headers=self._headers(),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["path"].endswith(".png")

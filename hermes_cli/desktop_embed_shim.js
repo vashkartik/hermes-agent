@@ -106,7 +106,22 @@
       return { ok: true };
     }
     if (method === 'pasteClipboardImage') {
-      return null;
+      // The sidecar materializes the bytes as a host temp file — same
+      // contract the desktop shell provides, served from the same machine
+      // the sessions run on, so the returned path attaches directly.
+      const res = await (window.fetch || fetch)('/api/desktop/paste-image', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-hermes-session-token': token(),
+        },
+        body: JSON.stringify({ bytes: payload && payload.bytes, ext: payload && payload.ext }),
+      });
+      const parsed = await res.json().catch(() => null);
+      if (!res.ok || !parsed || !parsed.path) {
+        throw new Error((parsed && parsed.error) || ('paste-image failed: HTTP ' + res.status));
+      }
+      return parsed;
     }
     throw new Error('unavailable in sidecar-served mode: ' + method);
   };
@@ -561,8 +576,29 @@
       },
     },
     api,
-    notify: () => ok(false),
-    requestMicrophoneAccess: () => ok(false),
+    notify: async (payload) => {
+      try {
+        if (typeof Notification === 'undefined') return false;
+        if (Notification.permission === 'default') await Notification.requestPermission();
+        if (Notification.permission !== 'granted') return false;
+        const title = (payload && (payload.title || payload.message)) || 'Hermes';
+        new Notification(String(title), { body: String((payload && payload.body) || '') });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    requestMicrophoneAccess: async () => {
+      // Browser permission model: ask at use-time via getUserMedia. Grant =
+      // true (voice UI enables); denial or unsupported = false.
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        for (const t of stream.getTracks()) t.stop();
+        return true;
+      } catch {
+        return false;
+      }
+    },
     readFileDataUrl: (target) => {
       const file = fileFor(target);
       return file ? blobToDataUrl(file) : Promise.reject(new Error('Mobile file is not available'));

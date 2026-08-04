@@ -102,7 +102,7 @@ from utils import env_var_enabled
 
 try:
     from fastapi import (
-        FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
+        Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -118,7 +118,7 @@ except ImportError:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import (
-            FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
+            Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
@@ -12893,6 +12893,44 @@ def _query_memory_facts(
         return {"error": f"memory store query failed: {exc}", **empty}
     finally:
         conn.close()
+
+
+@app.post("/api/desktop/paste-image")
+async def desktop_paste_image(request: Request, _: None = Depends(_require_token)):
+    """Materialize pasted image bytes as a host temp file for serve-mode embeds.
+
+    The desktop renderer's paste/attach flow hands image BYTES to its bridge
+    and expects a host PATH back (which then flows through ``image.attach``).
+    In Electron the shell writes the temp file; when the renderer is served
+    over HTTP (serve-mode shim, mobile proxy), this endpoint plays that role —
+    the backend runs on the same host as the sessions, so the path it returns
+    is directly attachable.
+    """
+    import base64 as _b64
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    raw = str((body or {}).get("bytes") or "")
+    ext = str((body or {}).get("ext") or "png").lower().lstrip(".")
+    if ext not in {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "heic"}:
+        ext = "png"
+    if not raw:
+        return JSONResponse({"error": "image bytes required"}, status_code=400)
+    try:
+        data = _b64.b64decode(raw, validate=True)
+    except Exception:
+        return JSONResponse({"error": "bytes must be base64"}, status_code=400)
+    # Attachment ceiling mirrors the platform senders' 25MB cap.
+    if not data or len(data) > 25 * 1024 * 1024:
+        return JSONResponse({"error": "image is empty or exceeds 25MB"}, status_code=413)
+    img_dir = get_hermes_home() / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    name = f"paste_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}.{ext}"
+    target = img_dir / name
+    target.write_bytes(data)
+    return {"path": str(target)}
 
 
 @app.get("/api/memory/facts")
