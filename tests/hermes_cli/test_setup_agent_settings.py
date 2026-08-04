@@ -3,6 +3,43 @@
 from hermes_cli.setup import setup_agent_settings
 
 
+def _patch_agent_settings_interactions(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt",
+        lambda _label, default="", **_kwargs: default,
+    )
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", lambda *args, **kwargs: 4)
+    monkeypatch.setattr("hermes_cli.setup.save_env_value", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.setup.save_config", lambda *args, **kwargs: None)
+
+
+def test_setup_agent_settings_enter_accepts_500_when_unconfigured(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _patch_agent_settings_interactions(monkeypatch)
+    config = {}
+
+    setup_agent_settings(config)
+
+    assert config["agent"]["max_turns"] == 500
+    assert "Press Enter to keep 500." in capsys.readouterr().out
+
+
+def test_setup_agent_settings_keeps_explicit_configured_override(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _patch_agent_settings_interactions(monkeypatch)
+    config = {"agent": {"max_turns": 237}}
+
+    setup_agent_settings(config)
+
+    assert config["agent"]["max_turns"] == 237
+    assert "Press Enter to keep 237." in capsys.readouterr().out
+
+
 def test_setup_agent_settings_uses_displayed_max_iterations_value(tmp_path, monkeypatch, capsys):
     """The helper text should match the value shown in the prompt.
 

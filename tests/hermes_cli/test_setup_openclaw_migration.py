@@ -224,6 +224,10 @@ class TestGetSectionConfigSummary:
 
 
 
+    def test_agent_fallback_matches_runtime_default(self):
+        with patch.object(setup_mod, "get_env_value", return_value=""):
+            result = setup_mod._get_section_config_summary({}, "agent")
+        assert result == "max turns: 500"
 
     # Regression tests for issue #13025: the model / gateway summaries used
     # stale, hardcoded env-var allowlists that drifted from the real setup +

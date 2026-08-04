@@ -22,6 +22,7 @@ EVENT_TYPES = (
 class RecordingTransport:
     def __init__(self) -> None:
         self.frames: list[dict] = []
+        self.subscription_lock = threading.Lock()
         self.subscribed_session_id: str | None = None
         self.subscription_next_generation = 0
         self.subscription_committed_generation = 0
@@ -34,23 +35,27 @@ class RecordingTransport:
         return None
 
     def subscribe_session(self, session_id: str) -> None:
-        self.subscription_next_generation += 1
-        self.subscription_committed_generation = self.subscription_next_generation
-        self.subscribed_session_id = session_id
+        with self.subscription_lock:
+            self.subscription_next_generation += 1
+            self.subscription_committed_generation = self.subscription_next_generation
+            self.subscribed_session_id = session_id
 
     def begin_session_subscription(self) -> int:
-        self.subscription_next_generation += 1
-        return self.subscription_next_generation
+        with self.subscription_lock:
+            self.subscription_next_generation += 1
+            return self.subscription_next_generation
 
     def complete_session_subscription(self, generation: int, session_id: str) -> bool:
-        if generation < self.subscription_committed_generation:
-            return False
-        self.subscription_committed_generation = generation
-        self.subscribed_session_id = session_id
-        return True
+        with self.subscription_lock:
+            if generation < self.subscription_committed_generation:
+                return False
+            self.subscription_committed_generation = generation
+            self.subscribed_session_id = session_id
+            return True
 
     def observes_session(self, session_id: str) -> bool:
-        return self.subscribed_session_id == session_id
+        with self.subscription_lock:
+            return self.subscribed_session_id == session_id
 
     def promote_session_if_subscribed(self, session_id: str, promote) -> bool:
         if not self.observes_session(session_id):
@@ -65,6 +70,12 @@ class ObserverTransport(RecordingTransport):
     def write_observer(self, obj: dict) -> bool:
         self.frames.append(obj)
         return True
+
+    def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
+        with self.subscription_lock:
+            if self.subscribed_session_id != session_id:
+                return False
+            return self.write_observer(obj)
 
 
 def test_mac_origin_stream_mirrors_thinking_tools_and_text_to_mobile() -> None:
@@ -133,6 +144,65 @@ def test_session_stream_does_not_leak_to_clients_subscribed_elsewhere() -> None:
     assert len(owner.frames) == 1
     assert len(same_session.frames) == 1
     assert unrelated.frames == []
+
+
+def test_session_switch_rejects_frame_selected_before_atomic_observer_enqueue() -> None:
+    session_a = "session-a-race"
+    session_b = "session-b-race"
+    reached_enqueue = threading.Event()
+    resume_enqueue = threading.Event()
+
+    class CoordinatedObserver(ObserverTransport):
+        def _pause_before_enqueue(self) -> None:
+            reached_enqueue.set()
+            assert resume_enqueue.wait(timeout=3)
+
+        def write_observer(self, obj: dict) -> bool:
+            self._pause_before_enqueue()
+            return super().write_observer(obj)
+
+        def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
+            self._pause_before_enqueue()
+            return super().write_observer_if_subscribed(session_id, obj)
+
+    owner_a = RecordingTransport()
+    owner_b = RecordingTransport()
+    observer = CoordinatedObserver()
+    observer.subscribe_session(session_a)
+    server._sessions[session_a] = {"transport": owner_a}
+    server._sessions[session_b] = {"transport": owner_b}
+    for transport in (owner_a, owner_b, observer):
+        server.register_live_transport(transport)
+
+    first_result: list[bool] = []
+    first_write = threading.Thread(
+        target=lambda: first_result.append(
+            server.write_json(
+                server._event_frame("message.delta", session_a, {"text": "A"})
+            )
+        )
+    )
+    try:
+        first_write.start()
+        assert reached_enqueue.wait(timeout=3)
+        observer.subscribe_session(session_b)
+        resume_enqueue.set()
+        first_write.join(timeout=3)
+        assert not first_write.is_alive()
+
+        assert server.write_json(
+            server._event_frame("message.complete", session_b, {"text": "B"})
+        )
+    finally:
+        resume_enqueue.set()
+        first_write.join(timeout=3)
+        for transport in (owner_a, owner_b, observer):
+            server.unregister_live_transport(transport)
+        server._sessions.pop(session_a, None)
+        server._sessions.pop(session_b, None)
+
+    assert first_result == [True]
+    assert [frame["params"]["session_id"] for frame in observer.frames] == [session_b]
 
 
 def test_dispatch_subscribes_an_activated_transport_to_the_response_session() -> None:
@@ -276,6 +346,58 @@ def test_owner_disconnect_promotes_a_live_subscriber(monkeypatch) -> None:
     finally:
         server.unregister_live_transport(successor)
         server._sessions.pop(sid, None)
+
+
+def test_owner_disconnect_does_not_detach_a_concurrently_reattached_session(
+    monkeypatch,
+) -> None:
+    sid = "owner-reattach-race"
+    teardown_snapshotted_owner = threading.Event()
+    resume_teardown = threading.Event()
+
+    class CoordinatedSession(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if key == "close_on_disconnect":
+                teardown_snapshotted_owner.set()
+                assert resume_teardown.wait(timeout=3)
+            return value
+
+    old_owner = RecordingTransport()
+    new_owner = ObserverTransport()
+    new_owner.subscribe_session(sid)
+    scheduled_reaps: list[str] = []
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled_reaps.append)
+    session = CoordinatedSession(
+        transport=old_owner,
+        close_on_disconnect=False,
+    )
+    server._sessions[sid] = session
+    server.register_live_transport(new_owner)
+
+    teardown_result: list[tuple[int, int]] = []
+    teardown = threading.Thread(
+        target=lambda: teardown_result.append(
+            server._close_sessions_for_transport(old_owner)
+        )
+    )
+    try:
+        teardown.start()
+        assert teardown_snapshotted_owner.wait(timeout=3)
+        with server._sessions_lock:
+            session["transport"] = new_owner
+        resume_teardown.set()
+        teardown.join(timeout=3)
+        assert not teardown.is_alive()
+    finally:
+        resume_teardown.set()
+        teardown.join(timeout=3)
+        server.unregister_live_transport(new_owner)
+        server._sessions.pop(sid, None)
+
+    assert teardown_result == [(0, 0)]
+    assert session["transport"] is new_owner
+    assert scheduled_reaps == []
 
 
 def test_owner_disconnect_skips_a_non_atomic_subscription_check(monkeypatch) -> None:

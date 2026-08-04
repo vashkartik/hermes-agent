@@ -1696,11 +1696,11 @@ def setup_agent_settings(config: dict):
     # config.yaml is authoritative; read from there. If a legacy .env
     # entry is still around (from pre-PR#18413 setups), prefer the
     # config value so we don't surface a stale number to the user.
-    current_max = str(cfg_get(config, "agent", "max_turns", default=90))
+    current_max = str(cfg_get(config, "agent", "max_turns", default=500))
     print_info("Maximum tool-calling iterations per conversation.")
     print_info("Higher = more complex tasks, but costs more tokens.")
     print_info(
-        f"Press Enter to keep {current_max}. Use 90 for most tasks or 150+ for open exploration."
+        f"Press Enter to keep {current_max}. The standard runtime budget is 500 iterations."
     )
 
     max_iter_str = prompt("Max iterations", current_max)
@@ -2532,7 +2532,7 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
         return f"backend: {backend}"
 
     elif section_key == "agent":
-        max_turns = cfg_get(config, "agent", "max_turns", default=90)
+        max_turns = cfg_get(config, "agent", "max_turns", default=500)
         return f"max turns: {max_turns}"
 
     elif section_key == "gateway":
@@ -3297,7 +3297,7 @@ def _blank_slate_minimize_config(config: dict):
     Everything here is opt-in afterwards via ``hermes setup agent`` /
     ``hermes config set``. We keep only what's needed to run.
     """
-    config.setdefault("agent", {})["max_turns"] = 90
+    config.setdefault("agent", {})["max_turns"] = 500
 
     # Compression off — minimal footprint; user opts in if they want long sessions.
     config.setdefault("compression", {})["enabled"] = False

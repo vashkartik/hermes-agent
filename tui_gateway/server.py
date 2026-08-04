@@ -1186,8 +1186,17 @@ def _close_sessions_for_transport(
             # Point detached sessions at the drop sentinel (NOT real stdio) so
             # _ws_session_is_orphaned recognizes them and the grace-reap can
             # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            session["transport"] = _detached_ws_transport
-            detached += 1
+            # The owned snapshot above can go stale while successor selection
+            # runs. Re-check authoritative ownership before parking the
+            # session so teardown cannot clobber a concurrent activate/resume.
+            with _sessions_lock:
+                if (
+                    _sessions.get(sid) is not session
+                    or session.get("transport") is not transport
+                ):
+                    continue
+                session["transport"] = _detached_ws_transport
+                detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
             except Exception:
@@ -1702,13 +1711,12 @@ def write_json(obj: dict) -> bool:
                 candidates = [transport for transport in _live_transports if transport is not t]
             delivered = False
             for transport in candidates:
-                observes_session = getattr(transport, "observes_session", None)
-                if not callable(observes_session) or not observes_session(sid):
-                    continue
                 try:
-                    write_observer = getattr(transport, "write_observer", None)
-                    if callable(write_observer):
-                        delivered = write_observer(obj) or delivered
+                    write_if_subscribed = getattr(
+                        transport, "write_observer_if_subscribed", None
+                    )
+                    if callable(write_if_subscribed):
+                        delivered = write_if_subscribed(sid, obj) or delivered
                 except Exception:
                     # Mirroring is best-effort: one stale observer must not
                     # break the authoritative session stream.

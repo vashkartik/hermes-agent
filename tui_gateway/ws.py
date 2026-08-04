@@ -165,6 +165,18 @@ class WSTransport:
         with self._subscription_lock:
             return self._subscribed_session_id == session_id
 
+    def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
+        """Queue ``obj`` only while this socket still observes ``session_id``.
+
+        Keep the subscription lock through acceptance into the observer queue
+        so a concurrent attach cannot commit a new subscription between the
+        session check and enqueue.
+        """
+        with self._subscription_lock:
+            if self._closed or self._subscribed_session_id != session_id:
+                return False
+            return self.write_observer(obj)
+
     def promote_session_if_subscribed(
         self,
         session_id: str,
