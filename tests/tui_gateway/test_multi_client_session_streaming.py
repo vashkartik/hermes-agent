@@ -2047,6 +2047,23 @@ def test_stale_generation_claim_keeps_historical_response_for_live_target() -> N
         assert response["result"]["session_id"] == target_sid
         assert client.observes_session(newer_sid)
         assert target_sid in server._sessions
+
+        # The losing claim left NO trace: the forceful takeover commits only
+        # inside the ordered commit, so a stale generation must not have
+        # crowned this socket, moved the legacy slot, or built a stream —
+        # and no target frame may reach the switched-away client.
+        assert server._session_streams.get(target_sid) is None
+        assert server.session_owner(target_sid) is None
+        assert server._sessions[target_sid]["transport"] is server._stdio_transport
+        frames_before = len(client.frames)
+        server.write_json(
+            server._event_frame("message.delta", target_sid, {"text": "private-target"})
+        )
+        assert not any(
+            frame.get("method") == "event"
+            and (frame.get("params") or {}).get("session_id") == target_sid
+            for frame in client.frames[frames_before:]
+        )
     finally:
         release_commit.set()
         server.unregister_live_transport(client)
@@ -2058,6 +2075,69 @@ def test_stale_generation_claim_keeps_historical_response_for_live_target() -> N
 
 def test_subscribe_losing_to_concurrent_close_returns_rpc_failure() -> None:
     _run_attach_close_race("session.subscribe")
+
+
+def test_build_settled_before_commit_replays_terminal_event(monkeypatch) -> None:
+    """A build that settles while the record is parked reaches the renderer.
+
+    The deferred-ownership design parks a fresh session.create record on the
+    drop sentinel until the ordered commit installs its owner; a build that
+    completed or failed inside that window emitted its terminal event into the
+    void. After the commit, the settled state is replayed to the attached
+    client so a fast init failure never leaves a successful-looking idle chat.
+    """
+    loop = asyncio.new_event_loop()
+    client = _RecordingWS(object(), loop, peer="precommit-build-test")
+    created_sids: list[str] = []
+
+    def instant_failed_build(sid, _delay=0.05):
+        # The build settles synchronously INSIDE the handler — strictly before
+        # the ordered commit that runs after the handler returns.
+        created_sids.append(sid)
+        session = server._sessions[sid]
+        session["agent_error"] = "agent init failed: boom"
+        session["agent_ready"].set()
+
+    monkeypatch.setattr(server, "_schedule_agent_build", instant_failed_build)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *a, **k: (None, None)
+    )
+    server.register_live_transport(client)
+    sid = ""
+    try:
+        response = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "create-precommit",
+                "method": "session.create",
+                "params": {},
+            },
+            client,
+        )
+        assert response is not None and "error" not in response
+        sid = response["result"]["session_id"]
+        assert created_sids == [sid]
+        assert client.observes_session(sid)
+
+        errors = [
+            (frame.get("params") or {})
+            for frame in client.frames
+            if frame.get("method") == "event"
+            and (frame.get("params") or {}).get("type") == "error"
+            and (frame.get("params") or {}).get("session_id") == sid
+        ]
+        assert errors, "settled build error must be replayed after the commit"
+        assert "boom" in str(errors[-1].get("payload", {}).get("message"))
+    finally:
+        server.unregister_live_transport(client)
+        client.close()
+        if sid:
+            session = server._sessions.pop(sid, None)
+            if session is not None and (lease := session.get("active_session_lease")):
+                lease.release()
+        server.reset_session_streams()
+        loop.close()
 
 
 def test_conditional_close_excludes_claims_from_its_critical_section(

@@ -2571,6 +2571,31 @@ def _release_stale_session_attachment(
     return was_owner, None
 
 
+def _resync_committed_session(sid: str) -> None:
+    """Replay a settled build's terminal event to a freshly-committed client.
+
+    A deferred session record is parked on the drop sentinel until the ordered
+    commit installs its owner; an agent build that settled inside that window
+    emitted its ``session.info`` / ``error`` into the void, leaving the
+    renderer with stale lazy state. Terminal transitions must reach the
+    renderer, so re-emit the settled state once the attachment commits.
+    """
+    session = _sessions.get(sid)
+    if session is None or session.get("_finalized"):
+        return
+    ready = session.get("agent_ready")
+    if ready is None or not ready.is_set():
+        return
+    try:
+        err = session.get("agent_error")
+        if err:
+            _emit("error", sid, {"message": str(err)})
+        else:
+            _emit_session_info_for_session(sid, session)
+    except Exception:
+        logger.debug("post-commit session resync failed sid=%s", sid, exc_info=True)
+
+
 def _record_transport_subscription(
     transport: Transport,
     method_name: str,
@@ -2609,6 +2634,9 @@ def _record_transport_subscription(
         # handlers overridden at the transport level) keep committing without
         # a record, as documented below.
         require_record = method_name in ("session.claim", "session.subscribe")
+        # session.claim's forceful takeover happens HERE, not in its handler,
+        # so a stale-generation rejection leaves no trace (see the handler).
+        commit_force = method_name == "session.claim"
         read_subscription = getattr(transport, "current_session_subscription", None)
         deferred_cleanup: list[Callable[[], None]] = []
         # Why the commit failed matters: only a vanished/finalized record turns
@@ -2638,9 +2666,29 @@ def _record_transport_subscription(
                         return False
                     # Commit through the durable stream registry. A second live
                     # client joins as a viewer; only a missing/dead owner is
-                    # replaced, and subscribe_session keeps the legacy transport
-                    # slot in sync when ownership really changes.
-                    subscribe_session(sid, transport, owner=commit_owner)
+                    # replaced (or displaced, for a claim's explicit handoff),
+                    # and subscribe_session keeps the legacy transport slot in
+                    # sync when ownership really changes.
+                    subscribe_session(
+                        sid,
+                        transport,
+                        owner=commit_owner,
+                        force=commit_force,
+                        explicit=commit_force,
+                    )
+                    if commit_force:
+                        deferred_cleanup.append(
+                            lambda: _announce_session_owner(
+                                sid, "claimed", fallback=transport
+                            )
+                        )
+                    if method_name != "prompt.submit":
+                        # A deferred record is parked on the drop sentinel
+                        # until this commit; a build that settled inside that
+                        # window emitted its terminal event into the void.
+                        deferred_cleanup.append(
+                            lambda: _resync_committed_session(sid)
+                        )
                 # A session-less sid (synthetic handlers used by transport-level
                 # callers) still commits the subscription move, so the stale
                 # release below applies either way.
@@ -9122,9 +9170,24 @@ def _(rid, params: dict) -> dict:
     transport = current_transport()
     if transport is None:
         return _err(rid, 4005, "session.claim requires a client transport")
-    owner = subscribe_session(sid, transport, owner=True, force=True, explicit=True)
-    if owner:
-        _announce_session_owner(sid, "claimed", fallback=transport)
+    ordered = callable(
+        getattr(transport, "begin_session_subscription", None)
+    ) and callable(getattr(transport, "complete_session_subscription", None))
+    if ordered:
+        # The forceful claim, its owner announcement, and the previous-session
+        # release all commit inside the ordered subscription commit (see
+        # _record_transport_subscription). A claim whose generation goes stale
+        # must leave no trace — mutating here let the losing socket keep the
+        # target's ownership and legacy slot while observing its newer session,
+        # dropping the target's frames for everyone and leaking private ones
+        # through the stale fallback.
+        owner = True
+    else:
+        # Transports without the ordered-commit machinery (stdio entry) keep
+        # the historical in-handler claim; nothing can reorder around them.
+        owner = subscribe_session(sid, transport, owner=True, force=True, explicit=True)
+        if owner:
+            _announce_session_owner(sid, "claimed", fallback=transport)
     stream = _session_streams.get(sid)
     return _ok(rid, {
         "session_id": sid,
