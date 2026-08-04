@@ -1229,8 +1229,16 @@ def _close_sessions_for_transport(
             ):
                 continue
         if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
+            # The predicate revalidates atomically under the teardown funnel's
+            # own lock: a claim landing after the check above must keep its
+            # freshly-claimed session, so only a still-orphaned record closes.
+            if _close_session_by_id(
+                sid,
+                end_reason=end_reason,
+                predicate=lambda current: current is session
+                and current.get("transport") is transport,
+            ):
+                reaped += 1
         else:
             with _live_transports_lock:
                 successor = None

@@ -1862,6 +1862,52 @@ def test_teardown_preserves_a_claim_that_raced_the_owned_snapshot(monkeypatch) -
         server.reset_session_streams()
 
 
+def test_close_on_disconnect_predicate_preserves_last_instant_claim(
+    monkeypatch,
+) -> None:
+    """A claim landing immediately before the close survives the teardown.
+
+    The close_on_disconnect branch revalidates, releases the lock, then calls
+    the teardown funnel — a claim in that gap must be preserved by the
+    funnel's own atomic predicate rather than popped unconditionally.
+    """
+    sid = "close-predicate-claim"
+    old_owner = RecordingTransport()
+    old_owner._closed = True
+    claimer = RecordingTransport()
+    session = _live_session_dict("stored-close-predicate", old_owner)
+    session["close_on_disconnect"] = True
+    server._sessions[sid] = session
+    real_close = server._close_session_by_id
+    claimed: list[bool] = []
+    try:
+        assert server.subscribe_session(sid, old_owner, owner=True, explicit=True)
+
+        def claim_then_close(close_sid, **kwargs):
+            if close_sid == sid and not claimed:
+                claimed.append(True)
+                # The claim lands after the branch's revalidation, immediately
+                # before the close reaches the teardown funnel.
+                claimer.subscribe_session(sid)
+                assert server.subscribe_session(
+                    sid, claimer, owner=True, force=True, explicit=True
+                )
+            return real_close(close_sid, **kwargs)
+
+        monkeypatch.setattr(server, "_close_session_by_id", claim_then_close)
+
+        reaped, detached = server._close_sessions_for_transport(old_owner)
+
+        assert claimed == [True]
+        assert (reaped, detached) == (0, 0)
+        assert sid in server._sessions, "claimed session must not be closed"
+        assert server.session_owner(sid) is claimer
+        assert session["transport"] is claimer
+    finally:
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
+
+
 def test_announcement_resolution_and_stamp_are_atomic_against_claims(
     monkeypatch,
 ) -> None:
