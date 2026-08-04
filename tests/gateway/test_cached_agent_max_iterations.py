@@ -19,9 +19,45 @@ assignment, so they fail if either contract regresses.
 
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent.iteration_budget import IterationBudget
 from agent.session_activity import ActivityProvenance
+
+
+def test_current_max_iterations_defaults_to_500(monkeypatch):
+    """An unset runtime config resolves to the shared default budget."""
+    from gateway import run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_reload_runtime_env_preserving_config_authority",
+        lambda: None,
+    )
+    monkeypatch.delenv("HERMES_MAX_ITERATIONS", raising=False)
+
+    assert gateway_run._current_max_iterations() == 500
+
+
+def test_initialized_agent_defaults_to_500_iterations():
+    """The public AIAgent constructor carries the shared default into state."""
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        initialized_agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert initialized_agent.max_iterations == 500
 
 
 def _make_cached_agent(max_iterations: int) -> SimpleNamespace:
