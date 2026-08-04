@@ -1808,6 +1808,168 @@ def test_owner_changed_after_racing_claim_names_the_claimant(monkeypatch) -> Non
         loop.close()
 
 
+def test_teardown_preserves_a_claim_that_raced_the_owned_snapshot(monkeypatch) -> None:
+    """A claim landing between teardown's snapshot and its promotion survives.
+
+    Pre-fix the teardown demoted whatever ``promote_next_owner`` returned when
+    installation failed — including an already-current claimant it never
+    promoted — leaving the registry ownerless (every viewer authorized), and a
+    ``close_on_disconnect`` session was closed without revalidating that it
+    still belonged to the disconnecting transport.
+    """
+    sid = "teardown-claim-race"
+    old_owner = RecordingTransport()
+    old_owner._closed = True
+    claimer = RecordingTransport()
+    scheduled_reaps: list[str] = []
+    session = _live_session_dict("stored-teardown-claim", old_owner)
+    session["close_on_disconnect"] = True
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled_reaps.append)
+    try:
+        assert server.subscribe_session(sid, old_owner, owner=True, explicit=True)
+        stream = server._session_streams.get(sid)
+        assert stream is not None
+        from tui_gateway import session_stream as stream_mod
+
+        real_promote = stream_mod.SessionStream.promote_next_owner
+        claimed: list[bool] = []
+
+        def promote_with_racing_claim(self, *args, **kwargs):
+            if self is stream and not claimed:
+                claimed.append(True)
+                # The claim lands after the teardown's owned snapshot but
+                # before its promotion: crown + mirror commit atomically.
+                claimer.subscribe_session(sid)
+                assert server.subscribe_session(
+                    sid, claimer, owner=True, force=True, explicit=True
+                )
+            return real_promote(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            stream_mod.SessionStream, "promote_next_owner", promote_with_racing_claim
+        )
+
+        server._close_sessions_for_transport(old_owner)
+
+        assert sid in server._sessions, "claimed session must not be closed"
+        assert server.session_owner(sid) is claimer
+        assert session["transport"] is claimer
+        assert server.session_owner(sid) is session["transport"]
+        assert scheduled_reaps == []
+    finally:
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
+
+
+def test_announcement_resolution_and_stamp_are_atomic_against_claims(
+    monkeypatch,
+) -> None:
+    """No frame sequenced after a crown may carry pre-crown ownership.
+
+    Pauses inside the announcement's build (which runs under the stream state
+    lock) while a claim races: the claim's crown must serialize entirely after
+    the in-flight announcement's resolution+stamp, so peers see the heir frame
+    strictly before the claimant frame and the claimant last.
+    """
+    loop = asyncio.new_event_loop()
+    leaver = _RecordingWS(object(), loop, peer="atomic-announce-leaver")
+    viewer = RecordingTransport()
+    viewer._peer = "atomic-announce-viewer"
+    claimer = RecordingTransport()
+    claimer._peer = "atomic-announce-claimer"
+    sid_a = "atomic-announce-a"
+    sid_b = "atomic-announce-b"
+    armed: list[bool] = []
+    reached_build = threading.Event()
+    release_build = threading.Event()
+    claim_started = threading.Event()
+    server._sessions[sid_a] = _live_session_dict("stored-atomic-a", leaver)
+    server._sessions[sid_b] = _live_session_dict("stored-atomic-b", RecordingTransport())
+    server.register_live_transport(leaver)
+    real_label = server._stream_client_label
+    claim_responses: list = []
+    try:
+        generation = leaver.begin_session_subscription()
+        assert leaver.complete_session_subscription(generation, sid_a)
+        assert server.subscribe_session(sid_a, leaver, owner=True, explicit=True)
+        server.subscribe_session(sid_a, viewer, explicit=True)
+        viewer.subscribe_session(sid_a)
+
+        def pausing_label(transport):
+            if armed and transport is viewer:
+                reached_build.set()
+                assert release_build.wait(timeout=3)
+            return real_label(transport)
+
+        monkeypatch.setattr(server, "_stream_client_label", pausing_label)
+
+        def racing_claim() -> None:
+            claim_started.set()
+            claim_responses.append(
+                server.dispatch(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "claim-atomic",
+                        "method": "session.claim",
+                        "params": {"session_id": sid_a},
+                    },
+                    claimer,
+                )
+            )
+
+        claim_thread = threading.Thread(target=racing_claim)
+
+        def watcher() -> None:
+            assert reached_build.wait(timeout=3)
+            claim_thread.start()
+            assert claim_started.wait(timeout=3)
+            # The claim serializes behind the in-flight announcement's
+            # resolution+stamp critical section.
+            time.sleep(0.3)
+            assert claim_thread.is_alive()
+            release_build.set()
+
+        watcher_thread = threading.Thread(target=watcher)
+        watcher_thread.start()
+        armed.append(True)
+        activate = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "activate-atomic-b",
+                "method": "session.activate",
+                "params": {"session_id": sid_b},
+            },
+            leaver,
+        )
+        assert activate is not None and "error" not in activate
+        watcher_thread.join(timeout=5)
+        claim_thread.join(timeout=5)
+        assert not watcher_thread.is_alive()
+        assert not claim_thread.is_alive()
+        assert claim_responses and claim_responses[0]["result"]["owner"] is True
+
+        owner_changes = [
+            (frame.get("params") or {})
+            for frame in viewer.frames
+            if (frame.get("params") or {}).get("type") == "session.owner_changed"
+        ]
+        clients = [change.get("payload", {}).get("client") for change in owner_changes]
+        assert clients == ["atomic-announce-viewer", "atomic-announce-claimer"]
+        seqs = [change.get("seq") for change in owner_changes]
+        assert seqs == sorted(seqs)
+        assert server.session_owner(sid_a) is claimer
+        assert server._sessions[sid_a]["transport"] is claimer
+    finally:
+        release_build.set()
+        server.unregister_live_transport(leaver)
+        leaver.close()
+        server._sessions.pop(sid_a, None)
+        server._sessions.pop(sid_b, None)
+        server.reset_session_streams()
+        loop.close()
+
+
 def test_orphan_reap_rearms_while_parked_session_is_running(monkeypatch) -> None:
     """A parked record protected by in-flight work keeps its reap timer.
 

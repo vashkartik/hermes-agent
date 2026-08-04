@@ -1165,12 +1165,18 @@ def _close_sessions_for_transport(
         # turn) and it settles immediately, inside this teardown.
         heir = None
         stream = None
+        # on_owner fires only when promote_next_owner actually CROWNS someone;
+        # an already-current owner (e.g. a claim that raced this teardown) is
+        # returned without it — and must never be demoted below.
+        promoted_here: list[Any] = []
         try:
             stream = _session_streams.get(sid)
             # Dead sockets are never crowned: a dead registry owner makes
             # session_is_owned_by grant every viewer mutation at once.
             heir = (
-                stream.promote_next_owner(is_dead=_transport_is_dead)
+                stream.promote_next_owner(
+                    is_dead=_transport_is_dead, on_owner=promoted_here.append
+                )
                 if stream is not None
                 else None
             )
@@ -1200,17 +1206,28 @@ def _close_sessions_for_transport(
             if installed:
                 _announce_session_owner(sid, end_reason, fallback=heir)
                 continue
-            # The promoted heir vanished mid-install (its own disconnect, a
-            # session switch, or a newer claim moved the slot). Never leave
-            # the registry crowning a transport the slot rejected; a racing
-            # claim that crowned itself is untouched.
-            try:
-                if stream is not None:
-                    stream.demote_owner(heir)
-            except Exception:
-                logger.debug(
-                    "failed-install owner demotion failed sid=%s", sid, exc_info=True
-                )
+            # An heir THIS teardown promoted vanished mid-install (its own
+            # disconnect, a session switch, or a newer claim moved the slot).
+            # Never leave the registry crowning a transport the slot rejected —
+            # but an owner someone else installed (a racing claim) was not our
+            # promotion and stays crowned.
+            if promoted_here:
+                try:
+                    if stream is not None:
+                        stream.demote_owner(heir)
+                except Exception:
+                    logger.debug(
+                        "failed-install owner demotion failed sid=%s", sid, exc_info=True
+                    )
+        # Ownership can move (a racing claim, a resume) between the owned
+        # snapshot above and here; a session that is no longer this
+        # transport's must not be closed or parked by its old owner's exit.
+        with _sessions_lock:
+            if (
+                _sessions.get(sid) is not session
+                or session.get("transport") is not transport
+            ):
+                continue
         if session.get("close_on_disconnect"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1

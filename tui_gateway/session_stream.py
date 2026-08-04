@@ -353,21 +353,34 @@ class SessionStream:
         """Stamp and fan out a frame built from state read at delivery time.
 
         ``build_frame`` receives the CURRENT owner transport (or ``None``) and
-        may return ``None`` to skip. Because the resolution happens inside the
-        delivery serialization, a stale ownership transition can never publish
-        its announcement after a newer transition's frame — the later-delivered
-        announcement always reflects the newer state.
+        may return ``None`` to skip. Resolution, frame construction, and the
+        sequence stamp happen in ONE state-lock critical section (ownership
+        transitions also take that lock), so a frame can never be sequenced
+        after a transition while carrying pre-transition content — the
+        announcement each peer receives last always names the newest owner.
+        ``build_frame`` runs under the stream lock: it must be cheap and
+        lock-free.
         """
         with self._delivery_lock:
-            frame = build_frame(self.owner())
-            if frame is None:
-                return None
-            event_type = (frame.get("params") or {}).get("type")
-            return self._deliver_locked(frame, event_type)
+            return self._deliver_locked(None, None, resolve=build_frame)
 
-    def _deliver_locked(self, frame: dict, event_type: Any) -> Optional[bool]:
+    def _deliver_locked(
+        self,
+        frame: Optional[dict],
+        event_type: Any,
+        *,
+        resolve: Optional[Callable[[Any], Optional[dict]]] = None,
+    ) -> Optional[bool]:
         """Body of :meth:`deliver`; caller holds ``_delivery_lock``."""
         with self._lock:
+            if resolve is not None:
+                owner = next(
+                    (sub.transport for sub in self._subs if sub.owner), None
+                )
+                frame = resolve(owner)
+                if frame is None:
+                    return None
+                event_type = (frame.get("params") or {}).get("type")
             if not self._subs:
                 return None
             if event_type in TERMINAL_EVENT_TYPES:
