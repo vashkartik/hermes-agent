@@ -102,8 +102,12 @@ def write_dashboard_portfile(port: int, *, hermes_home: Optional[Path] = None) -
 
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # No signal-0 probe on Windows; report alive and let the HTTP probe
+        # (the real health signal) decide.
+        return True
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — gated on os.name above
         return True
     except ProcessLookupError:
         return False
