@@ -10375,6 +10375,33 @@ def cmd_dashboard(args):
         # Don't build the SPA, and tell mount_spa() (read at web_server import
         # below) to disable it even if a stray dist exists. Set it first.
         os.environ["HERMES_SERVE_HEADLESS"] = "1"
+    # ── Config-driven web dist (dashboard.web_dist) ────────────────────
+    # An embedding shell (the Ace desktop, a kiosk, a remote proxy) may want
+    # this dashboard to serve a prebuilt desktop-renderer dist instead of the
+    # browser dashboard SPA, without controlling the spawn environment.
+    # `dashboard.web_dist` in config.yaml adopts the same contract as the
+    # HERMES_WEB_DIST env var (validated + expanded below); the env var, when
+    # set by a managing parent, still wins.
+    if not _headless_backend and "HERMES_WEB_DIST" not in os.environ:
+        try:
+            from hermes_cli.config import load_config as _load_cfg_for_web_dist
+
+            _cfg_web_dist = str(
+                (_load_cfg_for_web_dist().get("dashboard") or {}).get("web_dist") or ""
+            ).strip()
+        except Exception:
+            _cfg_web_dist = ""
+        if _cfg_web_dist:
+            _cfg_dist_root = Path(_cfg_web_dist).expanduser()
+            if (_cfg_dist_root / "index.html").exists():
+                os.environ["HERMES_WEB_DIST"] = str(_cfg_dist_root)
+                print(f"→ Using web dist from config dashboard.web_dist: {_cfg_dist_root}")
+            else:
+                print(
+                    f"⚠ dashboard.web_dist has no index.html at: {_cfg_dist_root} — "
+                    "serving the default web UI instead"
+                )
+
     elif "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
         if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
             sys.exit(1)
