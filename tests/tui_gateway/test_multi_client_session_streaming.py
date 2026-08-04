@@ -1359,6 +1359,168 @@ def test_sole_owner_unsubscribe_stops_private_routing_and_parks(monkeypatch) -> 
         loop.close()
 
 
+def _live_session_dict(session_key: str, transport) -> dict:
+    now = time.time()
+    return {
+        "agent": None,
+        "created_at": now,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "last_active": now,
+        "running": False,
+        "session_key": session_key,
+        "transport": transport,
+    }
+
+
+def test_claim_then_switch_releases_prior_ownership() -> None:
+    """session.claim is an ordered attach: the socket tracks it, and a newer
+    switch releases the claimed session back to the displaced owner."""
+    loop = asyncio.new_event_loop()
+    client = _RecordingWS(object(), loop, peer="claim-switch-test")
+    x_owner = RecordingTransport()
+    y_owner = RecordingTransport()
+    sid_a = "claim-switch-a"
+    sid_b = "claim-switch-b"
+    server._sessions[sid_a] = session_a = _live_session_dict("stored-claim-a", x_owner)
+    server._sessions[sid_b] = _live_session_dict("stored-claim-b", y_owner)
+    server.register_live_transport(client)
+    try:
+        assert server.subscribe_session(sid_a, x_owner, owner=True, explicit=True)
+        claim = server.dispatch(
+            {"id": "claim-a", "method": "session.claim",
+             "params": {"session_id": sid_a}},
+            client,
+        )
+        assert claim is not None and claim["result"]["owner"] is True
+        assert client.observes_session(sid_a)
+        assert server.session_owner(sid_a) is client
+
+        activate = server.dispatch(
+            {"id": "activate-b", "method": "session.activate",
+             "params": {"session_id": sid_b}},
+            client,
+        )
+        assert activate is not None and "error" not in activate
+        assert client.observes_session(sid_b)
+
+        # The displaced owner (still watching) inherits the claimed session.
+        assert server.session_owner(sid_a) is x_owner
+        assert session_a["transport"] is x_owner
+
+        frames_before = len(client.frames)
+        assert server.write_json(
+            server._event_frame("message.delta", sid_a, {"text": "private-a"})
+        )
+        assert not any(
+            frame.get("method") == "event"
+            and (frame.get("params") or {}).get("session_id") == sid_a
+            for frame in client.frames[frames_before:]
+        )
+    finally:
+        server.unregister_live_transport(client)
+        client.close()
+        server._sessions.pop(sid_a, None)
+        server._sessions.pop(sid_b, None)
+        loop.close()
+
+
+def test_subscribe_then_switch_detaches_viewer() -> None:
+    """A watch-only session.subscribe is tracked and released on switch, and
+    its commit never steals ownership from the live owner."""
+    loop = asyncio.new_event_loop()
+    client = _RecordingWS(object(), loop, peer="subscribe-switch-test")
+    x_owner = RecordingTransport()
+    y_owner = RecordingTransport()
+    sid_a = "subscribe-switch-a"
+    sid_b = "subscribe-switch-b"
+    server._sessions[sid_a] = session_a = _live_session_dict("stored-sub-a", x_owner)
+    server._sessions[sid_b] = _live_session_dict("stored-sub-b", y_owner)
+    server.register_live_transport(client)
+    try:
+        assert server.subscribe_session(sid_a, x_owner, owner=True, explicit=True)
+        subscribe = server.dispatch(
+            {"id": "subscribe-a", "method": "session.subscribe",
+             "params": {"session_id": sid_a}},
+            client,
+        )
+        assert subscribe is not None and subscribe["result"]["owner"] is False
+        assert client.observes_session(sid_a)
+        assert server.session_owner(sid_a) is x_owner
+
+        # As an attached viewer the client mirrors the stream.
+        assert server.write_json(
+            server._event_frame("message.delta", sid_a, {"text": "watched"})
+        )
+        assert any(
+            (frame.get("params") or {}).get("session_id") == sid_a
+            for frame in client.frames
+        )
+
+        activate = server.dispatch(
+            {"id": "activate-b", "method": "session.activate",
+             "params": {"session_id": sid_b}},
+            client,
+        )
+        assert activate is not None and "error" not in activate
+        assert client.observes_session(sid_b)
+        assert server.session_owner(sid_a) is x_owner
+        assert session_a["transport"] is x_owner
+
+        frames_before = len(client.frames)
+        assert server.write_json(
+            server._event_frame("message.delta", sid_a, {"text": "private-a"})
+        )
+        assert not any(
+            (frame.get("params") or {}).get("session_id") == sid_a
+            for frame in client.frames[frames_before:]
+        )
+    finally:
+        server.unregister_live_transport(client)
+        client.close()
+        server._sessions.pop(sid_a, None)
+        server._sessions.pop(sid_b, None)
+        loop.close()
+
+
+def test_concurrent_claims_keep_owner_and_legacy_slot_consistent() -> None:
+    """Racing forced claims must leave the stream owner and the legacy
+    ``session["transport"]`` slot agreeing — disconnect cleanup selects by the
+    legacy slot, so divergence would strand the real owner's sessions."""
+    sid = "concurrent-claim-race"
+    client_a = RecordingTransport()
+    client_b = RecordingTransport()
+    try:
+        for _ in range(50):
+            session = _live_session_dict("stored-claim-race", server._stdio_transport)
+            server._sessions[sid] = session
+            barrier = threading.Barrier(2)
+
+            def claim(transport) -> None:
+                barrier.wait(timeout=3)
+                server.subscribe_session(
+                    sid, transport, owner=True, force=True, explicit=True
+                )
+
+            threads = [
+                threading.Thread(target=claim, args=(client_a,)),
+                threading.Thread(target=claim, args=(client_b,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+                assert not thread.is_alive()
+
+            assert server.session_owner(sid) is session["transport"]
+            server._session_streams.get(sid)
+            server._sessions.pop(sid, None)
+            server.reset_session_streams()
+    finally:
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
+
+
 def test_orphan_reap_rearms_while_parked_session_is_running(monkeypatch) -> None:
     """A parked record protected by in-flight work keeps its reap timer.
 

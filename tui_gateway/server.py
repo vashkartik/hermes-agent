@@ -1840,17 +1840,24 @@ def subscribe_session(
         session_key=str((session or {}).get("session_key") or ""),
         profile_key=str((session or {}).get("profile_home") or ""),
     )
-    became_owner = stream.attach(
+    # The legacy-slot mirror commits inside the stream's ownership lock: two
+    # racing claims otherwise interleave so the registry crowns one owner while
+    # ``session["transport"]`` keeps the other, and disconnect cleanup (which
+    # selects by the legacy slot) then misses the real owner.
+    mirror = None
+    if session is not None:
+        def mirror() -> None:
+            session["transport"] = transport
+
+    return stream.attach(
         transport,
         owner=owner,
         force=force,
         explicit=explicit,
         client=_stream_client_label(transport),
         is_dead=_transport_is_dead,
+        on_owner=mirror,
     )
-    if became_owner and session is not None:
-        session["transport"] = transport
-    return became_owner
 
 
 def unsubscribe_session(sid: str, transport: Any) -> bool:
@@ -2379,8 +2386,10 @@ _SESSION_SUBSCRIPTION_METHODS = frozenset(
         "prompt.submit",
         "session.activate",
         "session.branch",
+        "session.claim",
         "session.create",
         "session.resume",
+        "session.subscribe",
     }
 )
 
@@ -2483,6 +2492,11 @@ def _record_transport_subscription(
         # prompt.submit keeps its takeover semantics (_claim_prompt_transport);
         # only the switch-shaped attaches close the previous attachment.
         release_stale = method_name != "prompt.submit"
+        # session.subscribe may be a watch-only attach: its commit must not
+        # upgrade a viewer to owner (that would steal an ownerless stdio/Ink
+        # session's legacy routing). The handler already attached with the
+        # caller's actual intent; the commit just re-affirms membership.
+        commit_owner = method_name != "session.subscribe"
         read_subscription = getattr(transport, "current_session_subscription", None)
         deferred_cleanup: list[Callable[[], None]] = []
 
@@ -2504,7 +2518,7 @@ def _record_transport_subscription(
                     # client joins as a viewer; only a missing/dead owner is
                     # replaced, and subscribe_session keeps the legacy transport
                     # slot in sync when ownership really changes.
-                    subscribe_session(sid, transport, owner=True)
+                    subscribe_session(sid, transport, owner=commit_owner)
                 # A session-less sid (synthetic handlers used by transport-level
                 # callers) still commits the subscription move, so the stale
                 # release below applies either way.

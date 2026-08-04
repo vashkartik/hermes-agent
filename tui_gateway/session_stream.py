@@ -202,6 +202,7 @@ class SessionStream:
         explicit: bool = False,
         client: str = "",
         is_dead: Optional[Callable[[Any], bool]] = None,
+        on_owner: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Attach ``transport``; return True when it holds ownership.
 
@@ -210,6 +211,12 @@ class SessionStream:
         slot is held by a dead/detached peer takes over implicitly — that is
         the reconnect case.  Re-attaching an already-present transport is
         idempotent and never downgrades it.
+
+        ``on_owner`` runs under the stream lock whenever this call reports
+        ownership, so the caller's mirror of the owner (the legacy
+        ``session["transport"]`` slot) commits atomically with the ownership
+        flip — racing claims can never leave the two disagreeing. It must be
+        cheap and lock-free.
         """
         with self._lock:
             existing = self._find(transport)
@@ -223,6 +230,8 @@ class SessionStream:
             existing.explicit = existing.explicit or explicit
 
             if not owner:
+                if existing.owner and on_owner is not None:
+                    on_owner()
                 return existing.owner
 
             current = next((s for s in self._subs if s.owner and s is not existing), None)
@@ -234,6 +243,8 @@ class SessionStream:
                     return False
                 current.owner = False
             existing.owner = True
+            if on_owner is not None:
+                on_owner()
             return True
 
     def detach(self, transport: Any) -> bool:
