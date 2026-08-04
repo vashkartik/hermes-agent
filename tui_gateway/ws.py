@@ -158,9 +158,11 @@ class WSTransport:
         session_id: str,
         claim_owner: Callable[[], bool] | None = None,
     ) -> bool:
-        """Atomically commit subscription and ownership for the latest attach."""
+        """Commit ownership unless a newer successful attach already won."""
         with self._subscription_lock:
-            if generation != self._subscription_next_generation:
+            if self._closed:
+                return False
+            if generation < self._subscription_committed_generation:
                 return False
             if claim_owner is not None and not claim_owner():
                 return False
@@ -463,7 +465,14 @@ class WSTransport:
                 )
 
     def close(self) -> None:
-        self._closed = True
+        # Serialize the explicit lifecycle close against an in-flight ordered
+        # attach completion. If completion wins, handle_ws's subsequent owner
+        # cleanup sees the claim; if close wins, completion observes _closed
+        # and cannot claim after cleanup has already snapshotted ownership.
+        with self._subscription_lock:
+            self._closed = True
+            self._subscription_next_generation += 1
+            self._subscribed_session_id = None
         with self._observer_lock:
             self._observer_batches.clear()
             self._observer_generation += 1

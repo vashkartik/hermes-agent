@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
 from tui_gateway import server
+from tui_gateway import ws as ws_mod
 
 
 EVENT_TYPES = (
@@ -49,7 +51,7 @@ class RecordingTransport:
         self, generation: int, session_id: str, claim_owner=None
     ) -> bool:
         with self.subscription_lock:
-            if generation != self.subscription_next_generation:
+            if generation < self.subscription_committed_generation:
                 return False
             if claim_owner is not None and not claim_owner():
                 return False
@@ -80,6 +82,76 @@ class ObserverTransport(RecordingTransport):
             if self.subscribed_session_id != session_id:
                 return False
             return self.write_observer(obj)
+
+
+def _start_paused_cold_resume(monkeypatch, transport, *, stored_session_id: str):
+    build_reached = threading.Event()
+    release_build = threading.Event()
+    runtime_session_ids: list[str] = []
+    scheduled_reaps: list[str] = []
+
+    class FakeLease:
+        def __init__(self):
+            self.released = False
+
+        def release(self):
+            self.released = True
+
+    class FakeDB:
+        def get_session(self, session_id):
+            if session_id == stored_session_id:
+                return {"id": session_id, "cwd": ""}
+            return None
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def reopen_session(self, _session_id):
+            return None
+
+        def get_resume_conversations(self, _session_id):
+            return [], []
+
+        def get_ancestor_display_prefix(self, _session_id):
+            return []
+
+    lease = FakeLease()
+
+    def pause_agent_build(session_id, _delay=0.05):
+        runtime_session_ids.append(session_id)
+        build_reached.set()
+        assert release_build.wait(timeout=3)
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *_args, **_kwargs: (lease, None),
+    )
+    monkeypatch.setattr(server, "_schedule_agent_build", pause_agent_build)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled_reaps.append)
+
+    assert server.dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": f"resume-{stored_session_id}",
+            "method": "session.resume",
+            "params": {"session_id": stored_session_id},
+        },
+        transport,
+    ) is None
+    assert build_reached.wait(timeout=3)
+    assert len(runtime_session_ids) == 1
+    return (
+        runtime_session_ids[0],
+        release_build,
+        scheduled_reaps,
+        lease,
+    )
 
 
 def test_mac_origin_stream_mirrors_thinking_tools_and_text_to_mobile() -> None:
@@ -357,9 +429,11 @@ def test_stale_resume_cannot_reclaim_ownership_or_leak_private_events(
     x_owner = RecordingTransport()
     y_owner = RecordingTransport()
     client = ClientTransport()
+    scheduled_reaps: list[str] = []
     session_x = live_session(stored_x, x_owner, PausedLock())
     session_y = live_session("stored-session-y", y_owner, threading.Lock())
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled_reaps.append)
     server._sessions[runtime_x] = session_x
     server._sessions[runtime_y] = session_y
     server.register_live_transport(client)
@@ -406,11 +480,159 @@ def test_stale_resume_cannot_reclaim_ownership_or_leak_private_events(
     assert client.observes_session(runtime_y)
     assert session_x["transport"] is x_owner
     assert session_y["transport"] is client
+    assert scheduled_reaps == []
     assert not any(
         frame.get("method") == "event"
         and (frame.get("params") or {}).get("session_id") == runtime_x
         for frame in client.frames
     )
+
+
+def test_closed_transport_cannot_claim_paused_cold_resume_and_schedules_reap(
+    monkeypatch,
+) -> None:
+    response_attempted = threading.Event()
+
+    class ResponseAwareTransport(ws_mod.WSTransport):
+        def write(self, _obj: dict) -> bool:
+            response_attempted.set()
+            return not self._closed
+
+    loop = asyncio.new_event_loop()
+    client = ResponseAwareTransport(object(), loop, peer="closed-resume-test")
+    server.register_live_transport(client)
+    runtime_sid = ""
+    release_resume = threading.Event()
+    lease = None
+    try:
+        runtime_sid, release_resume, scheduled_reaps, lease = _start_paused_cold_resume(
+            monkeypatch,
+            client,
+            stored_session_id="stored-closed-resume",
+        )
+        session = server._sessions[runtime_sid]
+        assert session["transport"] is server._detached_ws_transport
+
+        server.unregister_live_transport(client)
+        client.close()
+        assert server._close_sessions_for_transport(client) == (0, 0)
+
+        release_resume.set()
+        assert response_attempted.wait(timeout=3)
+
+        assert not client.observes_session(runtime_sid)
+        assert session["transport"] is server._detached_ws_transport
+        assert scheduled_reaps == [runtime_sid]
+        assert session["active_session_lease"] is lease
+    finally:
+        release_resume.set()
+        server.unregister_live_transport(client)
+        client.close()
+        session = server._sessions.pop(runtime_sid, None) if runtime_sid else None
+        if session is not None and (held_lease := session.get("active_session_lease")):
+            held_lease.release()
+        loop.close()
+
+
+def test_close_serializes_with_an_inflight_subscription_claim() -> None:
+    loop = asyncio.new_event_loop()
+    transport = ws_mod.WSTransport(object(), loop, peer="close-claim-race-test")
+    generation = transport.begin_session_subscription()
+    claim_started = threading.Event()
+    close_started = threading.Event()
+    release_claim = threading.Event()
+    completion_result: list[bool] = []
+
+    def claim_owner() -> bool:
+        claim_started.set()
+        assert close_started.wait(timeout=3)
+        assert release_claim.wait(timeout=3)
+        return True
+
+    complete_thread = threading.Thread(
+        target=lambda: completion_result.append(
+            transport.complete_session_subscription(
+                generation,
+                "claimed-session",
+                claim_owner,
+            )
+        )
+    )
+
+    def close_transport() -> None:
+        close_started.set()
+        transport.close()
+
+    close_thread = threading.Thread(target=close_transport)
+    try:
+        complete_thread.start()
+        assert claim_started.wait(timeout=3)
+        close_thread.start()
+        assert close_started.wait(timeout=3)
+        release_claim.set()
+        complete_thread.join(timeout=3)
+        close_thread.join(timeout=3)
+
+        assert not complete_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert completion_result == [True]
+        assert transport._closed
+        assert not transport.observes_session("claimed-session")
+    finally:
+        release_claim.set()
+        complete_thread.join(timeout=3)
+        close_thread.join(timeout=3)
+        transport.close()
+        loop.close()
+
+
+def test_failed_newer_attach_does_not_invalidate_older_cold_resume(monkeypatch) -> None:
+    response_attempted = threading.Event()
+
+    class ResponseAwareTransport(ws_mod.WSTransport):
+        def write(self, _obj: dict) -> bool:
+            response_attempted.set()
+            return not self._closed
+
+    loop = asyncio.new_event_loop()
+    client = ResponseAwareTransport(object(), loop, peer="failed-attach-test")
+    server.register_live_transport(client)
+    runtime_sid = ""
+    release_resume = threading.Event()
+    try:
+        runtime_sid, release_resume, scheduled_reaps, _lease = _start_paused_cold_resume(
+            monkeypatch,
+            client,
+            stored_session_id="stored-generation-resume",
+        )
+        session = server._sessions[runtime_sid]
+        assert session["transport"] is server._detached_ws_transport
+
+        failed_activate = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "failed-newer-activate",
+                "method": "session.activate",
+                "params": {"session_id": "missing-newer-session"},
+            },
+            client,
+        )
+        assert failed_activate is not None and "error" in failed_activate
+
+        release_resume.set()
+        assert response_attempted.wait(timeout=3)
+
+        assert client.observes_session(runtime_sid)
+        assert session["transport"] is client
+        assert scheduled_reaps == []
+    finally:
+        release_resume.set()
+        server.unregister_live_transport(client)
+        client.close()
+        session = server._sessions.pop(runtime_sid, None) if runtime_sid else None
+        if session is not None and (lease := session.get("active_session_lease")):
+            lease.release()
+        loop.close()
 
 
 def test_observer_is_queued_before_a_stalled_owner_write() -> None:

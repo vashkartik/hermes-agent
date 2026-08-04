@@ -2350,6 +2350,21 @@ _SESSION_SUBSCRIPTION_METHODS = frozenset(
 )
 
 
+def _schedule_rejected_deferred_subscription(sid: str) -> None:
+    """Reap request-created state that no transport successfully claimed."""
+    with _sessions_lock:
+        if not _ws_session_is_orphaned(_sessions.get(sid)):
+            return
+    try:
+        _schedule_ws_orphan_reap(sid)
+    except Exception:
+        logger.debug(
+            "rejected subscription orphan scheduling failed sid=%s",
+            sid,
+            exc_info=True,
+        )
+
+
 def _record_transport_subscription(
     transport: Transport,
     method_name: str,
@@ -2387,7 +2402,9 @@ def _record_transport_subscription(
                 subscribe_session(sid, transport, owner=True)
                 return True
 
-        complete_subscription(generation, sid, claim_owner)
+        committed = complete_subscription(generation, sid, claim_owner)
+        if not committed and method_name != "prompt.submit":
+            _schedule_rejected_deferred_subscription(sid)
         return
     subscribe_session = getattr(transport, "subscribe_session", None)
     if sid and callable(subscribe_session):
