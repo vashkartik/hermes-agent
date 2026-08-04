@@ -12,7 +12,7 @@
 import { build } from 'esbuild'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mkdirSync } from 'node:fs'
+import { copyFileSync, mkdirSync } from 'node:fs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
@@ -63,3 +63,11 @@ await build({
   logLevel: 'info',
 })
 console.log(`bundled ${preloadOut}${isDev ? ' (dev)' : ''}`)
+
+// External embedders (the Ace desktop shell) resolve this bundle by loading
+// app.asar/electron/preload.cjs as their webview preload. Webview preloads
+// run SANDBOXED: they cannot require() arbitrary files, so a thin wrapper
+// that requires dist/electron-preload.js throws and the embed silently loses
+// its IPC bridge. Ship the same self-contained bundle at both paths.
+copyFileSync(preloadOut, resolve(root, 'electron/preload.cjs'))
+console.log(`copied ${preloadOut} -> electron/preload.cjs (embed compat)`)
