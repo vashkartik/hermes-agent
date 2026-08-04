@@ -1991,6 +1991,71 @@ def test_claim_losing_to_concurrent_close_returns_rpc_failure() -> None:
     _run_attach_close_race("session.claim")
 
 
+def test_stale_generation_claim_keeps_historical_response_for_live_target() -> None:
+    """The 4001 substitution fires only for a vanished record.
+
+    A claim whose ordered commit loses by GENERATION — a newer attachment won
+    while the target stays live — keeps the historical behavior: the handler
+    response passes through unchanged, the newer subscription stays put, and
+    the live target is untouched.
+    """
+    loop = asyncio.new_event_loop()
+    reached_commit = threading.Event()
+    release_commit = threading.Event()
+    newer_sid = "stale-gen-newer"
+    target_sid = "stale-gen-target"
+
+    class BoundaryWS(_RecordingWS):
+        def complete_session_subscription(self, generation, session_id, claim_owner=None):
+            if session_id == target_sid and not release_commit.is_set():
+                reached_commit.set()
+                assert release_commit.wait(timeout=5)
+            return super().complete_session_subscription(
+                generation, session_id, claim_owner
+            )
+
+    client = BoundaryWS(object(), loop, peer="stale-gen-claim")
+    server._sessions[target_sid] = _live_session_dict(
+        "stored-stale-gen-target", server._stdio_transport
+    )
+    server.register_live_transport(client)
+    try:
+        def newer_attachment() -> None:
+            assert reached_commit.wait(timeout=5)
+            # A newer attachment commits while the claim's ordered commit is
+            # in flight; the claim's generation is now stale.
+            client.subscribe_session(newer_sid)
+            release_commit.set()
+
+        newer_thread = threading.Thread(target=newer_attachment, daemon=True)
+        newer_thread.start()
+        response = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "claim-stale-gen",
+                "method": "session.claim",
+                "params": {"session_id": target_sid},
+            },
+            client,
+        )
+        newer_thread.join(timeout=5)
+        assert not newer_thread.is_alive()
+
+        # Historical semantics: the stale response is returned unchanged (the
+        # client correlates by id and its newer attachment already won).
+        assert response is not None and "error" not in response
+        assert response["result"]["session_id"] == target_sid
+        assert client.observes_session(newer_sid)
+        assert target_sid in server._sessions
+    finally:
+        release_commit.set()
+        server.unregister_live_transport(client)
+        client.close()
+        server._sessions.pop(target_sid, None)
+        server.reset_session_streams()
+        loop.close()
+
+
 def test_subscribe_losing_to_concurrent_close_returns_rpc_failure() -> None:
     _run_attach_close_race("session.subscribe")
 

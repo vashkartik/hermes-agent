@@ -2611,6 +2611,11 @@ def _record_transport_subscription(
         require_record = method_name in ("session.claim", "session.subscribe")
         read_subscription = getattr(transport, "current_session_subscription", None)
         deferred_cleanup: list[Callable[[], None]] = []
+        # Why the commit failed matters: only a vanished/finalized record turns
+        # the handler's success into an error below. A stale-generation or
+        # closed-socket rejection never invokes claim_owner, so this stays
+        # empty there and the historical response passes through unchanged.
+        record_missing: list[bool] = []
 
         def claim_owner() -> bool:
             # Keep ownership and subscription as one ordered commit. A stale
@@ -2624,9 +2629,12 @@ def _record_transport_subscription(
                     previous_sid = read_subscription()
                 session = _sessions.get(sid)
                 if session is None and require_record:
+                    record_missing.append(True)
                     return False
                 if session is not None:
                     if session.get("_finalized"):
+                        if require_record:
+                            record_missing.append(True)
                         return False
                     # Commit through the durable stream registry. A second live
                     # client joins as a viewer; only a missing/dead owner is
@@ -2650,13 +2658,16 @@ def _record_transport_subscription(
         if not committed:
             if method_name != "prompt.submit":
                 _schedule_rejected_deferred_subscription(sid)
-            if require_record:
+            if record_missing:
                 # The handler built success against a record that vanished
                 # before the ordered commit (a close won the race). Returning
                 # the stale success would tell the client it now owns/watches
                 # a session that no longer exists while its socket stays on
                 # the previous subscription — fail the RPC honestly instead.
                 # The previous attachment was preserved by the failed commit.
+                # Stale-generation / closed-socket rejections keep returning
+                # the historical response: the target is still live and the
+                # client's newer attachment already won.
                 return _err(
                     response.get("id"),
                     4001,
