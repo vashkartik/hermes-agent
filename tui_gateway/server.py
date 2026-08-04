@@ -841,16 +841,31 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     )
 
 
+def _session_has_pending_work(session: dict) -> bool:
+    """True when this session owns work the server must still run or deliver.
+
+    An accepted-but-not-started prompt (``queued_prompt``) lives only in this
+    dict — reaping the session silently drops a message the server already
+    said yes to. That is the "I sent it from my phone and nothing happened
+    until I opened the session again" bug: the client walked away trusting
+    the queue, and the 20-second orphan reaper threw it away.
+    """
+    return bool(session.get("queued_prompt"))
+
+
 def _ws_session_is_orphaned(session: dict | None) -> bool:
     """True if a WS session has no live transport and no in-flight turn.
 
     After ``handle_ws`` detaches a disconnected client it points the session at
     ``_detached_ws_transport``. A session left on that transport (and not
-    mid-turn) is genuinely orphaned and safe to reap.
+    mid-turn, with no accepted-but-unstarted work) is genuinely orphaned and
+    safe to reap.
     """
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
+        return False
+    if _session_has_pending_work(session):
         return False
     return session.get("transport") is _detached_ws_transport
 
@@ -984,6 +999,8 @@ def _transport_is_dead(transport) -> bool:
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     if session.get("running") or _session_pending_kind(sid):
         return False
+    if _session_has_pending_work(session):
+        return False
     ready = session.get("agent_ready")
     # Lazy watch sessions (subagent spectator windows) never start a build,
     # so their forever-unset agent_ready must not make them immortal.
@@ -1034,6 +1051,8 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # awaiting input, or still building), but WITHOUT the hours-scale age gate:
     # a detached session is eligible the moment it loses its client.
     if session.get("running") or _session_pending_kind(sid):
+        return False
+    if _session_has_pending_work(session):
         return False
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set() and not session.get("lazy"):
@@ -1086,8 +1105,65 @@ def _start_idle_reaper() -> None:
     threading.Thread(target=_loop, daemon=True).start()
 
 
+# How often the queue sweeper looks for accepted-but-unstarted prompts. Short:
+# this is the ceiling on how long a queued message can sit after its turn
+# SHOULD have started, when every event-driven drain hook missed it.
+_QUEUE_SWEEP_S = 15.0
+
+
+def _sweep_queued_prompts() -> None:
+    """Start any accepted prompt whose session is idle. Client-independent.
+
+    The normal drain runs at end-of-turn, in whatever thread finished the
+    turn. Two real gaps let an accepted prompt sit forever with no client
+    attached to nudge it:
+
+    * the drain lost its ``_claim_update_turn`` race (updater active) and
+      deliberately left the prompt queued "for retry" — but the only retry
+      triggers were client-driven;
+    * the turn thread died between clearing ``running`` and draining.
+
+    A queued prompt is work the server accepted; it must run whether or not
+    anyone is watching. ``_drain_queued_prompt`` claims under the history
+    lock, so racing a concurrent event-driven drain is harmless — one wins,
+    the other no-ops.
+    """
+    with _sessions_lock:
+        candidates = [
+            (sid, s)
+            for sid, s in _sessions.items()
+            if s.get("queued_prompt") and not s.get("running") and not s.get("_finalized")
+        ]
+    for sid, session in candidates:
+        try:
+            # A prompt can be queued while the agent is still building (the
+            # redirect turn-build window). Drain needs a live agent, so kick
+            # the build and let the next sweep start the turn.
+            if session.get("agent") is None:
+                ready = session.get("agent_ready")
+                if ready is None or not ready.is_set():
+                    _start_agent_build(sid, session)
+                    continue
+            _drain_queued_prompt("queue-sweep", sid, session)
+        except Exception:
+            logger.debug("queued prompt sweep failed sid=%s", sid, exc_info=True)
+
+
+def _start_queue_sweeper() -> None:
+    def _loop():
+        while True:
+            time.sleep(_QUEUE_SWEEP_S)
+            try:
+                _sweep_queued_prompts()
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, daemon=True, name="tui-queue-sweeper").start()
+
+
 atexit.register(_shutdown_sessions)
 _start_idle_reaper()
+_start_queue_sweeper()
 
 
 # ── Plumbing ──────────────────────────────────────────────────────────
@@ -1379,6 +1455,29 @@ def session_is_owned_by(sid: str, transport: Any) -> bool:
     if _transport_is_dead(owner):
         return True
     return not stream.is_explicit(transport)
+
+
+def _coerce_request_id(rid, params: dict) -> tuple[str, dict | None]:
+    """Read the submit's idempotency key from either accepted field name.
+
+    ``request_id`` is the durable-session contract's name; ``client_request_id``
+    is the alias an earlier production hotfix established, kept so clients
+    already sending it stay retry-safe. Returns ``("", None)`` when neither is
+    present (legacy behaviour), or ``("", error_frame)`` on a malformed value —
+    a client asking for idempotency must never silently lose it.
+    """
+    value = params.get("request_id")
+    if value in (None, ""):
+        value = params.get("client_request_id")
+    if value in (None, ""):
+        return "", None
+    if not isinstance(value, str) or value != value.strip() or len(value) > 200:
+        return "", _err(
+            rid, 4004, "request_id must be a non-empty string up to 200 characters"
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return "", _err(rid, 4004, "request_id contains control characters")
+    return value, None
 
 
 def _require_session_owner(rid, sid: str) -> dict | None:
@@ -7804,6 +7903,27 @@ def _(rid, params: dict) -> dict:
     })
 
 
+def _request_status_response(rid, sid: str, request_id: str) -> dict:
+    record = _request_ledger.status(sid, request_id)
+    if record is None:
+        return _ok(rid, {
+            "session_id": sid,
+            "request_id": request_id,
+            "client_request_id": request_id,
+            "status": "unknown",
+            "result": None,
+        })
+    return _ok(rid, {
+        "session_id": sid,
+        "request_id": request_id,
+        "client_request_id": request_id,
+        "status": record["status"],
+        "result": record["result"],
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+    })
+
+
 @method("request.status")
 def _(rid, params: dict) -> dict:
     """Report what happened to a ``prompt.submit`` request id.
@@ -7814,25 +7934,28 @@ def _(rid, params: dict) -> dict:
     this never leaves a reconnected client waiting forever.
     """
     sid = str(params.get("session_id") or "")
-    request_id = str(params.get("request_id") or "")
+    request_id, rid_err = _coerce_request_id(rid, params)
+    if rid_err is not None:
+        return rid_err
     if not sid or not request_id:
         return _err(rid, 4006, "session_id and request_id required")
-    record = _request_ledger.status(sid, request_id)
-    if record is None:
-        return _ok(rid, {
-            "session_id": sid,
-            "request_id": request_id,
-            "status": "unknown",
-            "result": None,
-        })
-    return _ok(rid, {
-        "session_id": sid,
-        "request_id": request_id,
-        "status": record["status"],
-        "result": record["result"],
-        "created_at": record["created_at"],
-        "updated_at": record["updated_at"],
-    })
+    return _request_status_response(rid, sid, request_id)
+
+
+@method("prompt.status")
+def _(rid, params: dict) -> dict:
+    """Alias of ``request.status`` under the earlier production hotfix's name.
+
+    Clients taught to poll ``prompt.status`` with ``client_request_id`` by the
+    hand-applied bridge fix keep working against the ledger unchanged.
+    """
+    sid = str(params.get("session_id") or "")
+    request_id, rid_err = _coerce_request_id(rid, params)
+    if rid_err is not None:
+        return rid_err
+    if not sid or not request_id:
+        return _err(rid, 4006, "session_id and client_request_id required")
+    return _request_status_response(rid, sid, request_id)
 
 
 @method("session.activate")
@@ -10672,8 +10795,12 @@ def _(rid, params: dict) -> dict:
     # The ledger answers "already running / already finished" instead of
     # running the turn a second time, and rejects an id reused for different
     # text. No request_id (legacy clients) keeps the historical behaviour.
-    request_id = params.get("request_id")
-    request_id = str(request_id) if request_id not in (None, "") else ""
+    # ``client_request_id`` is accepted as an alias — it is the field name an
+    # earlier hand-applied production hotfix taught clients to send, and those
+    # clients are already in the field.
+    request_id, rid_err = _coerce_request_id(rid, params)
+    if rid_err is not None:
+        return rid_err
     if request_id:
         outcome = _request_ledger.begin(
             sid, request_id, fingerprint_prompt(text, (truncate_user_ordinal,))
@@ -10688,6 +10815,10 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {
                 "status": "duplicate",
                 "request_id": request_id,
+                # Compat with clients built against the earlier production
+                # hotfix's field names.
+                "client_request_id": request_id,
+                "deduplicated": True,
                 "request_status": record["status"],
                 "result": record["result"],
             })
