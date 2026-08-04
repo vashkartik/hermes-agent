@@ -30,7 +30,6 @@ class FakeWebSocket {
   // errors (a dead remote). Mirrors a VPS going away after the first connect.
   static mode: 'open' | 'fail' = 'open'
   static instances: FakeWebSocket[] = []
-  static rpcFrames: Array<{ id?: string | number; method?: string }> = []
 
   readyState = 0
   private listeners: Record<string, Set<Listener>> = {}
@@ -62,16 +61,6 @@ class FakeWebSocket {
   close() {
     this.readyState = FakeWebSocket.CLOSED
     this.emit('close', {})
-  }
-
-  send(raw: string) {
-    const frame = JSON.parse(raw) as { id?: string | number; method?: string }
-    FakeWebSocket.rpcFrames.push(frame)
-
-    const result = frame.method === 'clarify.pending' ? { requests: [] } : {}
-    this.emit('message', {
-      data: JSON.stringify({ jsonrpc: '2.0', id: frame.id, result })
-    })
   }
 
   // Force-drop an open socket, as a sleeping laptop / restarted remote would.
@@ -157,7 +146,6 @@ beforeEach(() => {
   vi.useFakeTimers()
   FakeWebSocket.mode = 'open'
   FakeWebSocket.instances = []
-  FakeWebSocket.rpcFrames = []
   connectionApplied = null
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
@@ -197,9 +185,7 @@ afterEach(() => {
 // Let pending microtasks (awaits) AND the queued 0ms socket open/error fire.
 async function flushAsync() {
   await act(async () => {
-    for (let index = 0; index < 3; index += 1) {
-      await vi.advanceTimersByTimeAsync(0)
-    }
+    await vi.advanceTimersByTimeAsync(0)
   })
 }
 
@@ -209,7 +195,6 @@ async function flushAsync() {
 async function advanceBackoff() {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(15_000)
-    await vi.advanceTimersByTimeAsync(0)
   })
 }
 
@@ -330,20 +315,6 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     expect($desktopBoot.get().error).toBeNull()
-  })
-
-  it('replays pending clarify requests after initial connection and reconnect', async () => {
-    render(<Harness />)
-    await flushAsync()
-
-    expect(FakeWebSocket.rpcFrames.filter(frame => frame.method === 'clarify.pending')).toHaveLength(1)
-
-    act(() => FakeWebSocket.instances[0].drop())
-    await flushAsync()
-    await advanceBackoff()
-
-    expect($gatewayState.get()).toBe('open')
-    expect(FakeWebSocket.rpcFrames.filter(frame => frame.method === 'clarify.pending')).toHaveLength(2)
   })
 
   it('FIX: a failed session-list fetch during boot is non-fatal — the app still boots', async () => {

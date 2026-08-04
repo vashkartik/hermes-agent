@@ -1,6 +1,7 @@
 import { atom, computed } from 'nanostores'
 
-import { $activeSessionId } from './active-session'
+import { $gateway } from './gateway'
+import { $activeSessionId } from './session'
 
 export interface ClarifyRequest {
   requestId: string
@@ -61,79 +62,8 @@ export const $clarifyRequest = computed(
 export const sessionClarifyRequest = (sessionId: string | null) =>
   computed($clarifyRequests, requests => requests[keyFor(sessionId)] ?? null)
 
-function sameClarifyRequest(left: ClarifyRequest, right: ClarifyRequest): boolean {
-  if (
-    left.requestId !== right.requestId ||
-    left.question !== right.question ||
-    left.sessionId !== right.sessionId
-  ) {
-    return false
-  }
-
-  if (left.choices === null || right.choices === null) {
-    return left.choices === right.choices
-  }
-
-  return (
-    left.choices.length === right.choices.length &&
-    left.choices.every((choice, index) => choice === right.choices?.[index])
-  )
-}
-
 export function setClarifyRequest(request: ClarifyRequest): void {
-  const requests = $clarifyRequests.get()
-  const key = keyFor(request.sessionId)
-  const current = requests[key]
-
-  if (current && sameClarifyRequest(current, request)) {
-    return
-  }
-
-  $clarifyRequests.set({ ...requests, [key]: request })
-}
-
-interface ClarifyGateway {
-  request<T>(method: string, params?: Record<string, unknown>): Promise<T>
-}
-
-interface PendingClarifyResponse {
-  requests?: Array<{
-    request_id?: unknown
-    session_id?: unknown
-    question?: unknown
-    choices?: unknown
-  } | null>
-}
-
-export async function syncPendingClarifyRequests(gateway: ClarifyGateway): Promise<void> {
-  const result = await gateway.request<PendingClarifyResponse>('clarify.pending', {})
-  const rows = Array.isArray(result?.requests) ? result.requests : []
-
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') {
-      continue
-    }
-
-    const requestId = typeof row.request_id === 'string' ? row.request_id.trim() : ''
-    const sessionId = typeof row.session_id === 'string' ? row.session_id : null
-    const question = typeof row.question === 'string' ? row.question : ''
-
-    if (!requestId || sessionId === null || !question.trim()) {
-      continue
-    }
-
-    let choices: string[] | null = null
-
-    if (row.choices !== null && row.choices !== undefined) {
-      if (!Array.isArray(row.choices) || !row.choices.every(choice => typeof choice === 'string')) {
-        continue
-      }
-
-      choices = [...row.choices]
-    }
-
-    setClarifyRequest({ requestId, sessionId, question, choices })
-  }
+  $clarifyRequests.set({ ...$clarifyRequests.get(), [keyFor(request.sessionId)]: request })
 }
 
 export function clearClarifyRequest(requestId?: string, sessionId?: string | null): void {
@@ -172,4 +102,43 @@ export function clearClarifyRequest(requestId?: string, sessionId?: string | nul
   if (changed) {
     $clarifyRequests.set(next)
   }
+}
+
+/** Whether `sessionId` has a clarify parked on it right now (imperative read —
+ *  the composer checks this on Enter, not on every render). */
+export const hasClarifyRequest = (sessionId: string | null | undefined): boolean =>
+  Boolean($clarifyRequests.get()[keyFor(sessionId)])
+
+/**
+ * Answer `sessionId`'s pending clarify with an empty answer (a skip) and drop it
+ * locally, resolving to whether there was one to skip.
+ *
+ * The composer uses this when the user types a real message instead of picking
+ * an option: a clarify blocks the agent inside its tool batch, so leaving it
+ * unanswered would park the follow-up until the server-side clarify timeout
+ * (default 5 min) — the message looks sent and nothing happens. Skipping lets
+ * the tool return and the turn carry on with the user's actual words.
+ *
+ * An empty answer is the same thing the card's own Skip button sends, and
+ * `clarify.respond` is `allow_expired`, so racing the timeout is harmless.
+ */
+export async function skipClarifyRequest(sessionId: string | null | undefined): Promise<boolean> {
+  const request = $clarifyRequests.get()[keyFor(sessionId)]
+
+  if (!request) {
+    return false
+  }
+
+  // Clear first: the answer is already decided, and an in-flight RPC must not
+  // leave a live card the user can answer a second time.
+  clearClarifyRequest(request.requestId, request.sessionId)
+
+  try {
+    await $gateway.get()?.request('clarify.respond', { request_id: request.requestId, answer: '' })
+  } catch {
+    // The tool times out on its own; a failed skip must never swallow the
+    // message the user is actually sending.
+  }
+
+  return true
 }

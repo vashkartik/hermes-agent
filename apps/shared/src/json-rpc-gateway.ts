@@ -54,6 +54,8 @@ export interface GatewayClientOptions {
   connectErrorMessage?: string
   connectTimeoutMs?: number
   createRequestId?: (nextId: number) => GatewayRequestId
+  /** Return true to intercept the default closed-state transition. */
+  onSocketClose?: (event: CloseEvent) => boolean | void
   // App-level liveness heartbeat. iOS suspends a backgrounded PWA's WebSocket
   // without firing 'close', leaving a zombie socket that still reads
   // readyState===OPEN. Periodically pinging `heartbeatMethod` and dropping the
@@ -96,6 +98,7 @@ export class JsonRpcGatewayClient {
       heartbeatMethod: options.heartbeatMethod ?? 'gateway.ping',
       heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? 8_000,
       notConnectedErrorMessage: options.notConnectedErrorMessage ?? 'gateway not connected',
+      onSocketClose: options.onSocketClose ?? (() => false),
       requestIdPrefix: options.requestIdPrefix ?? 'r',
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       socketFactory: options.socketFactory
@@ -148,8 +151,12 @@ export class JsonRpcGatewayClient {
       this.handleMessage(message.data)
     })
 
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', event => {
       if (this.socket !== socket) {
+        return
+      }
+
+      if (this.options.onSocketClose(event)) {
         return
       }
 

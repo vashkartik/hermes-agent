@@ -180,7 +180,7 @@ def test_queued_prompt_handoff_keeps_same_update_lease(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, _session, text: dispatched.append((rid, sid, text)),
+        lambda rid, sid, _session, text, **_kw: dispatched.append((rid, sid, text)),
     )
     try:
         assert server._drain_queued_prompt("r1", "sid", session) is True

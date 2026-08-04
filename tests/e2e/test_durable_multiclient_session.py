@@ -84,6 +84,17 @@ def _run_disposable_backend() -> None:
                 ]
             )
             self._session_messages = history
+            # The real AIAgent persists rows to state.db as it produces them;
+            # the gateway no longer rewrites the transcript at turn end. Mimic
+            # that contract so session.history serves this turn after the fact.
+            try:
+                from tui_gateway import server as _srv
+
+                db = _srv._get_db()
+                if db is not None:
+                    db.replace_messages(self.session_id, history)
+            except Exception:
+                pass
             return {"final_response": final, "messages": history}
 
     class FakeSlashWorker:

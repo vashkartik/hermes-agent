@@ -1,9 +1,6 @@
-import { useStore } from '@nanostores/react'
 import { type CSSProperties, useState } from 'react'
 
-import { resolveProfileColor } from '@/lib/profile-color'
 import { capitalize, normalize } from '@/lib/text'
-import { $activeGatewayProfile, $profileColors, $profiles, normalizeProfileKey } from '@/store/profile'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
 
@@ -147,49 +144,7 @@ function pickCopy(copies: IntroCopy[], seed = 0): IntroCopy {
   return copies[Math.abs(seed) % copies.length] || FALLBACK_COPY[0]
 }
 
-// Per-profile identity emoji for the hero wordmark (Capella fork). Profiles have
-// no emoji field in the data model, so known operator lanes are mapped here.
-const HERO_EMOJI_BY_KEY: Record<string, string> = {
-  rook: '♜',
-  king: '♚',
-}
-
-// The hero wordmark reflects the profile the chat is scoped to: a named profile
-// shows its own name (with its identity emoji when known, tinted with its rail
-// color), while the default/root profile keeps the neutral "Hermes Agent".
-// Capella embed identity override (capella/patches): King is spawned as an
-// identity home that reports backend profile 'default', so the native key alone
-// falls through to neutral "Hermes Agent". The host passes ?capellaProfile so the
-// King hero renders natively in-app — no host-side DOM scrape, persists across
-// updates by construction.
-function readCapellaEmbedProfile(): string | null {
-  try {
-    return new URLSearchParams(window.location.search).get('capellaProfile')
-  } catch {
-    return null
-  }
-}
-
-function useHero(): { color: null | string; wordmark: string } {
-  const gatewayProfile = useStore($activeGatewayProfile)
-  const profiles = useStore($profiles)
-  const colors = useStore($profileColors)
-  const override = readCapellaEmbedProfile()
-  const key = normalizeProfileKey(override ?? gatewayProfile)
-
-  if (key === 'default') {
-    return { color: null, wordmark: 'Hermes Agent' }
-  }
-
-  const overrideName = override ? override.replace(/\b\w/g, c => c.toUpperCase()) : null
-  const name =
-    overrideName ??
-    profiles.find(profile => normalizeProfileKey(profile.name) === key)?.name ??
-    gatewayProfile
-  const emoji = HERO_EMOJI_BY_KEY[key]
-
-  return { color: resolveProfileColor(name, colors), wordmark: emoji ? `${emoji} ${name}` : name }
-}
+const WORDMARK = 'HERMES AGENT'
 
 function resolveCopy(personality?: string, seed?: number): IntroCopy {
   const personalityKey = normalizeKey(personality)
@@ -204,7 +159,6 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 export function Intro({ personality, seed }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
   const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
-  const hero = useHero()
 
   return (
     <div
@@ -213,19 +167,14 @@ export function Intro({ personality, seed }: IntroProps) {
     >
       <div className="w-full min-w-0">
         <p
-          aria-label={hero.wordmark}
+          aria-label={WORDMARK}
           className="fit-text mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
-          style={
-            {
-              '--fit-min': '2.75rem',
-              ...(hero.color ? { color: hero.color } : {})
-            } as CSSProperties
-          }
+          style={{ '--fit-min': '2.75rem' } as CSSProperties}
         >
           <span>
-            <span>{hero.wordmark}</span>
+            <span>{WORDMARK}</span>
           </span>
-          <span aria-hidden="true">{hero.wordmark}</span>
+          <span aria-hidden="true">{WORDMARK}</span>
         </p>
 
         <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>

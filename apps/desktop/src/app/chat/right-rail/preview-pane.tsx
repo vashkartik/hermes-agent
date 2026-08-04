@@ -12,6 +12,7 @@ import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $previewServerRestart, failPreviewServerRestart, type PreviewTarget } from '@/store/preview'
 
+import { ArtifactPreview } from './preview-artifact'
 import {
   clampConsoleHeight,
   compactUrl,
@@ -48,33 +49,6 @@ interface PreviewLoadErrorState {
 
 const FILE_RELOAD_DEBOUNCE_MS = 200
 const SERVER_RESTART_TIMEOUT_MS = 45_000
-const EMBEDDED_FRAME_SANDBOX = ['allow-downloads', 'allow-forms', 'allow-modals', 'allow-popups', 'allow-scripts']
-
-export function isAceEmbeddedRenderer(
-  search = typeof window === 'undefined' ? '' : window.location?.search || ''
-): boolean {
-  const params = new URLSearchParams(search)
-
-  return params.has('aceProfile') || params.has('capellaProfile')
-}
-
-export function embeddedPreviewFrameSandbox(url: string): string {
-  try {
-    const protocol = new URL(url).protocol
-
-    // HTTP content is cross-origin from Hermes's file:// renderer, so retaining
-    // its origin preserves modules, storage, and dev servers without exposing
-    // the host. Local file previews intentionally remain opaque: otherwise an
-    // arbitrary HTML attachment could reach the Hermes renderer and bridge.
-    if (protocol === 'http:' || protocol === 'https:') {
-      return [...EMBEDDED_FRAME_SANDBOX, 'allow-same-origin'].join(' ')
-    }
-  } catch {
-    // Invalid targets stay on the most restrictive preview sandbox.
-  }
-
-  return EMBEDDED_FRAME_SANDBOX.join(' ')
-}
 
 function loadErrorTitle(error: PreviewLoadErrorState, copy: Translations['preview']['web']): string {
   const description = error.description.toLowerCase()
@@ -173,8 +147,13 @@ export function PreviewPane({
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
-  const isWebPreview = target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source')
-  const useEmbeddedFrame = isAceEmbeddedRenderer()
+
+  // Artifacts have no URL to load — they render from the registry, never in a
+  // webview.
+  const isWebPreview =
+    target.kind !== 'artifact' &&
+    (target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source'))
+
   const currentLabel = compactUrl(currentUrl)
 
   const previewLabel =
@@ -331,17 +310,13 @@ export function PreviewPane({
               label: consoleOpen ? copy.hideConsole : copy.showConsole,
               onSelect: () => consoleState.setOpen(open => !open)
             },
-            ...(!useEmbeddedFrame
-              ? [
-                  {
-                    active: devtoolsOpen,
-                    icon: <Bug />,
-                    id: `${TITLEBAR_GROUP_ID}-devtools`,
-                    label: devtoolsOpen ? copy.hideDevTools : copy.openDevTools,
-                    onSelect: toggleDevTools
-                  }
-                ]
-              : [])
+            {
+              active: devtoolsOpen,
+              icon: <Bug />,
+              id: `${TITLEBAR_GROUP_ID}-devtools`,
+              label: devtoolsOpen ? copy.hideDevTools : copy.openDevTools,
+              onSelect: toggleDevTools
+            }
           ]
         : [])
     ]
@@ -349,17 +324,9 @@ export function PreviewPane({
     setTitlebarToolGroup(TITLEBAR_GROUP_ID, tools)
 
     return () => setTitlebarToolGroup(TITLEBAR_GROUP_ID, [])
-  }, [
-    consoleOpen,
-    consoleState,
-    copy,
-    devtoolsOpen,
-    isWebPreview,
-    setTitlebarToolGroup,
-    toggleDevTools,
-    useEmbeddedFrame
-  ])
+  }, [consoleOpen, consoleState, copy, devtoolsOpen, isWebPreview, setTitlebarToolGroup, toggleDevTools])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (!consoleOpen) {
       return
@@ -375,6 +342,7 @@ export function PreviewPane({
     return () => window.cancelAnimationFrame(handle)
   }, [consoleOpen])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (
       !previewServerRestart ||
@@ -433,6 +401,7 @@ export function PreviewPane({
     return () => window.clearTimeout(timer)
   }, [copy.stillWorking, previewServerRestart, restartingServer])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (reloadRequest === lastReloadRequestRef.current) {
       return
@@ -539,6 +508,7 @@ export function PreviewPane({
     }
   }, [appendConsoleEntry, copy, reloadPreview, target.kind, target.url])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     const host = hostRef.current
 
@@ -558,41 +528,6 @@ export function PreviewPane({
       setLoading(false)
 
       return
-    }
-
-    if (useEmbeddedFrame) {
-      const frame = document.createElement('iframe') as HTMLIFrameElement & PreviewWebview
-      const reload = () => {
-        setLoading(true)
-        frame.src = target.url
-      }
-      const onLoad = () => {
-        setCurrentUrl(target.url)
-        setLoading(false)
-      }
-      const onError = () => {
-        setLoadError({ description: copy.unreachableDescription, url: target.url })
-        setLoading(false)
-      }
-
-      frame.className = 'flex h-full w-full flex-1 border-0 bg-transparent'
-      frame.referrerPolicy = 'no-referrer'
-      frame.setAttribute('sandbox', embeddedPreviewFrameSandbox(target.url))
-      frame.setAttribute('title', target.label || copy.fallbackTitle)
-      frame.getURL = () => frame.src
-      frame.reload = reload
-      frame.reloadIgnoringCache = reload
-      frame.addEventListener('load', onLoad)
-      frame.addEventListener('error', onError)
-      frame.src = target.url
-      host.appendChild(frame)
-      webviewRef.current = frame
-
-      return () => {
-        frame.removeEventListener('load', onLoad)
-        frame.removeEventListener('error', onError)
-        frame.remove()
-      }
     }
 
     const webview = document.createElement('webview') as PreviewWebview
@@ -682,7 +617,7 @@ export function PreviewPane({
       webview.removeEventListener('did-stop-loading', onStop)
       webview.remove()
     }
-  }, [appendConsoleEntry, consoleState, copy, isWebPreview, target.label, target.url, useEmbeddedFrame])
+  }, [appendConsoleEntry, consoleState, copy, isWebPreview, target.url])
 
   return (
     <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground">
@@ -715,7 +650,12 @@ export function PreviewPane({
             )}
             ref={hostRef}
           />
-          {!isWebPreview && <LocalFilePreview reloadKey={localReloadKey} target={target} />}
+          {!isWebPreview &&
+            (target.kind === 'artifact' ? (
+              <ArtifactPreview target={target} />
+            ) : (
+              <LocalFilePreview reloadKey={localReloadKey} target={target} />
+            ))}
           {loadError && (
             <PreviewLoadError
               consoleHeight={consoleOpen ? consoleHeight : 0}
