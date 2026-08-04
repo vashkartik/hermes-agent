@@ -1674,6 +1674,140 @@ def test_forced_claim_during_heir_promotion_cannot_split_owner_and_mirror(
         loop.close()
 
 
+def test_disconnect_promotion_skips_dead_viewer_and_crowns_live_one() -> None:
+    """A dead longest-attached viewer must never be crowned on disconnect.
+
+    Pre-fix the disconnect path promoted by attach order alone: the dead
+    viewer won the registry, its installation was rejected, and the live
+    successor got only the legacy slot — leaving a dead (then absent) registry
+    owner, which makes ``session_is_owned_by`` grant every viewer mutation.
+    """
+    sid = "dead-viewer-promotion"
+    owner = RecordingTransport()
+    owner._closed = True  # the disconnecting owner
+    dead_viewer = RecordingTransport()
+    live_viewer = RecordingTransport()
+    session = _live_session_dict("stored-dead-viewer-promotion", owner)
+    server._sessions[sid] = session
+    try:
+        assert server.subscribe_session(sid, owner, owner=True, explicit=True)
+        server.subscribe_session(sid, dead_viewer, explicit=True)
+        time.sleep(0.01)  # attach order: dead first, live later
+        server.subscribe_session(sid, live_viewer, explicit=True)
+        live_viewer.subscribe_session(sid)
+        dead_viewer._closed = True
+
+        server._close_sessions_for_transport(owner)
+
+        assert server.session_owner(sid) is live_viewer
+        assert session["transport"] is live_viewer
+        assert server.session_owner(sid) is session["transport"]
+    finally:
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
+
+
+def test_owner_changed_after_racing_claim_names_the_claimant(monkeypatch) -> None:
+    """A stale promotion announcement can never publish stale ownership.
+
+    The release's deferred ``session.owner_changed`` resolves the owner at
+    delivery time, inside the stream's delivery serialization — so when a
+    forced claim lands between the promotion and the announcement, peers hear
+    about the claimant, and the promoted-then-displaced heir is never the
+    final word.
+    """
+    loop = asyncio.new_event_loop()
+    leaver = _RecordingWS(object(), loop, peer="announce-race-leaver")
+    viewer = RecordingTransport()
+    viewer._peer = "announce-race-viewer"
+    claimer = RecordingTransport()
+    claimer._peer = "announce-race-claimer"
+    sid_a = "announce-race-a"
+    sid_b = "announce-race-b"
+    release_deferred_reached = threading.Event()
+    claim_finished = threading.Event()
+    server._sessions[sid_a] = _live_session_dict("stored-announce-a", leaver)
+    server._sessions[sid_b] = _live_session_dict("stored-announce-b", RecordingTransport())
+    server.register_live_transport(leaver)
+    real_release = server._release_stale_session_attachment
+    try:
+        generation = leaver.begin_session_subscription()
+        assert leaver.complete_session_subscription(generation, sid_a)
+        assert server.subscribe_session(sid_a, leaver, owner=True, explicit=True)
+        server.subscribe_session(sid_a, viewer, explicit=True)
+        viewer.subscribe_session(sid_a)
+
+        def wrapped_release(previous_sid, transport, **kwargs):
+            was_owner, deferred = real_release(previous_sid, transport, **kwargs)
+            if deferred is None or previous_sid != sid_a:
+                return was_owner, deferred
+
+            def paused_deferred() -> None:
+                # The promotion (heir crowned + mirrored) has committed; the
+                # announcement has not run yet. Let the forced claim land in
+                # exactly this window.
+                release_deferred_reached.set()
+                assert claim_finished.wait(timeout=3)
+                deferred()
+
+            return was_owner, paused_deferred
+
+        monkeypatch.setattr(
+            server, "_release_stale_session_attachment", wrapped_release
+        )
+
+        def racing_claim() -> None:
+            assert release_deferred_reached.wait(timeout=3)
+            response = server.dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "claim-during-announce",
+                    "method": "session.claim",
+                    "params": {"session_id": sid_a},
+                },
+                claimer,
+            )
+            assert response is not None and response["result"]["owner"] is True
+            claim_finished.set()
+
+        claim_thread = threading.Thread(target=racing_claim)
+        claim_thread.start()
+        activate = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "activate-announce-b",
+                "method": "session.activate",
+                "params": {"session_id": sid_b},
+            },
+            leaver,
+        )
+        assert activate is not None and "error" not in activate
+        claim_thread.join(timeout=3)
+        assert not claim_thread.is_alive()
+
+        owner_changes = [
+            (frame.get("params") or {})
+            for frame in viewer.frames
+            if (frame.get("params") or {}).get("type") == "session.owner_changed"
+        ]
+        assert owner_changes, "expected owner_changed announcements"
+        assert owner_changes[-1].get("payload", {}).get("client") == "announce-race-claimer"
+        assert not any(
+            change.get("payload", {}).get("client") == "announce-race-viewer"
+            for change in owner_changes
+        )
+        assert server.session_owner(sid_a) is claimer
+        assert server._sessions[sid_a]["transport"] is claimer
+    finally:
+        claim_finished.set()
+        server.unregister_live_transport(leaver)
+        leaver.close()
+        server._sessions.pop(sid_a, None)
+        server._sessions.pop(sid_b, None)
+        server.reset_session_streams()
+        loop.close()
+
+
 def test_orphan_reap_rearms_while_parked_session_is_running(monkeypatch) -> None:
     """A parked record protected by in-flight work keeps its reap timer.
 

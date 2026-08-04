@@ -1164,9 +1164,16 @@ def _close_sessions_for_transport(
         # unattended half of the handoff story (desktop sleeps, phone keeps the
         # turn) and it settles immediately, inside this teardown.
         heir = None
+        stream = None
         try:
             stream = _session_streams.get(sid)
-            heir = stream.promote_next_owner() if stream is not None else None
+            # Dead sockets are never crowned: a dead registry owner makes
+            # session_is_owned_by grant every viewer mutation at once.
+            heir = (
+                stream.promote_next_owner(is_dead=_transport_is_dead)
+                if stream is not None
+                else None
+            )
         except Exception:
             logger.debug("session stream owner promotion failed sid=%s", sid, exc_info=True)
         if heir is not None and not _transport_is_dead(heir):
@@ -1191,14 +1198,19 @@ def _close_sessions_for_transport(
                 session["transport"] = heir
                 installed = True
             if installed:
-                _emit(
-                    "session.owner_changed",
-                    sid,
-                    {"reason": end_reason, "client": _stream_client_label(heir)},
-                )
+                _announce_session_owner(sid, end_reason, fallback=heir)
                 continue
-            # The promoted heir vanished mid-install (its own disconnect or a
-            # session switch); fall through to the successor scan / park policy.
+            # The promoted heir vanished mid-install (its own disconnect, a
+            # session switch, or a newer claim moved the slot). Never leave
+            # the registry crowning a transport the slot rejected; a racing
+            # claim that crowned itself is untouched.
+            try:
+                if stream is not None:
+                    stream.demote_owner(heir)
+            except Exception:
+                logger.debug(
+                    "failed-install owner demotion failed sid=%s", sid, exc_info=True
+                )
         if session.get("close_on_disconnect"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
@@ -1218,12 +1230,18 @@ def _close_sessions_for_transport(
                         # or disconnect lands wholly before or after this claim.
                         with _sessions_lock:
                             if (
-                                _sessions.get(sid) is session
-                                and session.get("transport") is transport
+                                _sessions.get(sid) is not session
+                                or session.get("transport") is not transport
                             ):
-                                session["transport"] = candidate
-                                return True
-                        return False
+                                return False
+                            # Registry + legacy slot commit as one step
+                            # (attach mirrors under the stream lock), so the
+                            # promoted successor is the stream owner too —
+                            # not a slot-only owner beside an ownerless or
+                            # stale registry.
+                            return bool(
+                                subscribe_session(sid, candidate, owner=True)
+                            )
 
                     if claim(sid, assign_successor):
                         successor = candidate
@@ -1868,6 +1886,42 @@ def unsubscribe_session(sid: str, transport: Any) -> bool:
     return stream.detach(transport)
 
 
+def _announce_session_owner(sid: str, reason: str, *, fallback: Any = None) -> None:
+    """Publish ``session.owner_changed`` naming the owner AT DELIVERY TIME.
+
+    Ownership transitions from different paths (promotion on switch/disconnect,
+    forced ``session.claim``) can announce concurrently; capturing the owner in
+    the caller lets a stale transition publish after a newer one and leave
+    peers believing the wrong final owner. Resolving the owner inside the
+    stream's delivery serialization makes the later-delivered announcement
+    always reflect the newer state. ``fallback`` covers the no-stream /
+    no-subscriber case, where the historical single-transport emit applies and
+    no rival transition can race it.
+    """
+
+    def build_frame(owner: Any) -> dict | None:
+        current = owner if owner is not None else fallback
+        if current is None:
+            return None
+        return _event_frame(
+            "session.owner_changed",
+            sid,
+            {"reason": reason, "client": _stream_client_label(current)},
+        )
+
+    stream = _session_streams.get(sid)
+    if stream is not None:
+        delivered = stream.deliver_resolved(build_frame)
+        if delivered is not None:
+            return
+    if fallback is not None:
+        _emit(
+            "session.owner_changed",
+            sid,
+            {"reason": reason, "client": _stream_client_label(fallback)},
+        )
+
+
 def session_owner(sid: str) -> Any:
     stream = _session_streams.get(sid)
     return stream.owner() if stream is not None else None
@@ -2460,14 +2514,9 @@ def _release_stale_session_attachment(
         heir = promoted[0]
 
         def _announce() -> None:
-            # Advisory: a forced claim that landed right after the promotion
-            # announced its own owner_changed; skip the stale one.
-            if session.get("transport") is heir:
-                _emit(
-                    "session.owner_changed",
-                    previous_sid,
-                    {"reason": reason, "client": _stream_client_label(heir)},
-                )
+            # Resolved at delivery time: a forced claim that landed right
+            # after the promotion is what peers hear about, not the stale heir.
+            _announce_session_owner(previous_sid, reason, fallback=heir)
 
         return was_owner, _announce
     if session.get("transport") is transport:
@@ -8992,8 +9041,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4005, "session.claim requires a client transport")
     owner = subscribe_session(sid, transport, owner=True, force=True, explicit=True)
     if owner:
-        _emit("session.owner_changed", sid,
-              {"reason": "claimed", "client": _stream_client_label(transport)})
+        _announce_session_owner(sid, "claimed", fallback=transport)
     stream = _session_streams.get(sid)
     return _ok(rid, {
         "session_id": sid,
