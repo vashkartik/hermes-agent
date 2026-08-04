@@ -693,10 +693,7 @@ def test_failed_delivery_does_not_deadlock_ordered_session_attach(
     sid = "failed-delivery-ordered-attach"
     write_scheduling = threading.Event()
     attach_attempted = threading.Event()
-    attach_finished = threading.Event()
-    attach_stalled = threading.Event()
     completion_finished = threading.Event()
-    attach_threads: list[threading.Thread] = []
 
     loop = asyncio.new_event_loop()
     transport = ws_mod.WSTransport(object(), loop, peer="delivery-attach-deadlock")
@@ -709,21 +706,13 @@ def test_failed_delivery_does_not_deadlock_ordered_session_attach(
     assert stream is not None
     real_subscribe_session = server.subscribe_session
 
-    def bounded_subscribe_session(*args, **kwargs):
-        result: list[bool] = []
-
-        def attach() -> None:
-            result.append(real_subscribe_session(*args, **kwargs))
-            attach_finished.set()
-
+    def marking_subscribe_session(*args, **kwargs):
+        # Runs on the commit thread itself: ownership mutation shares the
+        # lifecycle lock with the conditional close, so it must stay reentrant
+        # on the calling thread. The daemon threads + bounded joins below turn
+        # a regression back into a visible test failure instead of a hang.
         attach_attempted.set()
-        thread = threading.Thread(target=attach)
-        attach_threads.append(thread)
-        thread.start()
-        if not attach_finished.wait(timeout=2):
-            attach_stalled.set()
-            return False
-        return result[0]
+        return real_subscribe_session(*args, **kwargs)
 
     def fail_schedule(coro, _loop):
         coro.close()
@@ -731,13 +720,14 @@ def test_failed_delivery_does_not_deadlock_ordered_session_attach(
         assert attach_attempted.wait(timeout=3)
         return None
 
-    monkeypatch.setattr(server, "subscribe_session", bounded_subscribe_session)
+    monkeypatch.setattr(server, "subscribe_session", marking_subscribe_session)
     monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", fail_schedule)
 
     deliver_thread = threading.Thread(
         target=lambda: stream.deliver(
             server._event_frame("message.start", sid, {})
-        )
+        ),
+        daemon=True,
     )
 
     def complete_subscription() -> None:
@@ -750,27 +740,22 @@ def test_failed_delivery_does_not_deadlock_ordered_session_attach(
         )
         completion_finished.set()
 
-    complete_thread = threading.Thread(target=complete_subscription)
+    complete_thread = threading.Thread(target=complete_subscription, daemon=True)
     try:
         deliver_thread.start()
         assert write_scheduling.wait(timeout=3)
         complete_thread.start()
         complete_thread.join(timeout=3)
         deliver_thread.join(timeout=3)
-        for thread in attach_threads:
-            thread.join(timeout=3)
 
         assert completion_finished.is_set()
         assert not complete_thread.is_alive()
         assert not deliver_thread.is_alive()
-        assert all(not thread.is_alive() for thread in attach_threads)
-        assert not attach_stalled.is_set()
+        assert attach_attempted.is_set()
     finally:
         if complete_thread.ident is not None:
             complete_thread.join(timeout=3)
         deliver_thread.join(timeout=3)
-        for thread in attach_threads:
-            thread.join(timeout=3)
         transport.close()
         server._sessions.pop(sid, None)
         server.reset_session_streams()
@@ -1904,6 +1889,74 @@ def test_close_on_disconnect_predicate_preserves_last_instant_claim(
         assert server.session_owner(sid) is claimer
         assert session["transport"] is claimer
     finally:
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
+
+
+def test_conditional_close_excludes_claims_from_its_critical_section(
+    monkeypatch,
+) -> None:
+    """A claim cannot land between the close predicate and the pop.
+
+    Ownership mutation shares the lifecycle lock with the conditional close,
+    so a last-instant claim either commits wholly before the critical section
+    (the predicate then preserves the session) or blocks until the close has
+    completed — the window the predicate observed can never be invalidated
+    under it.
+    """
+    sid = "close-critical-section"
+    old_owner = RecordingTransport()
+    old_owner._closed = True
+    claimer = RecordingTransport()
+    session = _live_session_dict("stored-close-critical", old_owner)
+    session["close_on_disconnect"] = True
+    server._sessions[sid] = session
+    reached_pop = threading.Event()
+    release_pop = threading.Event()
+    claim_done = threading.Event()
+    claim_blocked_during_close: list[bool] = []
+    real_pop = server._pop_session_by_id
+
+    def paused_pop(pop_sid):
+        if pop_sid == sid and not release_pop.is_set():
+            # Between predicate observation and the pop, still under the
+            # lifecycle lock.
+            reached_pop.set()
+            assert release_pop.wait(timeout=5)
+        return real_pop(pop_sid)
+
+    monkeypatch.setattr(server, "_pop_session_by_id", paused_pop)
+    try:
+        assert server.subscribe_session(sid, old_owner, owner=True, explicit=True)
+
+        def racing_claim() -> None:
+            assert reached_pop.wait(timeout=5)
+            server.subscribe_session(
+                sid, claimer, owner=True, force=True, explicit=True
+            )
+            claim_done.set()
+
+        def watcher() -> None:
+            assert reached_pop.wait(timeout=5)
+            claim_thread.start()
+            time.sleep(0.3)
+            claim_blocked_during_close.append(not claim_done.is_set())
+            release_pop.set()
+
+        claim_thread = threading.Thread(target=racing_claim, daemon=True)
+        watcher_thread = threading.Thread(target=watcher, daemon=True)
+        watcher_thread.start()
+
+        server._close_sessions_for_transport(old_owner)
+
+        watcher_thread.join(timeout=5)
+        claim_thread.join(timeout=5)
+        assert not watcher_thread.is_alive()
+        assert not claim_thread.is_alive()
+        assert claim_blocked_during_close == [True]
+        assert sid not in server._sessions
+    finally:
+        release_pop.set()
         server._sessions.pop(sid, None)
         server.reset_session_streams()
 

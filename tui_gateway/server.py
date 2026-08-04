@@ -1877,30 +1877,38 @@ def subscribe_session(
     """
     if not sid or transport is None:
         return False
-    session = _sessions.get(sid)
-    stream = _session_streams.ensure(
-        sid,
-        session_key=str((session or {}).get("session_key") or ""),
-        profile_key=str((session or {}).get("profile_home") or ""),
-    )
-    # The legacy-slot mirror commits inside the stream's ownership lock: two
-    # racing claims otherwise interleave so the registry crowns one owner while
-    # ``session["transport"]`` keeps the other, and disconnect cleanup (which
-    # selects by the legacy slot) then misses the real owner.
-    mirror = None
-    if session is not None:
-        def mirror() -> None:
-            session["transport"] = transport
+    # One lifecycle serialization domain: ownership mutation shares
+    # ``_sessions_lock`` with the conditional-close predicate+pop
+    # (``_close_session_by_id``) and the release path, so a claim can never
+    # interleave inside their critical sections — a last-instant claim either
+    # lands wholly before (the predicate sees it and preserves the session) or
+    # wholly after (the record is already gone). ``_sessions_lock`` is an
+    # RLock; in-lock callers (ordered commits, prompt claims) nest safely.
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        stream = _session_streams.ensure(
+            sid,
+            session_key=str((session or {}).get("session_key") or ""),
+            profile_key=str((session or {}).get("profile_home") or ""),
+        )
+        # The legacy-slot mirror commits inside the stream's ownership lock:
+        # two racing claims otherwise interleave so the registry crowns one
+        # owner while ``session["transport"]`` keeps the other, and disconnect
+        # cleanup (which selects by the legacy slot) then misses the real owner.
+        mirror = None
+        if session is not None:
+            def mirror() -> None:
+                session["transport"] = transport
 
-    return stream.attach(
-        transport,
-        owner=owner,
-        force=force,
-        explicit=explicit,
-        client=_stream_client_label(transport),
-        is_dead=_transport_is_dead,
-        on_owner=mirror,
-    )
+        return stream.attach(
+            transport,
+            owner=owner,
+            force=force,
+            explicit=explicit,
+            client=_stream_client_label(transport),
+            is_dead=_transport_is_dead,
+            on_owner=mirror,
+        )
 
 
 def unsubscribe_session(sid: str, transport: Any) -> bool:
