@@ -1895,6 +1895,106 @@ def test_close_on_disconnect_predicate_preserves_last_instant_claim(
         server.reset_session_streams()
 
 
+def _run_attach_close_race(method: str) -> None:
+    """Race a REAL attach RPC against a REAL session.close at the
+    post-handler / pre-commit boundary.
+
+    The handler builds its success response, then the target is closed before
+    the ordered commit runs. The commit correctly refuses ghost ownership —
+    and dispatch must NOT return the stale success: the client would believe
+    it owns/watches a session that no longer exists while its socket stays on
+    the previous subscription. The RPC fails honestly instead, and the prior
+    attachment is untouched.
+    """
+    loop = asyncio.new_event_loop()
+    reached_commit = threading.Event()
+    release_commit = threading.Event()
+    prior_sid = f"attach-race-prior-{method.replace('.', '-')}"
+    target_sid = f"attach-race-target-{method.replace('.', '-')}"
+
+    class BoundaryWS(_RecordingWS):
+        def complete_session_subscription(self, generation, session_id, claim_owner=None):
+            if session_id == target_sid and not release_commit.is_set():
+                # Post-handler, pre-commit: the success response exists, the
+                # ordered attachment has not committed yet.
+                reached_commit.set()
+                assert release_commit.wait(timeout=5)
+            return super().complete_session_subscription(
+                generation, session_id, claim_owner
+            )
+
+    client = BoundaryWS(object(), loop, peer=f"attach-race-{method}")
+    closer = RecordingTransport()
+    close_results: list = []
+    server._sessions[prior_sid] = _live_session_dict("stored-attach-prior", client)
+    server._sessions[target_sid] = _live_session_dict(
+        "stored-attach-target", server._stdio_transport
+    )
+    server.register_live_transport(client)
+    try:
+        generation = client.begin_session_subscription()
+        assert client.complete_session_subscription(generation, prior_sid)
+        assert server.subscribe_session(prior_sid, client, owner=True, explicit=True)
+
+        def racing_close() -> None:
+            assert reached_commit.wait(timeout=5)
+            close_results.append(
+                server.dispatch(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "close-attach-target",
+                        "method": "session.close",
+                        "params": {"session_id": target_sid},
+                    },
+                    closer,
+                )
+            )
+            release_commit.set()
+
+        close_thread = threading.Thread(target=racing_close, daemon=True)
+        close_thread.start()
+        response = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": f"attach-{method}",
+                "method": method,
+                "params": {"session_id": target_sid},
+            },
+            client,
+        )
+        close_thread.join(timeout=5)
+        assert not close_thread.is_alive()
+        assert close_results and close_results[0]["result"]["closed"] is True
+
+        # The losing attach is an RPC failure, never a stale success.
+        assert response is not None
+        assert "result" not in response, f"stale success returned: {response}"
+        assert response["error"]["code"] == 4001
+
+        # The prior valid subscription is untouched; nothing ghosts the target.
+        assert client.observes_session(prior_sid)
+        assert server.session_owner(prior_sid) is client
+        assert target_sid not in server._sessions
+        assert server._session_streams.get(target_sid) is None
+        assert server.session_owner(target_sid) is None
+    finally:
+        release_commit.set()
+        server.unregister_live_transport(client)
+        client.close()
+        server._sessions.pop(prior_sid, None)
+        server._sessions.pop(target_sid, None)
+        server.reset_session_streams()
+        loop.close()
+
+
+def test_claim_losing_to_concurrent_close_returns_rpc_failure() -> None:
+    _run_attach_close_race("session.claim")
+
+
+def test_subscribe_losing_to_concurrent_close_returns_rpc_failure() -> None:
+    _run_attach_close_race("session.subscribe")
+
+
 def test_conditional_close_excludes_claims_from_its_critical_section(
     monkeypatch,
 ) -> None:

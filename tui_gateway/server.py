@@ -2577,13 +2577,19 @@ def _record_transport_subscription(
     params: dict,
     response: dict | None,
     generation: object | None,
-) -> None:
-    """Bind a WebSocket transport to the live session returned by an attach RPC."""
+) -> dict | None:
+    """Bind a WebSocket transport to the live session returned by an attach RPC.
+
+    Returns a replacement RESPONSE when the handler's success must not reach
+    the client (a claim/subscribe whose target vanished before the ordered
+    commit); the caller delivers it instead of the stale success. ``None``
+    means deliver the original response unchanged.
+    """
     if method_name not in _SESSION_SUBSCRIPTION_METHODS or not isinstance(response, dict):
-        return
+        return None
     result = response.get("result")
     if not isinstance(result, dict):
-        return
+        return None
     sid = result.get("session_id") or params.get("session_id")
     complete_subscription = getattr(transport, "complete_session_subscription", None)
     if sid and generation is not None and callable(complete_subscription):
@@ -2641,12 +2647,26 @@ def _record_transport_subscription(
         committed = complete_subscription(generation, sid, claim_owner)
         for cleanup in deferred_cleanup:
             cleanup()
-        if not committed and method_name != "prompt.submit":
-            _schedule_rejected_deferred_subscription(sid)
-        return
+        if not committed:
+            if method_name != "prompt.submit":
+                _schedule_rejected_deferred_subscription(sid)
+            if require_record:
+                # The handler built success against a record that vanished
+                # before the ordered commit (a close won the race). Returning
+                # the stale success would tell the client it now owns/watches
+                # a session that no longer exists while its socket stays on
+                # the previous subscription — fail the RPC honestly instead.
+                # The previous attachment was preserved by the failed commit.
+                return _err(
+                    response.get("id"),
+                    4001,
+                    "session closed before the attachment committed",
+                )
+        return None
     subscribe_transport = getattr(transport, "subscribe_session", None)
     if sid and callable(subscribe_transport):
         subscribe_transport(str(sid))
+    return None
 
 
 def _begin_transport_subscription(transport: Transport, method_name: str) -> object | None:
@@ -2688,9 +2708,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         if method not in _LONG_HANDLERS:
             try:
                 response = handle_request(req)
-                _record_transport_subscription(
+                replacement = _record_transport_subscription(
                     t, method, _params, response, subscription_generation
                 )
+                if replacement is not None:
+                    response = replacement
                 return response
             finally:
                 if defer_ownership_token is not None:
@@ -2708,9 +2730,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
-                _record_transport_subscription(
+                replacement = _record_transport_subscription(
                     t, method, _params, resp, subscription_generation
                 )
+                if replacement is not None:
+                    resp = replacement
                 t.write(resp)
 
         _pool.submit(lambda: ctx.run(run))
