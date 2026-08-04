@@ -161,6 +161,10 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_defer_session_ownership: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_gateway_defer_session_ownership",
+    default=False,
+)
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -327,6 +331,14 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
+
+
+def _request_session_transport() -> Transport:
+    """Choose initial ownership without pre-committing an ordered attach."""
+    transport = current_transport() or _stdio_transport
+    if _defer_session_ownership.get() and transport is not _stdio_transport:
+        return _detached_ws_transport
+    return transport
 
 
 class _SlashWorker:
@@ -1910,6 +1922,8 @@ def _bind_creator_as_owner(sid: str) -> None:
     gateway keeps the historical single-transport route untouched (no stream,
     no ``seq`` stamping, no ownership checks).
     """
+    if _defer_session_ownership.get():
+        return
     t = current_transport()
     if t is None or t is _stdio_transport or t is _detached_ws_transport:
         return
@@ -2352,7 +2366,28 @@ def _record_transport_subscription(
     sid = result.get("session_id") or params.get("session_id")
     complete_subscription = getattr(transport, "complete_session_subscription", None)
     if sid and generation is not None and callable(complete_subscription):
-        complete_subscription(generation, str(sid))
+        sid = str(sid)
+
+        def claim_owner() -> bool:
+            # Keep ownership and subscription as one ordered commit. A stale
+            # response must never redirect the authoritative event path before
+            # its generation is rejected by the transport.
+            with _sessions_lock:
+                session = _sessions.get(sid)
+                if session is None:
+                    # Synthetic handlers used by transport-level callers may
+                    # return a subscription without a live server-side record.
+                    return True
+                if session.get("_finalized"):
+                    return False
+                # Commit through the durable stream registry. A second live
+                # client joins as a viewer; only a missing/dead owner is
+                # replaced, and subscribe_session keeps the legacy transport
+                # slot in sync when ownership really changes.
+                subscribe_session(sid, transport, owner=True)
+                return True
+
+        complete_subscription(generation, sid, claim_owner)
         return
     subscribe_session = getattr(transport, "subscribe_session", None)
     if sid and callable(subscribe_session):
@@ -2388,15 +2423,29 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
 
         _rid, method, _params = normalized
         subscription_generation = _begin_transport_subscription(t, method)
+        defer_ownership_token = None
+        if (
+            method in _SESSION_SUBSCRIPTION_METHODS
+            and method != "prompt.submit"
+            and subscription_generation is not None
+        ):
+            defer_ownership_token = _defer_session_ownership.set(True)
         if method not in _LONG_HANDLERS:
-            response = handle_request(req)
-            _record_transport_subscription(
-                t, method, _params, response, subscription_generation
-            )
-            return response
+            try:
+                response = handle_request(req)
+                _record_transport_subscription(
+                    t, method, _params, response, subscription_generation
+                )
+                return response
+            finally:
+                if defer_ownership_token is not None:
+                    _defer_session_ownership.reset(defer_ownership_token)
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
+        if defer_ownership_token is not None:
+            _defer_session_ownership.reset(defer_ownership_token)
+            defer_ownership_token = None
 
         def run():
             try:
@@ -2761,6 +2810,8 @@ def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
     current transport and are left untouched.
     """
     if not session:
+        return
+    if _defer_session_ownership.get():
         return
     t = current_transport()
     if t is None or t is _stdio_transport:
@@ -7061,7 +7112,7 @@ def _init_session(
             "model_override": None,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
-            "transport": current_transport() or _stdio_transport,
+            "transport": _request_session_transport(),
         }
     _init_owns_db = False
     if session_db is not None:
@@ -8379,7 +8430,7 @@ def _deferred_session_record(
         "source": source,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
-        "transport": current_transport() or _stdio_transport,
+        "transport": _request_session_transport(),
     }
 
 
@@ -8600,7 +8651,7 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
-    if transport is not None:
+    if transport is not None and not _defer_session_ownership.get():
         # Attach the resuming client to the fan-out. It takes ownership only
         # when nobody live holds it (reconnect); otherwise it joins as a viewer
         # so the device that already owns the session keeps streaming. Done

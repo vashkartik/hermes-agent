@@ -152,10 +152,17 @@ class WSTransport:
             self._subscription_next_generation += 1
             return self._subscription_next_generation
 
-    def complete_session_subscription(self, generation: int, session_id: str) -> bool:
-        """Commit a successful attach unless a newer attach already committed."""
+    def complete_session_subscription(
+        self,
+        generation: int,
+        session_id: str,
+        claim_owner: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Atomically commit subscription and ownership for the latest attach."""
         with self._subscription_lock:
-            if generation < self._subscription_committed_generation:
+            if generation != self._subscription_next_generation:
+                return False
+            if claim_owner is not None and not claim_owner():
                 return False
             self._subscription_committed_generation = generation
             self._subscribed_session_id = session_id

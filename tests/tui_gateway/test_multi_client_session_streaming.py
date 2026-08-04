@@ -45,9 +45,13 @@ class RecordingTransport:
             self.subscription_next_generation += 1
             return self.subscription_next_generation
 
-    def complete_session_subscription(self, generation: int, session_id: str) -> bool:
+    def complete_session_subscription(
+        self, generation: int, session_id: str, claim_owner=None
+    ) -> bool:
         with self.subscription_lock:
-            if generation < self.subscription_committed_generation:
+            if generation != self.subscription_next_generation:
+                return False
+            if claim_owner is not None and not claim_owner():
                 return False
             self.subscription_committed_generation = generation
             self.subscribed_session_id = session_id
@@ -296,6 +300,117 @@ def test_stale_long_attach_response_cannot_overwrite_newer_subscription() -> Non
         server._methods["session.activate"] = original_activate
 
     assert transport.observes_session("newer-session")
+
+
+def test_stale_resume_cannot_reclaim_ownership_or_leak_private_events(
+    monkeypatch,
+) -> None:
+    """A completed newer activation owns both subscription and event routing."""
+    stored_x = "stored-session-x"
+    runtime_x = "runtime-session-x"
+    runtime_y = "runtime-session-y"
+    resume_reached_payload = threading.Event()
+    release_resume = threading.Event()
+
+    class PausedLock:
+        def __enter__(self):
+            resume_reached_payload.set()
+            assert release_resume.wait(timeout=3)
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return False
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "cwd": ""} if session_id == stored_x else None
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def get_messages_as_conversation(self, _session_id, **_kwargs):
+            return []
+
+    class ClientTransport(RecordingTransport):
+        def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
+            with self.subscription_lock:
+                if self.subscribed_session_id != session_id:
+                    return False
+                self.frames.append(obj)
+                return True
+
+    def live_session(session_key, transport, history_lock):
+        now = time.time()
+        return {
+            "agent": None,
+            "created_at": now,
+            "history": [],
+            "history_lock": history_lock,
+            "last_active": now,
+            "running": False,
+            "session_key": session_key,
+            "transport": transport,
+        }
+
+    x_owner = RecordingTransport()
+    y_owner = RecordingTransport()
+    client = ClientTransport()
+    session_x = live_session(stored_x, x_owner, PausedLock())
+    session_y = live_session("stored-session-y", y_owner, threading.Lock())
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    server._sessions[runtime_x] = session_x
+    server._sessions[runtime_y] = session_y
+    server.register_live_transport(client)
+
+    try:
+        assert server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "resume-x",
+                "method": "session.resume",
+                "params": {"session_id": stored_x},
+            },
+            client,
+        ) is None
+        assert resume_reached_payload.wait(timeout=3)
+
+        activate_y = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "activate-y",
+                "method": "session.activate",
+                "params": {"session_id": runtime_y},
+            },
+            client,
+        )
+        assert activate_y is not None
+        assert client.observes_session(runtime_y)
+
+        release_resume.set()
+        deadline = time.monotonic() + 3
+        while not any(frame.get("id") == "resume-x" for frame in client.frames):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        assert server.write_json(
+            server._event_frame("message.delta", runtime_x, {"text": "private-x"})
+        )
+    finally:
+        release_resume.set()
+        server.unregister_live_transport(client)
+        server._sessions.pop(runtime_x, None)
+        server._sessions.pop(runtime_y, None)
+
+    assert client.observes_session(runtime_y)
+    assert session_x["transport"] is x_owner
+    assert session_y["transport"] is client
+    assert not any(
+        frame.get("method") == "event"
+        and (frame.get("params") or {}).get("session_id") == runtime_x
+        for frame in client.frames
+    )
 
 
 def test_observer_is_queued_before_a_stalled_owner_write() -> None:
