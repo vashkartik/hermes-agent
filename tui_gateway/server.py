@@ -2406,9 +2406,9 @@ def _record_transport_subscription(
         if not committed and method_name != "prompt.submit":
             _schedule_rejected_deferred_subscription(sid)
         return
-    subscribe_session = getattr(transport, "subscribe_session", None)
-    if sid and callable(subscribe_session):
-        subscribe_session(str(sid))
+    subscribe_transport = getattr(transport, "subscribe_session", None)
+    if sid and callable(subscribe_transport):
+        subscribe_transport(str(sid))
 
 
 def _begin_transport_subscription(transport: Transport, method_name: str) -> object | None:
