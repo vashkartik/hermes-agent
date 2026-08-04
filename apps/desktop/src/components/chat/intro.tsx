@@ -1,8 +1,7 @@
 import { useStore } from '@nanostores/react'
-
-import { $agentBrandName } from '@/i18n/branding'
 import { type CSSProperties, useState } from 'react'
 
+import { $agentBrandName } from '@/i18n/branding'
 import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
