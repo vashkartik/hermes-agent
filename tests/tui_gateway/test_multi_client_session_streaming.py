@@ -1521,6 +1521,159 @@ def test_concurrent_claims_keep_owner_and_legacy_slot_consistent() -> None:
         server.reset_session_streams()
 
 
+def test_stream_frame_selected_before_switch_cannot_enqueue_after_commit() -> None:
+    """A frame that selected a durable subscriber before its switch committed
+    must be rejected at the enqueue gate, for OWNERS as well as viewers.
+
+    ``deliver`` snapshots membership under the stream lock, releases it, then
+    writes. Pre-fix the owner write was the ungated blocking path, so a socket
+    that completed a switch to a newer session between snapshot and write still
+    accepted the old session's private frame. The old session stays registered
+    in the stream throughout — only the enqueue gate may reject the frame.
+    """
+    sid_old = "gated-enqueue-old"
+    sid_new = "gated-enqueue-new"
+    reached_gate = threading.Event()
+    release_gate = threading.Event()
+
+    loop = asyncio.new_event_loop()
+
+    class PausingWS(_RecordingWS):
+        def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
+            # Pause after deliver selected this subscriber but before the
+            # session-gated acceptance (the lock is taken inside super()).
+            reached_gate.set()
+            assert release_gate.wait(timeout=3)
+            return super().write_observer_if_subscribed(session_id, obj)
+
+    client = PausingWS(object(), loop, peer="gated-enqueue-test")
+    try:
+        generation = client.begin_session_subscription()
+        assert client.complete_session_subscription(generation, sid_old)
+        assert server.subscribe_session(sid_old, client, owner=True, explicit=True)
+        stream = server._session_streams.get(sid_old)
+        assert stream is not None and stream.owner() is client
+
+        delivered: list = []
+        deliver_thread = threading.Thread(
+            target=lambda: delivered.append(
+                stream.deliver(
+                    server._event_frame("message.delta", sid_old, {"text": "private"})
+                )
+            )
+        )
+        deliver_thread.start()
+        assert reached_gate.wait(timeout=3)
+
+        # The switch to the newer session commits while the old frame is
+        # already selected and in flight.
+        newer_generation = client.begin_session_subscription()
+        assert client.complete_session_subscription(newer_generation, sid_new)
+
+        release_gate.set()
+        deliver_thread.join(timeout=3)
+        assert not deliver_thread.is_alive()
+
+        assert not any(
+            (frame.get("params") or {}).get("session_id") == sid_old
+            for frame in client.frames
+        )
+        assert delivered == [False]
+    finally:
+        release_gate.set()
+        client.close()
+        server.reset_session_streams()
+        loop.close()
+
+
+def test_forced_claim_during_heir_promotion_cannot_split_owner_and_mirror(
+    monkeypatch,
+) -> None:
+    """Heir promotion and the legacy-slot mirror must commit atomically.
+
+    Pre-fix ``_release_stale_session_attachment`` promoted the heir under the
+    stream lock but wrote ``session["transport"]`` afterwards; a newer forced
+    claim landing between the two won the stream registry while the release
+    overwrote only the legacy mirror — stream owner and slot diverged, and
+    disconnect cleanup (which selects by the slot) then missed the real owner.
+    """
+    loop = asyncio.new_event_loop()
+    leaver = _RecordingWS(object(), loop, peer="promotion-race-leaver")
+    viewer = RecordingTransport()
+    claimer = RecordingTransport()
+    sid_old = "promotion-race-old"
+    sid_new = "promotion-race-new"
+    promote_returned = threading.Event()
+    claim_finished = threading.Event()
+    server._sessions[sid_old] = session_old = _live_session_dict(
+        "stored-promotion-race-old", leaver
+    )
+    server._sessions[sid_new] = _live_session_dict(
+        "stored-promotion-race-new", RecordingTransport()
+    )
+    server.register_live_transport(leaver)
+    try:
+        generation = leaver.begin_session_subscription()
+        assert leaver.complete_session_subscription(generation, sid_old)
+        assert server.subscribe_session(sid_old, leaver, owner=True, explicit=True)
+        server.subscribe_session(sid_old, viewer, explicit=True)
+        stream = server._session_streams.get(sid_old)
+        assert stream is not None
+        from tui_gateway import session_stream as stream_mod
+
+        real_promote = stream_mod.SessionStream.promote_next_owner
+
+        def paused_promote(self, *args, **kwargs):
+            result = real_promote(self, *args, **kwargs)
+            if self is stream:
+                # Old code: the mirror write is still pending at this point.
+                # New code: the mirror already committed under the stream lock.
+                promote_returned.set()
+                assert claim_finished.wait(timeout=3)
+            return result
+
+        monkeypatch.setattr(
+            stream_mod.SessionStream, "promote_next_owner", paused_promote
+        )
+
+        def forced_claim() -> None:
+            assert promote_returned.wait(timeout=3)
+            server.subscribe_session(
+                sid_old, claimer, owner=True, force=True, explicit=True
+            )
+            claim_finished.set()
+
+        claim_thread = threading.Thread(target=forced_claim)
+        claim_thread.start()
+
+        # The leaver switches away: the ordered commit releases sid_old, which
+        # promotes the viewer — with the forced claim racing right behind it.
+        activate = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "activate-promotion-race",
+                "method": "session.activate",
+                "params": {"session_id": sid_new},
+            },
+            leaver,
+        )
+        assert activate is not None and "error" not in activate
+        claim_thread.join(timeout=3)
+        assert not claim_thread.is_alive()
+
+        assert server.session_owner(sid_old) is claimer
+        assert session_old["transport"] is claimer
+        assert server.session_owner(sid_old) is session_old["transport"]
+    finally:
+        claim_finished.set()
+        server.unregister_live_transport(leaver)
+        leaver.close()
+        server._sessions.pop(sid_old, None)
+        server._sessions.pop(sid_new, None)
+        server.reset_session_streams()
+        loop.close()
+
+
 def test_orphan_reap_rearms_while_parked_session_is_running(monkeypatch) -> None:
     """A parked record protected by in-flight work keeps its reap timer.
 

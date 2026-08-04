@@ -256,21 +256,42 @@ class SessionStream:
             self._subs.remove(sub)
             return sub.owner
 
-    def promote_next_owner(self) -> Any:
+    def promote_next_owner(
+        self,
+        *,
+        is_dead: Optional[Callable[[Any], bool]] = None,
+        on_owner: Optional[Callable[[Any], None]] = None,
+    ) -> Any:
         """Hand ownership to the longest-attached remaining peer.
 
-        Called when the owner disconnects while another device is still
-        watching: the session must survive on the surviving client rather than
-        be detached to the orphan reaper. Returns the new owner transport, or
-        ``None`` when nobody is left.
+        Called when the owner disconnects or switches away while another
+        device is still watching: the session must survive on the surviving
+        client rather than be detached to the orphan reaper. Returns the new
+        owner transport, or ``None`` when nobody (live) is left.
+
+        ``is_dead`` filters candidates so a dead socket is never crowned.
+        ``on_owner`` runs under the stream lock only when this call actually
+        promotes a new owner, receiving the promoted transport — the caller's
+        legacy ``session["transport"]`` mirror commits atomically with the
+        promotion, so a racing forced claim (which also commits owner+mirror
+        under this lock) can never win the registry while the mirror keeps
+        the heir. An already-present owner is returned without invoking it;
+        whoever installed that owner already mirrored it.
         """
         with self._lock:
-            if any(sub.owner for sub in self._subs):
-                return next(sub.transport for sub in self._subs if sub.owner)
-            if not self._subs:
+            current = next((s.transport for s in self._subs if s.owner), None)
+            if current is not None:
+                return current
+            candidates = [
+                sub for sub in self._subs
+                if not (is_dead(sub.transport) if is_dead else False)
+            ]
+            if not candidates:
                 return None
-            heir = min(self._subs, key=lambda s: s.attached_at)
+            heir = min(candidates, key=lambda s: s.attached_at)
             heir.owner = True
+            if on_owner is not None:
+                on_owner(heir.transport)
             return heir.transport
 
     # -- delivery -----------------------------------------------------------
@@ -342,12 +363,33 @@ class SessionStream:
             ordered.extend(item for item in subscribers if item[1])
             for sub, was_owner in ordered:
                 try:
-                    writer = None
-                    if not was_owner:
-                        writer = getattr(sub.transport, "write_observer", None)
-                    if not callable(writer):
-                        writer = sub.transport.write
-                    ok = bool(writer(stamped))
+                    # Durable sockets — those tracking a committed session
+                    # subscription — accept frames through the session-gated
+                    # enqueue: the subscription check and queue admission are
+                    # one atomic step under the transport's subscription lock,
+                    # so a frame selected here before a switch committed can
+                    # never enqueue after it — for OWNERS as well as viewers
+                    # (the ungated owner write was the leak). Sockets with no
+                    # tracked subscription (legacy clients attached server-side
+                    # by the rebind/prompt-reclaim paths) and transports
+                    # without the gate (stdio, in-process) keep their
+                    # historical writer: they never committed an attach, so
+                    # there is no newer subscription to protect.
+                    gated = getattr(
+                        sub.transport, "write_observer_if_subscribed", None
+                    )
+                    tracked = getattr(
+                        sub.transport, "current_session_subscription", None
+                    )
+                    if callable(gated) and callable(tracked) and tracked() is not None:
+                        ok = bool(gated(self.sid, stamped))
+                    else:
+                        writer = None
+                        if not was_owner:
+                            writer = getattr(sub.transport, "write_observer", None)
+                        if not callable(writer):
+                            writer = sub.transport.write
+                        ok = bool(writer(stamped))
                 except Exception:
                     logger.debug(
                         "session stream write raised sid=%s client=%s",

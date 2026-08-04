@@ -2438,25 +2438,36 @@ def _release_stale_session_attachment(
         return was_owner, None
     if not was_owner and session.get("transport") is not transport:
         return was_owner, None
-    heir = None
+    promoted: list[Any] = []
     if was_owner and stream is not None:
         try:
-            heir = stream.promote_next_owner()
+            def _mirror(next_owner: Any) -> None:
+                # Runs under the stream lock, atomically with the promotion.
+                # A racing forced claim serializes on that lock and commits
+                # owner + mirror in one step too, so the registry owner and
+                # the legacy slot can never diverge between them.
+                session["transport"] = next_owner
+                promoted.append(next_owner)
+
+            stream.promote_next_owner(is_dead=_transport_is_dead, on_owner=_mirror)
         except Exception:
             logger.debug(
                 "stale-attachment owner promotion failed sid=%s",
                 previous_sid,
                 exc_info=True,
             )
-    if heir is not None and heir is not transport and not _transport_is_dead(heir):
-        session["transport"] = heir
+    if promoted:
+        heir = promoted[0]
 
         def _announce() -> None:
-            _emit(
-                "session.owner_changed",
-                previous_sid,
-                {"reason": reason, "client": _stream_client_label(heir)},
-            )
+            # Advisory: a forced claim that landed right after the promotion
+            # announced its own owner_changed; skip the stale one.
+            if session.get("transport") is heir:
+                _emit(
+                    "session.owner_changed",
+                    previous_sid,
+                    {"reason": reason, "client": _stream_client_label(heir)},
+                )
 
         return was_owner, _announce
     if session.get("transport") is transport:
