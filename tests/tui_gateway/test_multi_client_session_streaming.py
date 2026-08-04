@@ -523,7 +523,10 @@ def test_closed_transport_cannot_claim_paused_cold_resume_and_schedules_reap(
         assert not client.observes_session(runtime_sid)
         assert session["transport"] is server._detached_ws_transport
         assert scheduled_reaps == [runtime_sid]
-        assert session["active_session_lease"] is lease
+        # The active-session slot is claimed lazily on the first turn now, so a
+        # rejected cold resume must leave the slot untouched (nothing to leak).
+        assert session["active_session_lease"] is None
+        assert lease.released is False
     finally:
         release_resume.set()
         server.unregister_live_transport(client)
@@ -814,7 +817,7 @@ def test_send_failure_before_stdio_prompt_rebind_cannot_install_dead_owner(
         assert release_prompt.wait(timeout=3)
         return original_sanitize(raw_text)
 
-    def queue_prompt(rid, *_args):
+    def queue_prompt(rid, *_args, **_kwargs):
         response = server._ok(rid, {"status": "queued"})
         queued_responses.append(response)
         return response
@@ -1083,6 +1086,190 @@ def test_failed_newer_attach_does_not_invalidate_older_cold_resume(monkeypatch) 
         session = server._sessions.pop(runtime_sid, None) if runtime_sid else None
         if session is not None and (lease := session.get("active_session_lease")):
             lease.release()
+        loop.close()
+
+
+class _RecordingWS(ws_mod.WSTransport):
+    """Real WSTransport subscription machinery with in-memory delivery."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.frames: list[dict] = []
+
+    def write(self, obj: dict) -> bool:
+        self.frames.append(obj)
+        return True
+
+    def write_observer(self, obj: dict) -> bool:
+        self.frames.append(obj)
+        return True
+
+    def event_session_ids(self) -> list[str]:
+        return [
+            (frame.get("params") or {}).get("session_id")
+            for frame in self.frames
+            if frame.get("method") == "event"
+        ]
+
+
+def _completed_cold_resume(monkeypatch, client, *, stored_session_id: str):
+    """Drive a REAL session.resume through dispatch to a committed ownership."""
+    runtime_sid, release_build, scheduled_reaps, lease = _start_paused_cold_resume(
+        monkeypatch,
+        client,
+        stored_session_id=stored_session_id,
+    )
+    release_build.set()
+    deadline = time.monotonic() + 3
+    response_id = f"resume-{stored_session_id}"
+    while not any(frame.get("id") == response_id for frame in client.frames):
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert server.session_owner(runtime_sid) is client
+    assert server._sessions[runtime_sid]["transport"] is client
+    assert client.observes_session(runtime_sid)
+    return runtime_sid, scheduled_reaps, lease
+
+
+def test_newer_switch_promotes_viewer_and_stops_stale_resume_routing(
+    monkeypatch,
+) -> None:
+    """A committed cold resume loses its attachment on the next switch.
+
+    The durable contract is one observed session per socket. Before the fix the
+    old stream kept this client as OWNER after it activated another session, and
+    ``SessionStream.deliver`` writes owners through the ungated ``write`` path —
+    every private frame of the abandoned session kept landing on the switched
+    client. A watching peer must inherit the session instead.
+    """
+    loop = asyncio.new_event_loop()
+    client = _RecordingWS(object(), loop, peer="switch-close-owner-test")
+    # A plain recording transport: once promoted to owner it legitimately
+    # receives blocking writes (session.owner_changed, then the live stream).
+    viewer = RecordingTransport()
+    y_owner = RecordingTransport()
+    newer_sid = "runtime-switch-newer"
+    old_sid = ""
+    lease = None
+    server.register_live_transport(client)
+    try:
+        old_sid, scheduled_reaps, lease = _completed_cold_resume(
+            monkeypatch, client, stored_session_id="stored-switch-owner"
+        )
+        assert server.subscribe_session(old_sid, viewer, explicit=True) is False
+        viewer.subscribe_session(old_sid)
+
+        now = time.time()
+        server._sessions[newer_sid] = {
+            "agent": None,
+            "created_at": now,
+            "history": [],
+            "history_lock": threading.Lock(),
+            "last_active": now,
+            "running": False,
+            "session_key": "stored-switch-newer",
+            "transport": y_owner,
+        }
+        activate = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "activate-newer",
+                "method": "session.activate",
+                "params": {"session_id": newer_sid},
+            },
+            client,
+        )
+        assert activate is not None and "error" not in activate
+        assert client.observes_session(newer_sid)
+
+        # The stale attachment is closed and the watching peer inherits it.
+        assert server.session_owner(old_sid) is viewer
+        assert server._sessions[old_sid]["transport"] is viewer
+        assert scheduled_reaps == []
+
+        frames_before = len(client.frames)
+        assert server.write_json(
+            server._event_frame("message.delta", old_sid, {"text": "private-old"})
+        )
+        assert old_sid in [
+            (frame.get("params") or {}).get("session_id") for frame in viewer.frames
+        ]
+        assert old_sid not in client.event_session_ids()[frames_before:]
+        assert not any(
+            frame.get("method") == "event"
+            and (frame.get("params") or {}).get("session_id") == old_sid
+            for frame in client.frames[frames_before:]
+        )
+    finally:
+        server.unregister_live_transport(client)
+        client.close()
+        for sid in (old_sid, newer_sid):
+            session = server._sessions.pop(sid, None) if sid else None
+            if session is not None and (held := session.get("active_session_lease")):
+                held.release()
+        loop.close()
+
+
+def test_newer_switch_parks_unwatched_stale_resume_for_the_reaper(
+    monkeypatch,
+) -> None:
+    """Switching away from an unwatched cold resume parks it on the drop
+    sentinel (zero further private routing to this client) and hands it to the
+    grace reaper, exactly like a disconnect would."""
+    loop = asyncio.new_event_loop()
+    client = _RecordingWS(object(), loop, peer="switch-close-park-test")
+    y_owner = RecordingTransport()
+    newer_sid = "runtime-switch-park-newer"
+    old_sid = ""
+    lease = None
+    server.register_live_transport(client)
+    try:
+        old_sid, scheduled_reaps, lease = _completed_cold_resume(
+            monkeypatch, client, stored_session_id="stored-switch-park"
+        )
+        now = time.time()
+        server._sessions[newer_sid] = {
+            "agent": None,
+            "created_at": now,
+            "history": [],
+            "history_lock": threading.Lock(),
+            "last_active": now,
+            "running": False,
+            "session_key": "stored-switch-park-newer",
+            "transport": y_owner,
+        }
+        activate = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "activate-park-newer",
+                "method": "session.activate",
+                "params": {"session_id": newer_sid},
+            },
+            client,
+        )
+        assert activate is not None and "error" not in activate
+        assert client.observes_session(newer_sid)
+
+        assert server.session_owner(old_sid) is None
+        assert server._sessions[old_sid]["transport"] is server._detached_ws_transport
+        assert scheduled_reaps == [old_sid]
+
+        frames_before = len(client.frames)
+        server.write_json(
+            server._event_frame("message.delta", old_sid, {"text": "private-old"})
+        )
+        assert not any(
+            frame.get("method") == "event"
+            and (frame.get("params") or {}).get("session_id") == old_sid
+            for frame in client.frames[frames_before:]
+        )
+    finally:
+        server.unregister_live_transport(client)
+        client.close()
+        for sid in (old_sid, newer_sid):
+            session = server._sessions.pop(sid, None) if sid else None
+            if session is not None and (held := session.get("active_session_lease")):
+                held.release()
         loop.close()
 
 

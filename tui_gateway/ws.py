@@ -232,6 +232,16 @@ class WSTransport:
         with self._subscription_lock:
             return self._subscribed_session_id == session_id
 
+    def current_session_subscription(self) -> str | None:
+        """Session id this socket currently observes.
+
+        ``_subscription_lock`` is reentrant, so an attach commit may read the
+        subscription it is about to replace from inside its own
+        ``complete_session_subscription`` claim callback.
+        """
+        with self._subscription_lock:
+            return self._subscribed_session_id
+
     def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
         """Queue ``obj`` only while this socket still observes ``session_id``.
 

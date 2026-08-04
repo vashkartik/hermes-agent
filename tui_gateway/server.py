@@ -2365,6 +2365,64 @@ def _schedule_rejected_deferred_subscription(sid: str) -> None:
         )
 
 
+def _release_stale_session_attachment(
+    previous_sid: str, transport: Transport
+) -> Callable[[], None] | None:
+    """Close ``transport``'s attachment to the session it is switching from.
+
+    A socket observes exactly one session; when an attach RPC commits a newer
+    one, the old stream must not keep this client in its fan-out — the owner
+    slot writes through the ungated ``write`` path, so a stale owner keeps
+    receiving the abandoned session's private frames. Mirrors the disconnect
+    policy scoped to one session: a watching peer inherits ownership, else the
+    record parks on the drop sentinel for the grace reaper (which skips
+    running/pending sessions, so a background turn survives the switch).
+
+    Runs under ``_sessions_lock`` (and the committing transport's subscription
+    lock). The returned callable carries the emit/reap side effects and must be
+    invoked only after those locks are released.
+    """
+    stream = _session_streams.get(previous_sid)
+    was_owner = bool(stream.detach(transport)) if stream is not None else False
+    session = _sessions.get(previous_sid)
+    if session is None or session.get("_finalized"):
+        return None
+    if not was_owner and session.get("transport") is not transport:
+        return None
+    heir = None
+    if was_owner and stream is not None:
+        try:
+            heir = stream.promote_next_owner()
+        except Exception:
+            logger.debug(
+                "stale-attachment owner promotion failed sid=%s",
+                previous_sid,
+                exc_info=True,
+            )
+    if heir is not None and heir is not transport and not _transport_is_dead(heir):
+        session["transport"] = heir
+
+        def _announce() -> None:
+            _emit(
+                "session.owner_changed",
+                previous_sid,
+                {"reason": "session_switch", "client": _stream_client_label(heir)},
+            )
+
+        return _announce
+    if session.get("transport") is transport:
+        session["transport"] = _detached_ws_transport
+
+        def _reap() -> None:
+            try:
+                _schedule_ws_orphan_reap(previous_sid)
+            except Exception:
+                pass
+
+        return _reap
+    return None
+
+
 def _record_transport_subscription(
     transport: Transport,
     method_name: str,
@@ -2382,27 +2440,45 @@ def _record_transport_subscription(
     complete_subscription = getattr(transport, "complete_session_subscription", None)
     if sid and generation is not None and callable(complete_subscription):
         sid = str(sid)
+        # prompt.submit keeps its takeover semantics (_claim_prompt_transport);
+        # only the switch-shaped attaches close the previous attachment.
+        release_stale = method_name != "prompt.submit"
+        read_subscription = getattr(transport, "current_session_subscription", None)
+        deferred_cleanup: list[Callable[[], None]] = []
 
         def claim_owner() -> bool:
             # Keep ownership and subscription as one ordered commit. A stale
             # response must never redirect the authoritative event path before
             # its generation is rejected by the transport.
             with _sessions_lock:
+                previous_sid = None
+                if release_stale and callable(read_subscription):
+                    # Safe under the transport's reentrant subscription lock:
+                    # this callback runs inside complete_session_subscription.
+                    previous_sid = read_subscription()
                 session = _sessions.get(sid)
-                if session is None:
-                    # Synthetic handlers used by transport-level callers may
-                    # return a subscription without a live server-side record.
-                    return True
-                if session.get("_finalized"):
-                    return False
-                # Commit through the durable stream registry. A second live
-                # client joins as a viewer; only a missing/dead owner is
-                # replaced, and subscribe_session keeps the legacy transport
-                # slot in sync when ownership really changes.
-                subscribe_session(sid, transport, owner=True)
+                if session is not None:
+                    if session.get("_finalized"):
+                        return False
+                    # Commit through the durable stream registry. A second live
+                    # client joins as a viewer; only a missing/dead owner is
+                    # replaced, and subscribe_session keeps the legacy transport
+                    # slot in sync when ownership really changes.
+                    subscribe_session(sid, transport, owner=True)
+                # A session-less sid (synthetic handlers used by transport-level
+                # callers) still commits the subscription move, so the stale
+                # release below applies either way.
+                if previous_sid and previous_sid != sid:
+                    deferred = _release_stale_session_attachment(
+                        previous_sid, transport
+                    )
+                    if deferred is not None:
+                        deferred_cleanup.append(deferred)
                 return True
 
         committed = complete_subscription(generation, sid, claim_owner)
+        for cleanup in deferred_cleanup:
+            cleanup()
         if not committed and method_name != "prompt.submit":
             _schedule_rejected_deferred_subscription(sid)
         return
