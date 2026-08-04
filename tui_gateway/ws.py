@@ -59,6 +59,23 @@ _STREAMING_EVENT_TYPES = frozenset({
 # enough to stay imperceptible to the live token cadence.
 _TOKEN_COALESCE_S = 0.033
 
+# Advertised in ``gateway.ready`` so Desktop / mobile can tell a gateway that
+# supports one durable session across several devices from an older one. Bump
+# ``version`` only for a breaking change to these methods or to the ``seq``
+# stamping on session events.
+DURABLE_SESSION_CONTRACT = {
+    "version": 1,
+    "methods": [
+        "session.subscribe",
+        "session.unsubscribe",
+        "session.claim",
+        "session.replay",
+        "request.status",
+    ],
+    "event_seq": True,
+    "request_id": True,
+}
+
 # Keep starlette optional at import time; handle_ws uses the real class when
 # it's available and falls back to a generic Exception sentinel otherwise.
 try:
@@ -325,7 +342,18 @@ async def handle_ws(ws: Any) -> None:
                 "method": "event",
                 "params": {
                     "type": "gateway.ready",
-                    "payload": {"skin": server.resolve_skin()},
+                    "payload": {
+                        "skin": server.resolve_skin(),
+                        # Feature detection for the durable multi-client
+                        # session contract: a client that sees this may attach
+                        # a second device (session.subscribe), hand the session
+                        # over (session.claim), catch up after a reconnect
+                        # (session.replay, using the ``seq`` on every event),
+                        # and make prompt.submit retry-safe with request_id /
+                        # request.status. Older clients ignore it and keep the
+                        # single-transport behaviour.
+                        "capabilities": {"durable_sessions": DURABLE_SESSION_CONTRACT},
+                    },
                 },
             }
         )

@@ -29,6 +29,12 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from tui_gateway import git_probe
+from tui_gateway.session_stream import (
+    TERMINAL_EVENT_TYPES,
+    RequestLedger,
+    SessionStreamRegistry,
+    fingerprint_prompt,
+)
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -802,6 +808,13 @@ def _pop_session_by_id(sid: str) -> dict | None:
     # Release any blocking prompt before teardown/agent.close so a closed
     # session never strands its run thread.
     _clear_pending(sid)
+    # The session id is gone; drop its fan-out and request bookkeeping so a
+    # later id reuse can never inherit another session's peers or results.
+    try:
+        _session_streams.drop(sid)
+        _request_ledger.forget_session(sid)
+    except Exception:
+        logger.debug("session stream cleanup failed sid=%s", sid, exc_info=True)
     return session
 
 
@@ -889,12 +902,41 @@ def _close_sessions_for_transport(
     the single WS-disconnect teardown entry point — there is no second
     independent reap loop in ``handle_ws``.
 
+    A peer that was only VIEWING a session (Desktop still owns it while mobile
+    watches) is simply detached from the fan-out: its departure must not reap
+    or detach a session it never owned, which is what kept the surviving
+    client's stream alive across the other device going away.
+
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
+    # Leave the fan-out first so no in-flight emit can touch this dead socket,
+    # and so a session that still has another live peer keeps streaming.
+    try:
+        _session_streams.detach_transport(transport)
+    except Exception:
+        logger.debug("session stream detach failed", exc_info=True)
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
     reaped = 0
     detached = 0
     for sid, session in owned:
+        # Another device is still attached: hand it the session instead of
+        # orphaning one that demonstrably still has a live client. This is the
+        # unattended half of the handoff story (desktop sleeps, phone keeps the
+        # turn) and it settles immediately, inside this teardown.
+        heir = None
+        try:
+            stream = _session_streams.get(sid)
+            heir = stream.promote_next_owner() if stream is not None else None
+        except Exception:
+            logger.debug("session stream owner promotion failed sid=%s", sid, exc_info=True)
+        if heir is not None and not _transport_is_dead(heir):
+            session["transport"] = heir
+            _emit(
+                "session.owner_changed",
+                sid,
+                {"reason": end_reason, "client": _stream_client_label(heir)},
+            )
+            continue
         if session.get("close_on_disconnect"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
@@ -1213,10 +1255,217 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
+        if sid:
+            # Multi-client fan-out: every peer attached to THIS session gets
+            # the frame, in one shared order, with a seq stamp it can replay
+            # from. Returns None when no peer is attached, in which case the
+            # historical single-transport route below still applies (stdio
+            # Ink, tests, and any session created before a client attached).
+            delivered = _session_streams.deliver(sid, obj)
+            if delivered is not None:
+                _note_stream_activity(sid, obj)
+                return delivered
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
             return t.write(obj)
 
     return (current_transport() or _stdio_transport).write(obj)
+
+
+# ── Durable multi-client session streaming ───────────────────────────
+#
+# One Hermes session can be open on Desktop and on mobile at the same time.
+# The registry below fans every session-scoped event out to all attached
+# peers in one order, while ownership (who may MUTATE the session) stays
+# single-holder and is mirrored into the legacy ``session["transport"]``
+# slot so every existing liveness / orphan-reap / eviction rule is unchanged.
+_session_streams = SessionStreamRegistry()
+_request_ledger = RequestLedger()
+
+
+def request_ledger() -> RequestLedger:
+    """Process-wide request ledger (execute-once + queryable status)."""
+    return _request_ledger
+
+
+def session_streams() -> SessionStreamRegistry:
+    """Process-wide session fan-out registry."""
+    return _session_streams
+
+
+def reset_session_streams() -> None:
+    """Drop all stream/ledger state. Test hook and shutdown helper."""
+    _session_streams.clear()
+    _request_ledger.clear()
+
+
+def _stream_client_label(transport: Any) -> str:
+    peer = getattr(transport, "_peer", None)
+    return str(peer) if peer else type(transport).__name__
+
+
+def subscribe_session(
+    sid: str,
+    transport: Any,
+    *,
+    owner: bool = False,
+    force: bool = False,
+    explicit: bool = False,
+) -> bool:
+    """Attach ``transport`` to session ``sid``. Returns True when it owns it.
+
+    A live owner is never displaced silently: a second client asking for
+    ownership becomes a read-only viewer unless the current owner's socket is
+    dead/detached (reconnect) or ``force`` is set (explicit handoff). The
+    winning owner is mirrored onto ``session["transport"]`` so the legacy
+    routing/liveness paths keep agreeing with the stream.
+
+    ``explicit`` records that the client attached through the durable-session
+    RPCs; see :class:`~tui_gateway.session_stream.Subscriber`.
+    """
+    if not sid or transport is None:
+        return False
+    session = _sessions.get(sid)
+    stream = _session_streams.ensure(
+        sid,
+        session_key=str((session or {}).get("session_key") or ""),
+        profile_key=str((session or {}).get("profile_home") or ""),
+    )
+    became_owner = stream.attach(
+        transport,
+        owner=owner,
+        force=force,
+        explicit=explicit,
+        client=_stream_client_label(transport),
+        is_dead=_transport_is_dead,
+    )
+    if became_owner and session is not None:
+        session["transport"] = transport
+    return became_owner
+
+
+def unsubscribe_session(sid: str, transport: Any) -> bool:
+    """Detach one client. Returns True when it had been the owner."""
+    stream = _session_streams.get(sid)
+    if stream is None:
+        return False
+    return stream.detach(transport)
+
+
+def session_owner(sid: str) -> Any:
+    stream = _session_streams.get(sid)
+    return stream.owner() if stream is not None else None
+
+
+def session_is_owned_by(sid: str, transport: Any) -> bool:
+    """True when ``transport`` may mutate ``sid``.
+
+    Unrestricted for:
+
+    * sessions with no attached stream (stdio Ink, tests, in-process callers);
+    * a dead/detached owner — a reconnecting client must never be wedged out
+      of its own session by a socket the OS has not torn down yet;
+    * clients that never opted into the durable-session contract. Those keep
+      the historical "the newest client drives" behaviour, so a Desktop build
+      older than this change cannot be stranded behind an ownership error it
+      has no RPC to clear. They no longer *blank* the other device though —
+      the displaced peer stays attached and keeps receiving the stream.
+    """
+    stream = _session_streams.get(sid)
+    if stream is None or transport is None:
+        return True
+    owner = stream.owner()
+    if owner is None or owner is transport:
+        return True
+    if _transport_is_dead(owner):
+        return True
+    return not stream.is_explicit(transport)
+
+
+def _require_session_owner(rid, sid: str) -> dict | None:
+    """Return an error frame when the calling client may not drive ``sid``.
+
+    Two devices may WATCH a session; exactly one drives it. A viewer that
+    tries to steer/redirect/interrupt is told to claim ownership first rather
+    than racing the owner into an interleaved turn.
+    """
+    if session_is_owned_by(sid, current_transport()):
+        return None
+    return _err(
+        rid, 4092,
+        "session is owned by another client — call session.claim to take over",
+    )
+
+
+def _settle_request_response(sid: str, request_id: str, resp: dict) -> dict:
+    """Settle a ledger record from an immediate ``prompt.submit`` response.
+
+    An error settles the request straight away (a retry then replays the same
+    error instead of executing). A prompt that was *queued* stays ``running``:
+    its turn has not started yet, so the drain arms it and the eventual
+    terminal event settles it. A prompt that was redirected/steered into the
+    live turn is already applied, so it settles here — re-sending it must not
+    inject the text a second time.
+    """
+    if not request_id or not isinstance(resp, dict):
+        return resp
+    if (err := resp.get("error")):
+        _request_ledger.finish(sid, request_id, status="error", result=err)
+        return resp
+    status = str(((resp.get("result") or {}).get("status")) or "")
+    if status and status not in ("queued", "streaming", "started", "ok"):
+        _request_ledger.finish(sid, request_id, status=status, result=resp.get("result"))
+    return resp
+
+
+def _bind_creator_as_owner(sid: str) -> None:
+    """Register the creating client as the session's first owner.
+
+    Only real client transports join the fan-out; a standalone stdio/Ink
+    gateway keeps the historical single-transport route untouched (no stream,
+    no ``seq`` stamping, no ownership checks).
+    """
+    t = current_transport()
+    if t is None or t is _stdio_transport or t is _detached_ws_transport:
+        return
+    try:
+        subscribe_session(sid, t, owner=True)
+    except Exception:
+        logger.debug("session owner bind failed sid=%s", sid, exc_info=True)
+
+
+def begin_session_turn(sid: str, request_id: str | None = None) -> None:
+    """Arm a turn: re-enable exactly one terminal event for this session."""
+    stream = _session_streams.get(sid)
+    if stream is not None:
+        stream.begin_turn(request_id)
+
+
+def _note_stream_activity(sid: str, frame: dict) -> None:
+    """Keep the request ledger in step with the frames on the wire.
+
+    Any delivered frame refreshes the running request's clock (so a long,
+    actively-streaming turn is never settled by the stall bound), and the
+    turn's single terminal frame settles the request — which is what makes a
+    reconnecting client's ``request.status`` return a real answer instead of
+    hanging.
+    """
+    stream = _session_streams.get(sid)
+    if stream is None:
+        return
+    request_id = stream.turn_request_id()
+    if not request_id:
+        return
+    params = frame.get("params") or {}
+    event_type = params.get("type")
+    if event_type not in TERMINAL_EVENT_TYPES:
+        _request_ledger.touch(sid, request_id)
+        return
+    payload = params.get("payload")
+    if event_type == "error":
+        status = "error"
+    else:
+        status = str((payload or {}).get("status") or "complete")
+    _request_ledger.finish(sid, request_id, status=status, result=payload)
 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
@@ -1791,7 +2040,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     threading.Thread(target=_build, daemon=True).start()
 
 
-def _rebind_ws_transport(session: dict | None) -> None:
+def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
     """Upgrade a stdio-parked session to the calling WS transport.
 
     When a websocket drops mid-turn, ``handle_ws`` points every session it
@@ -1809,14 +2058,36 @@ def _rebind_ws_transport(session: dict | None) -> None:
     t = current_transport()
     if t is None or t is _stdio_transport:
         return
-    if session.get("transport") is _stdio_transport:
-        session["transport"] = t
+    sid = sid or str(session.get("_sid") or "") or _sid_for_session(session)
+    if session.get("transport") in (_stdio_transport, _detached_ws_transport):
+        # No live owner — the returning client takes the session back and the
+        # fan-out registry is updated in the same step so both agree.
+        if sid:
+            subscribe_session(sid, t, owner=True)
+        else:
+            session["transport"] = t
+        return
+    # A live owner exists: attach as a viewer so this peer still sees the
+    # stream. Ownership is unchanged — stealing it here is what blanked the
+    # other device mid-turn.
+    if sid:
+        subscribe_session(sid, t)
+
+
+def _sid_for_session(session: dict) -> str:
+    """Reverse-lookup a session's live id. Cheap: the registry is tiny."""
+    with _sessions_lock:
+        for sid, candidate in _sessions.items():
+            if candidate is session:
+                return sid
+    return ""
 
 
 def _sess_nowait(params, rid):
-    s = _sessions.get(params.get("session_id") or "")
+    sid = params.get("session_id") or ""
+    s = _sessions.get(sid)
     if s is not None:
-        _rebind_ws_transport(s)
+        _rebind_ws_transport(s, sid)
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
@@ -5596,6 +5867,7 @@ def _init_session(
             except Exception:
                 logger.debug("failed to persist resumed session cwd", exc_info=True)
     _register_session_cwd(_sessions[sid])
+    _bind_creator_as_owner(sid)
     try:
         _attach_worker(
             sid,
@@ -6265,8 +6537,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return False
         session["queued_prompt"] = None
         session["running"] = True
-        if queued.get("transport") is not None:
+        if queued.get("transport") is not None and _session_streams.get(sid) is None:
             session["transport"] = queued["transport"]
+    if queued.get("transport") is not None and _session_streams.get(sid) is not None:
+        # Fan-out sessions re-attach through the registry so the queuing client
+        # never displaces a live owner (the other device may be driving now).
+        subscribe_session(sid, queued["transport"], owner=True)
+    # Arm the drained turn with the request id that accepted it, so its
+    # terminal event settles the right ledger record (the client that queued
+    # the prompt may have reconnected since and be polling request.status).
+    begin_session_turn(sid, session.pop("_queued_request_id", None))
     try:
         if _session_uses_compute_host(session):
             resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
@@ -6442,6 +6722,7 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+    _bind_creator_as_owner(sid)
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -6712,6 +6993,7 @@ def _claim_or_reuse_live(
         with _sessions_lock:
             _sessions[sid] = record
             _register_session_cwd(_sessions[sid])
+    _bind_creator_as_owner(sid)
     return None
 
 
@@ -7326,11 +7608,16 @@ def _live_session_payload(
     touch: bool = False,
     transport: Transport | None = None,
 ) -> dict:
+    if transport is not None:
+        # Attach the resuming client to the fan-out. It takes ownership only
+        # when nobody live holds it (reconnect); otherwise it joins as a viewer
+        # so the device that already owns the session keeps streaming. Done
+        # outside history_lock: subscribe_session touches the stream registry,
+        # never this session's history.
+        subscribe_session(sid, transport, owner=True)
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
@@ -7396,6 +7683,156 @@ def _(rid, params: dict) -> dict:
         if not session.get("_finalized")
     ]
     return _ok(rid, {"sessions": rows})
+
+
+# ── Methods: durable multi-client session ────────────────────────────
+#
+# Desktop and mobile can hold ONE session open together. These four methods
+# are the whole contract:
+#
+#   session.subscribe  attach this client to a session's live stream
+#   session.claim      take over the right to drive the session (handoff)
+#   session.replay     fetch the frames missed while disconnected
+#   request.status     ask what happened to a submitted request id
+#
+# Everything else about the session (history, prompts, tools) is unchanged.
+
+
+@method("session.subscribe")
+def _(rid, params: dict) -> dict:
+    """Attach this client to a session's event stream.
+
+    ``owner: true`` asks to drive it as well; the request is granted only when
+    no live client currently owns it (that is the reconnect case). Otherwise
+    the caller joins as a read-only viewer and still receives every delta and
+    the single terminal event, in the same order as the owner.
+    """
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4005, "session.subscribe requires a client transport")
+    owner = subscribe_session(
+        sid, transport, owner=bool(params.get("owner")), explicit=True
+    )
+    stream = _session_streams.get(sid)
+    return _ok(rid, {
+        "session_id": sid,
+        "session_key": _session_lookup_key(session, fallback=sid),
+        "owner": owner,
+        "seq": stream.latest_seq() if stream is not None else 0,
+        "running": bool(session.get("running")),
+        "clients": stream.clients() if stream is not None else [],
+    })
+
+
+@method("session.unsubscribe")
+def _(rid, params: dict) -> dict:
+    """Detach this client from a session's stream without closing it."""
+    sid = str(params.get("session_id") or "")
+    transport = current_transport()
+    was_owner = unsubscribe_session(sid, transport) if transport is not None else False
+    if was_owner:
+        # Explicit release: hand the session to whoever is still watching so a
+        # deliberate handoff settles immediately rather than via the reaper.
+        stream = _session_streams.get(sid)
+        heir = stream.promote_next_owner() if stream is not None else None
+        session = _sessions.get(sid)
+        if heir is not None and session is not None:
+            session["transport"] = heir
+            _emit("session.owner_changed", sid,
+                  {"reason": "released", "client": _stream_client_label(heir)})
+    return _ok(rid, {"session_id": sid, "released_ownership": was_owner})
+
+
+@method("session.claim")
+def _(rid, params: dict) -> dict:
+    """Take over the right to drive a session (explicit device handoff).
+
+    Unlike ``session.subscribe``, this displaces a live owner — the user asked
+    for it on this device. The previous owner stays attached as a viewer and is
+    told through ``session.owner_changed``, so its stream never goes dark.
+    """
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4005, "session.claim requires a client transport")
+    owner = subscribe_session(sid, transport, owner=True, force=True, explicit=True)
+    if owner:
+        _emit("session.owner_changed", sid,
+              {"reason": "claimed", "client": _stream_client_label(transport)})
+    stream = _session_streams.get(sid)
+    return _ok(rid, {
+        "session_id": sid,
+        "owner": owner,
+        "seq": stream.latest_seq() if stream is not None else 0,
+        "running": bool(session.get("running")),
+    })
+
+
+@method("session.replay")
+def _(rid, params: dict) -> dict:
+    """Return the session frames newer than ``after_seq``.
+
+    This is how a client that dropped its socket mid-turn catches up without
+    re-rendering the whole conversation. ``truncated: true`` means the missed
+    span has aged out of the ring and the client must do a full
+    ``session.resume`` instead of stitching a gap.
+    """
+    sid = str(params.get("session_id") or "")
+    _, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    try:
+        after_seq = int(params.get("after_seq") or 0)
+    except (TypeError, ValueError):
+        return _err(rid, 4004, "after_seq must be an integer")
+    stream = _session_streams.get(sid)
+    if stream is None:
+        return _ok(rid, {"session_id": sid, "frames": [], "truncated": False, "seq": 0})
+    frames, truncated, latest = stream.replay_since(max(0, after_seq))
+    return _ok(rid, {
+        "session_id": sid,
+        "frames": frames,
+        "truncated": truncated,
+        "seq": latest,
+    })
+
+
+@method("request.status")
+def _(rid, params: dict) -> dict:
+    """Report what happened to a ``prompt.submit`` request id.
+
+    Answers ``running`` / ``complete`` / ``error`` / ``stalled`` / a busy
+    disposition, plus the terminal payload once there is one. A request that
+    stops producing output settles as ``stalled`` within a bounded window, so
+    this never leaves a reconnected client waiting forever.
+    """
+    sid = str(params.get("session_id") or "")
+    request_id = str(params.get("request_id") or "")
+    if not sid or not request_id:
+        return _err(rid, 4006, "session_id and request_id required")
+    record = _request_ledger.status(sid, request_id)
+    if record is None:
+        return _ok(rid, {
+            "session_id": sid,
+            "request_id": request_id,
+            "status": "unknown",
+            "result": None,
+        })
+    return _ok(rid, {
+        "session_id": sid,
+        "request_id": request_id,
+        "status": record["status"],
+        "result": record["result"],
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+    })
 
 
 @method("session.activate")
@@ -9801,6 +10238,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
+    if (owner_err := _require_session_owner(rid, str(params.get("session_id") or ""))):
+        return owner_err
     # Keypress barge-in: stopping the turn also silences its streaming TTS
     # (voice is process-global, so no per-session scoping is needed).
     _tts_stream_stop()
@@ -10110,6 +10549,8 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    if (owner_err := _require_session_owner(rid, str(params.get("session_id") or ""))):
+        return owner_err
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -10136,6 +10577,8 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    if (owner_err := _require_session_owner(rid, str(params.get("session_id") or ""))):
+        return owner_err
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -10200,11 +10643,55 @@ def _(rid, params: dict) -> dict:
         return err
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
-    # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+
+    # ── Only the session owner mutates ──────────────────────────────
+    # Two devices can WATCH one session, but exactly one drives it. A viewer
+    # that submits is told to claim first (session.claim) rather than silently
+    # racing the owner into an interleaved transcript. Sessions with no
+    # attached stream (stdio Ink, in-process callers) are unrestricted.
+    t = current_transport()
+    if not session_is_owned_by(sid, t):
+        return _err(
+            rid, 4092,
+            "session is owned by another client — call session.claim to take over",
+        )
+    if t is not None:
+        # Re-bind to the current client transport for this request. This keeps
+        # streaming events on the active websocket even if an earlier
+        # disconnect or fallback moved the session transport to stdio. The
+        # guard above already established that this client is entitled to
+        # drive the session, so taking ownership here is safe — and the peer
+        # it displaces stays attached to the fan-out instead of going dark.
+        if _session_streams.get(sid) is not None:
+            subscribe_session(sid, t, owner=True, force=True)
+        else:
+            session["transport"] = t
+
+    # ── Execute-once on retry ───────────────────────────────────────
+    # A client that reconnects mid-turn resubmits with the same request_id.
+    # The ledger answers "already running / already finished" instead of
+    # running the turn a second time, and rejects an id reused for different
+    # text. No request_id (legacy clients) keeps the historical behaviour.
+    request_id = params.get("request_id")
+    request_id = str(request_id) if request_id not in (None, "") else ""
+    if request_id:
+        outcome = _request_ledger.begin(
+            sid, request_id, fingerprint_prompt(text, (truncate_user_ordinal,))
+        )
+        if outcome.outcome == "conflict":
+            return _err(
+                rid, 4094,
+                "request_id already used for a different prompt in this session",
+            )
+        if outcome.outcome == "duplicate":
+            record = outcome.record
+            return _ok(rid, {
+                "status": "duplicate",
+                "request_id": request_id,
+                "request_status": record["status"],
+                "result": record["result"],
+            })
+
     while True:
         busy_transport = None
         with session["history_lock"]:
@@ -10218,7 +10705,12 @@ def _(rid, params: dict) -> dict:
                 break
         busy_response = _handle_busy_submit(rid, sid, session, text, busy_transport)
         if busy_response is not None:
-            return busy_response
+            if request_id and ((busy_response.get("result") or {}).get("status")) == "queued":
+                # The accepted-but-not-yet-running prompt carries its request id
+                # to the drain so the turn it eventually starts settles the
+                # right ledger record.
+                session["_queued_request_id"] = request_id
+            return _settle_request_response(sid, request_id, busy_response)
         # The old turn finished between the two lock acquisitions. Retry the
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
@@ -10230,13 +10722,19 @@ def _(rid, params: dict) -> dict:
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
-            return _err(rid, 4009, "subagent still running — wait for it to finish")
+            return _settle_request_response(
+                sid, request_id,
+                _err(rid, 4009, "subagent still running — wait for it to finish"),
+            )
         truncated = None
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
             except (TypeError, ValueError):
-                return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
+                return _settle_request_response(
+                    sid, request_id,
+                    _err(rid, 4004, "truncate_before_user_ordinal must be an integer"),
+                )
             history = session.get("history", [])
             user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
             # Reject out-of-range ordinals on BOTH ends. A negative value would
@@ -10245,14 +10743,20 @@ def _(rid, params: dict) -> dict:
             # truncating history to everything before it and persisting that loss
             # via replace_messages — an unrecoverable overwrite of the session DB.
             if ordinal < 0 or ordinal >= len(user_indices):
-                return _err(rid, 4018, "target user message is no longer in session history")
+                return _settle_request_response(
+                    sid, request_id,
+                    _err(rid, 4018, "target user message is no longer in session history"),
+                )
             truncated = history[: user_indices[ordinal]]
 
         # This claim and the updater's idle claim use the same cross-process
         # lock. Acquire before mutating history or acknowledging the prompt, so
         # a submitted message is either fully protected or cleanly retryable.
         if not _claim_update_turn(session):
-            return _err(rid, 4091, "Hermes is applying an update; retry shortly")
+            return _settle_request_response(
+                sid, request_id,
+                _err(rid, 4091, "Hermes is applying an update; retry shortly"),
+            )
 
         if truncated is not None:
             session["history"] = truncated
@@ -10267,10 +10771,15 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
+    # Arm the turn on the fan-out: re-enables exactly one terminal event for
+    # every attached client and binds this request id to that terminal, which
+    # is what settles the ledger record.
+    begin_session_turn(sid, request_id or None)
+
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
         if not isolated_response.get("error"):
-            return isolated_response
+            return _settle_request_response(sid, request_id, isolated_response)
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
             sid,
@@ -10289,7 +10798,9 @@ def _(rid, params: dict) -> dict:
             session["running"] = False
             _clear_inflight_turn(session)
         _release_update_turn_if_idle(session)
-        return _err(rid, 5032, f"agent initialization failed: {exc}")
+        return _settle_request_response(
+            sid, request_id, _err(rid, 5032, f"agent initialization failed: {exc}")
+        )
 
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
@@ -10331,8 +10842,13 @@ def _(rid, params: dict) -> dict:
             session["running"] = False
             _clear_inflight_turn(session)
         _release_update_turn_if_idle(session)
-        return _err(rid, 5032, f"turn start failed: {exc}")
-    return _ok(rid, {"status": "streaming"})
+        return _settle_request_response(
+            sid, request_id, _err(rid, 5032, f"turn start failed: {exc}")
+        )
+    result = {"status": "streaming"}
+    if request_id:
+        result["request_id"] = request_id
+    return _ok(rid, result)
 
 
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
