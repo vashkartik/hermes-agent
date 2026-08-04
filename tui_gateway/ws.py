@@ -221,6 +221,13 @@ class WSTransport:
             self._subscribed_session_id = session_id
             return True
 
+    def claim_session_if_live(self, claim_owner: Callable[[], bool]) -> bool:
+        """Commit session ownership only while this socket remains live."""
+        with self._subscription_lock:
+            if self._closed:
+                return False
+            return bool(claim_owner())
+
     def observes_session(self, session_id: str) -> bool:
         with self._subscription_lock:
             return self._subscribed_session_id == session_id

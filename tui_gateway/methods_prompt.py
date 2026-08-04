@@ -142,10 +142,12 @@ def _(rid, params: dict) -> dict:
         # disconnect or fallback moved the session transport to stdio. The
         # guard above already established that this client may drive the
         # session; the peer it displaces stays attached to the fan-out.
-        if _session_streams.get(sid) is not None:
-            subscribe_session(sid, t, owner=True, force=True)
-        else:
-            session["transport"] = t
+        _claim_prompt_transport(
+            sid,
+            session,
+            t,
+            allow_legacy_takeover=True,
+        )
 
     # ── Execute-once on retry ───────────────────────────────────────
     # A client that reconnects mid-turn resubmits with the same request_id

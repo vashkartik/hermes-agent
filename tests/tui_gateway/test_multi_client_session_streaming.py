@@ -672,6 +672,223 @@ def test_send_failure_cleans_owner_claim_that_won_subscription_lock(
         loop.close()
 
 
+def test_send_failure_before_prompt_claim_cannot_reinstall_dead_owner(
+    monkeypatch,
+) -> None:
+    sid = "send-failure-before-prompt-claim"
+    prompt_reached_claim = threading.Event()
+    release_prompt = threading.Event()
+    cleanup_done = threading.Event()
+    cleanup_results: list[tuple[int, int]] = []
+    responses: list[dict] = []
+
+    class FailingWS:
+        async def send_text(self, _line: str) -> None:
+            raise RuntimeError("socket gone")
+
+    loop = asyncio.new_event_loop()
+    transport = ws_mod.WSTransport(FailingWS(), loop, peer="prompt-claim-race-test")
+    previous_owner = RecordingTransport()
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "transport": previous_owner,
+    }
+    original_cleanup = server._close_sessions_for_transport
+
+    def record_cleanup(owner, *, end_reason="ws_disconnect"):
+        result = original_cleanup(owner, end_reason=end_reason)
+        cleanup_results.append(result)
+        cleanup_done.set()
+        return result
+
+    def pause_before_prompt_claim(_session, _cfg=None) -> bool:
+        prompt_reached_claim.set()
+        assert release_prompt.wait(timeout=3)
+        return False
+
+    def submit_prompt() -> None:
+        token = server.bind_transport(transport)
+        try:
+            responses.append(
+                server.handle_request(
+                    {
+                        "id": "prompt-race",
+                        "method": "prompt.submit",
+                        "params": {"session_id": sid, "text": "hello"},
+                    }
+                )
+            )
+        finally:
+            server.reset_transport(token)
+
+    monkeypatch.setattr(server, "_close_sessions_for_transport", record_cleanup)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", pause_before_prompt_claim)
+    monkeypatch.setattr(
+        server,
+        "_handle_busy_submit",
+        lambda rid, *_args: server._ok(rid, {"status": "queued"}),
+    )
+    server._sessions[sid] = session
+    prompt_thread = threading.Thread(target=submit_prompt)
+    try:
+        prompt_thread.start()
+        assert prompt_reached_claim.wait(timeout=3)
+        asyncio.run(transport._safe_send_many(["frame"]))
+        assert cleanup_done.wait(timeout=3)
+        assert cleanup_results == [(0, 0)]
+
+        release_prompt.set()
+        prompt_thread.join(timeout=3)
+        assert not prompt_thread.is_alive()
+
+        assert responses[0]["result"]["status"] == "queued"
+        assert session["transport"] is previous_owner
+        assert transport._closed
+    finally:
+        release_prompt.set()
+        prompt_thread.join(timeout=3)
+        transport.close()
+        server._sessions.pop(sid, None)
+        loop.close()
+
+
+def test_send_failure_before_queued_drain_preserves_live_successor(
+    monkeypatch,
+) -> None:
+    sid = "send-failure-before-queued-drain"
+    ran_prompt: list[str] = []
+    claim_saw_unlocked_history: list[bool] = []
+    history_lock = threading.Lock()
+
+    class FailingWS:
+        async def send_text(self, _line: str) -> None:
+            raise RuntimeError("socket gone")
+
+    class CoordinatedTransport(ws_mod.WSTransport):
+        def claim_session_if_live(self, claim_owner) -> bool:
+            acquired = history_lock.acquire(blocking=False)
+            claim_saw_unlocked_history.append(acquired)
+            if acquired:
+                history_lock.release()
+            return super().claim_session_if_live(claim_owner)
+
+    loop = asyncio.new_event_loop()
+    failed = CoordinatedTransport(FailingWS(), loop, peer="queued-drain-race-test")
+    successor = RecordingTransport()
+    successor.subscribe_session(sid)
+    session = {
+        "close_on_disconnect": False,
+        "history_lock": history_lock,
+        "queued_prompt": {"text": "run queued", "transport": failed},
+        "running": False,
+        "transport": failed,
+    }
+
+    def run_prompt(_rid, prompt_sid, _session, text, **_kwargs) -> None:
+        ran_prompt.append(text)
+        server._emit("message.delta", prompt_sid, {"text": "first delta"})
+
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda _sid: None)
+    monkeypatch.setattr(server, "_claim_update_turn", lambda _session: True)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
+    server._sessions[sid] = session
+    server.register_live_transport(failed)
+    server.register_live_transport(successor)
+    try:
+        asyncio.run(failed._safe_send_many(["frame"]))
+        deadline = time.monotonic() + 3
+        while session["transport"] is failed:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert session["transport"] is successor
+
+        # Ownership is already committed. Remove the successor from observer
+        # fan-out so the first delta proves direct owner routing after drain.
+        server.unregister_live_transport(successor)
+        assert server._drain_queued_prompt("queued-race", sid, session)
+
+        assert ran_prompt == ["run queued"]
+        assert claim_saw_unlocked_history == [True]
+        assert session["running"] is True
+        assert session["transport"] is successor
+        assert [frame["params"]["type"] for frame in successor.frames] == [
+            "message.delta"
+        ]
+    finally:
+        server.unregister_live_transport(failed)
+        server.unregister_live_transport(successor)
+        failed.close()
+        server._sessions.pop(sid, None)
+        loop.close()
+
+
+def test_live_prompt_claim_routes_its_first_delta_to_the_submitting_socket(
+    monkeypatch,
+) -> None:
+    sid = "live-prompt-first-delta"
+    delta_emitted = threading.Event()
+
+    class RecordingWS(ws_mod.WSTransport):
+        def __init__(self, loop) -> None:
+            super().__init__(object(), loop, peer="live-prompt-delta-test")
+            self.frames: list[dict] = []
+
+        def write(self, obj: dict) -> bool:
+            self.frames.append(obj)
+            return True
+
+    loop = asyncio.new_event_loop()
+    transport = RecordingWS(loop)
+    previous_owner = RecordingTransport()
+    session = {
+        "attached_images": [],
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "session_key": "live-prompt-session-key",
+        "transport": previous_owner,
+    }
+
+    def run_prompt(_rid, prompt_sid, _session, _text, **_kwargs) -> None:
+        server._emit("message.delta", prompt_sid, {"text": "first delta"})
+        delta_emitted.set()
+
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_claim_update_turn", lambda _session: True)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
+    server._sessions[sid] = session
+    token = server.bind_transport(transport)
+    try:
+        response = server.handle_request(
+            {
+                "id": "live-prompt",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "hello"},
+            }
+        )
+        assert response["result"]["status"] == "streaming"
+        assert delta_emitted.wait(timeout=3)
+
+        assert session["transport"] is transport
+        assert [frame["params"]["type"] for frame in transport.frames] == [
+            "message.delta"
+        ]
+    finally:
+        server.reset_transport(token)
+        transport.close()
+        server._sessions.pop(sid, None)
+        loop.close()
+
+
 def test_failed_newer_attach_does_not_invalidate_older_cold_resume(monkeypatch) -> None:
     response_attempted = threading.Event()
 

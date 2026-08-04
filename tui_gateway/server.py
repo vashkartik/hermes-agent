@@ -2858,6 +2858,56 @@ def _sid_for_session(session: dict) -> str:
     return ""
 
 
+def _claim_prompt_transport(
+    sid: str,
+    session: dict,
+    transport: Transport,
+    *,
+    allow_legacy_takeover: bool = False,
+) -> bool:
+    """Rebind prompt ownership without reviving a closed or stale client."""
+
+    def assign_owner() -> bool:
+        with _sessions_lock:
+            if _sessions.get(sid) is not session or session.get("_finalized"):
+                return False
+            stream = _session_streams.get(sid)
+            if stream is None:
+                session["transport"] = transport
+                return True
+            # Durable clients may only retain ownership they still hold. A
+            # legacy client has no session.claim RPC, so prompt.submit keeps
+            # the newer base's compatibility takeover while queued drains do
+            # not displace a successor that already owns the session.
+            force = allow_legacy_takeover and not stream.is_explicit(transport)
+            if not force and not session_is_owned_by(sid, transport):
+                return False
+            return subscribe_session(sid, transport, owner=True, force=force)
+
+    claim_if_live = getattr(transport, "claim_session_if_live", None)
+    if callable(claim_if_live):
+        return bool(claim_if_live(assign_owner))
+    if _transport_is_dead(transport):
+        return False
+    # Non-WS transports have no lifecycle lock. Preserve their historical
+    # assignment semantics while rejecting known-dead or conflicting owners.
+    with _sessions_lock:
+        authoritative = _sessions.get(sid)
+        if (
+            (authoritative is not None and authoritative is not session)
+            or session.get("_finalized")
+        ):
+            return False
+        stream = _session_streams.get(sid)
+        if stream is None:
+            session["transport"] = transport
+            return True
+        force = allow_legacy_takeover and not stream.is_explicit(transport)
+        if not force and not session_is_owned_by(sid, transport):
+            return False
+        return subscribe_session(sid, transport, owner=True, force=force)
+
+
 def _sess_nowait(params, rid):
     sid = params.get("session_id") or ""
     s = _sessions.get(sid)
@@ -8181,6 +8231,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    queued_transport = None
     with session["history_lock"]:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
@@ -8196,12 +8247,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None and _session_streams.get(sid) is None:
-            session["transport"] = queued["transport"]
-    if queued.get("transport") is not None and _session_streams.get(sid) is not None:
-        # Fan-out sessions re-attach through the registry so the queuing client
-        # never displaces a live owner (the other device may be driving now).
-        subscribe_session(sid, queued["transport"], owner=True)
+        queued_transport = queued.get("transport")
+    if queued_transport is not None:
+        # Claim under the transport's lifecycle lock, but never displace a
+        # successor that took ownership while this prompt was queued.
+        _claim_prompt_transport(sid, session, queued_transport)
     # Arm the drained turn with the request id that accepted it, so its
     # terminal event settles the right ledger record (the client that queued
     # the prompt may have reconnected since and be polling request.status).
