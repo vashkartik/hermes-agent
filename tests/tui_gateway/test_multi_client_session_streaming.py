@@ -1273,6 +1273,92 @@ def test_newer_switch_parks_unwatched_stale_resume_for_the_reaper(
         loop.close()
 
 
+def test_prompt_submit_rejects_claim_lost_after_ownership_precheck(monkeypatch) -> None:
+    """Ownership moving between the pre-check and the atomic claim fails the
+    submit instead of interleaving two drivers into one transcript."""
+    sid = "prompt-claim-race"
+    owner = RecordingTransport()
+    challenger = RecordingTransport()
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "session_key": sid,
+        "transport": owner,
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    try:
+        assert server.subscribe_session(sid, owner, owner=True, explicit=True)
+        server.subscribe_session(sid, challenger, explicit=True)
+        # Simulate the pre-check reading stale ownership (the other device's
+        # claim lands right after it); the atomic claim must still refuse.
+        monkeypatch.setattr(server, "session_is_owned_by", lambda *_a, **_k: True)
+        response = server.dispatch(
+            {
+                "id": "prompt-claim",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "hello"},
+            },
+            challenger,
+        )
+        assert response is not None and response["error"]["code"] == 4092
+        assert session["transport"] is owner
+        assert server.session_owner(sid) is owner
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_sole_owner_unsubscribe_stops_private_routing_and_parks(monkeypatch) -> None:
+    """An explicit unsubscribe is a full release: the legacy transport slot and
+    the socket's own subscription must stop pointing at the session, so no
+    later private frame reaches the departed client."""
+    loop = asyncio.new_event_loop()
+    client = _RecordingWS(object(), loop, peer="unsubscribe-release-test")
+    scheduled_reaps: list[str] = []
+    sid = "unsubscribe-sole-owner"
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+        "session_key": sid,
+        "transport": client,
+    }
+    server._sessions[sid] = session
+    server.register_live_transport(client)
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled_reaps.append)
+    try:
+        assert server.subscribe_session(sid, client, owner=True, explicit=True)
+        client.subscribe_session(sid)
+        response = server.dispatch(
+            {
+                "id": "unsub",
+                "method": "session.unsubscribe",
+                "params": {"session_id": sid},
+            },
+            client,
+        )
+        assert response is not None
+        assert response["result"]["released_ownership"] is True
+        assert session["transport"] is server._detached_ws_transport
+        assert scheduled_reaps == [sid]
+        assert not client.observes_session(sid)
+
+        frames_before = len(client.frames)
+        server.write_json(
+            server._event_frame("message.delta", sid, {"text": "private"})
+        )
+        assert not any(
+            frame.get("method") == "event"
+            and (frame.get("params") or {}).get("session_id") == sid
+            for frame in client.frames[frames_before:]
+        )
+    finally:
+        server.unregister_live_transport(client)
+        client.close()
+        server._sessions.pop(sid, None)
+        loop.close()
+
+
 def test_orphan_reap_rearms_while_parked_session_is_running(monkeypatch) -> None:
     """A parked record protected by in-flight work keeps its reap timer.
 

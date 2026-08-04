@@ -2401,29 +2401,34 @@ def _schedule_rejected_deferred_subscription(sid: str) -> None:
 
 
 def _release_stale_session_attachment(
-    previous_sid: str, transport: Transport
-) -> Callable[[], None] | None:
-    """Close ``transport``'s attachment to the session it is switching from.
+    previous_sid: str,
+    transport: Transport,
+    *,
+    reason: str = "session_switch",
+) -> tuple[bool, Callable[[], None] | None]:
+    """Close ``transport``'s attachment to the session it is leaving.
 
     A socket observes exactly one session; when an attach RPC commits a newer
-    one, the old stream must not keep this client in its fan-out — the owner
-    slot writes through the ungated ``write`` path, so a stale owner keeps
-    receiving the abandoned session's private frames. Mirrors the disconnect
-    policy scoped to one session: a watching peer inherits ownership, else the
-    record parks on the drop sentinel for the grace reaper (which skips
-    running/pending sessions, so a background turn survives the switch).
+    one (or the client explicitly unsubscribes), the old stream must not keep
+    this client in its fan-out — the owner slot writes through the ungated
+    ``write`` path, so a stale owner keeps receiving the abandoned session's
+    private frames. Mirrors the disconnect policy scoped to one session: a
+    watching peer inherits ownership, else the record parks on the drop
+    sentinel for the grace reaper (which rearms across running/pending work,
+    so a background turn survives).
 
-    Runs under ``_sessions_lock`` (and the committing transport's subscription
-    lock). The returned callable carries the emit/reap side effects and must be
-    invoked only after those locks are released.
+    Runs under ``_sessions_lock`` (and, on the switch path, the committing
+    transport's subscription lock). Returns ``(was_owner, deferred)``; the
+    deferred callable carries the emit/reap side effects and must be invoked
+    only after those locks are released.
     """
     stream = _session_streams.get(previous_sid)
     was_owner = bool(stream.detach(transport)) if stream is not None else False
     session = _sessions.get(previous_sid)
     if session is None or session.get("_finalized"):
-        return None
+        return was_owner, None
     if not was_owner and session.get("transport") is not transport:
-        return None
+        return was_owner, None
     heir = None
     if was_owner and stream is not None:
         try:
@@ -2441,10 +2446,10 @@ def _release_stale_session_attachment(
             _emit(
                 "session.owner_changed",
                 previous_sid,
-                {"reason": "session_switch", "client": _stream_client_label(heir)},
+                {"reason": reason, "client": _stream_client_label(heir)},
             )
 
-        return _announce
+        return was_owner, _announce
     if session.get("transport") is transport:
         session["transport"] = _detached_ws_transport
 
@@ -2454,8 +2459,8 @@ def _release_stale_session_attachment(
             except Exception:
                 pass
 
-        return _reap
-    return None
+        return was_owner, _reap
+    return was_owner, None
 
 
 def _record_transport_subscription(
@@ -2504,7 +2509,7 @@ def _record_transport_subscription(
                 # callers) still commits the subscription move, so the stale
                 # release below applies either way.
                 if previous_sid and previous_sid != sid:
-                    deferred = _release_stale_session_attachment(
+                    _, deferred = _release_stale_session_attachment(
                         previous_sid, transport
                     )
                     if deferred is not None:
@@ -8921,20 +8926,27 @@ def _(rid, params: dict) -> dict:
 
 @method("session.unsubscribe")
 def _(rid, params: dict) -> dict:
-    """Detach this client from a session's stream without closing it."""
+    """Detach this client from a session's stream without closing it.
+
+    A full release: the stream detach alone left the legacy transport slot
+    (and the socket's own subscription) pointing at this client, so a sole
+    owner that unsubscribed kept receiving the session's private frames
+    through the ungated fallback route. A watching peer inherits ownership;
+    with nobody left the record parks for the grace reaper.
+    """
     sid = str(params.get("session_id") or "")
     transport = current_transport()
-    was_owner = unsubscribe_session(sid, transport) if transport is not None else False
-    if was_owner:
-        # Explicit release: hand the session to whoever is still watching so a
-        # deliberate handoff settles immediately rather than via the reaper.
-        stream = _session_streams.get(sid)
-        heir = stream.promote_next_owner() if stream is not None else None
-        session = _sessions.get(sid)
-        if heir is not None and session is not None:
-            session["transport"] = heir
-            _emit("session.owner_changed", sid,
-                  {"reason": "released", "client": _stream_client_label(heir)})
+    if not sid or transport is None:
+        return _ok(rid, {"session_id": sid, "released_ownership": False})
+    with _sessions_lock:
+        was_owner, deferred = _release_stale_session_attachment(
+            sid, transport, reason="released"
+        )
+    clear_subscription = getattr(transport, "clear_session_subscription", None)
+    if callable(clear_subscription):
+        clear_subscription(sid)
+    if deferred is not None:
+        deferred()
     return _ok(rid, {"session_id": sid, "released_ownership": was_owner})
 
 

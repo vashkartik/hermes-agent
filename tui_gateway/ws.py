@@ -242,6 +242,20 @@ class WSTransport:
         with self._subscription_lock:
             return self._subscribed_session_id
 
+    def clear_session_subscription(self, session_id: str) -> bool:
+        """Drop the subscription if it still points at ``session_id``.
+
+        Bumps the committed generation so a stale in-flight attach commit
+        cannot resurrect a subscription the client explicitly released.
+        """
+        with self._subscription_lock:
+            if self._subscribed_session_id != session_id:
+                return False
+            self._subscription_next_generation += 1
+            self._subscription_committed_generation = self._subscription_next_generation
+            self._subscribed_session_id = None
+            return True
+
     def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
         """Queue ``obj`` only while this socket still observes ``session_id``.
 
