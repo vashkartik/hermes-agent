@@ -586,6 +586,92 @@ def test_close_serializes_with_an_inflight_subscription_claim() -> None:
         loop.close()
 
 
+def test_send_failure_cleans_owner_claim_that_won_subscription_lock(
+    monkeypatch,
+) -> None:
+    sid = "send-failure-claim-race"
+    claim_started = threading.Event()
+    failure_mark_attempted = threading.Event()
+    release_claim = threading.Event()
+    completion_result: list[bool] = []
+    owner_claimed: list[bool] = []
+    scheduled_reaps: list[str] = []
+
+    class FailingWS:
+        async def send_text(self, _line: str) -> None:
+            raise RuntimeError("socket gone")
+
+    class CoordinatedTransport(ws_mod.WSTransport):
+        def _mark_closed(self, *, schedule_owner_cleanup: bool) -> bool:
+            failure_mark_attempted.set()
+            return super()._mark_closed(
+                schedule_owner_cleanup=schedule_owner_cleanup
+            )
+
+    loop = asyncio.new_event_loop()
+    transport = CoordinatedTransport(FailingWS(), loop, peer="send-claim-race-test")
+    generation = transport.begin_session_subscription()
+    session = {
+        "close_on_disconnect": False,
+        "running": False,
+        "transport": RecordingTransport(),
+    }
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled_reaps.append)
+    server._sessions[sid] = session
+    server.register_live_transport(transport)
+
+    def claim_owner() -> bool:
+        claim_started.set()
+        assert release_claim.wait(timeout=3)
+        with server._sessions_lock:
+            session["transport"] = transport
+            owner_claimed.append(True)
+        return True
+
+    complete_thread = threading.Thread(
+        target=lambda: completion_result.append(
+            transport.complete_session_subscription(
+                generation,
+                sid,
+                claim_owner,
+            )
+        )
+    )
+    failure_thread = threading.Thread(
+        target=lambda: asyncio.run(transport._safe_send_many(["frame"]))
+    )
+    try:
+        complete_thread.start()
+        assert claim_started.wait(timeout=3)
+        failure_thread.start()
+        assert failure_mark_attempted.wait(timeout=3)
+        release_claim.set()
+        complete_thread.join(timeout=3)
+        failure_thread.join(timeout=3)
+        assert not complete_thread.is_alive()
+        assert not failure_thread.is_alive()
+
+        deadline = time.monotonic() + 3
+        while session["transport"] is transport:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        assert completion_result == [True]
+        assert owner_claimed == [True]
+        assert transport._closed
+        assert not transport.observes_session(sid)
+        assert session["transport"] is server._detached_ws_transport
+        assert scheduled_reaps == [sid]
+    finally:
+        release_claim.set()
+        complete_thread.join(timeout=3)
+        failure_thread.join(timeout=3)
+        server.unregister_live_transport(transport)
+        transport.close()
+        server._sessions.pop(sid, None)
+        loop.close()
+
+
 def test_failed_newer_attach_does_not_invalidate_older_cold_resume(monkeypatch) -> None:
     response_attempted = threading.Event()
 

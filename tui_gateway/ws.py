@@ -134,10 +134,61 @@ class WSTransport:
         self._observer_drain_armed = False
         self._observer_flush_handle: asyncio.TimerHandle | None = None
         self._observer_generation = 0
-        self._subscription_lock = threading.Lock()
+        # RLock permits a subscribed observer write to latch a failure after
+        # releasing _observer_lock while write_observer_if_subscribed still
+        # owns the subscription lock. No closed-state path nests observer ->
+        # subscription, preserving the subscription -> observer order.
+        self._subscription_lock = threading.RLock()
         self._subscribed_session_id: str | None = None
         self._subscription_next_generation = 0
         self._subscription_committed_generation = 0
+        self._owner_cleanup_scheduled = False
+
+    def _schedule_owner_cleanup(self) -> None:
+        """Detach/reap sessions claimed just before this transport failed."""
+
+        def cleanup() -> None:
+            try:
+                server._close_sessions_for_transport(
+                    self,
+                    end_reason="ws_transport_failure",
+                )
+            except Exception:
+                _log.debug(
+                    "ws failure owner cleanup failed peer=%s",
+                    self._peer,
+                    exc_info=True,
+                )
+
+        async def cleanup_off_loop() -> None:
+            await asyncio.to_thread(cleanup)
+
+        def enqueue() -> None:
+            self._loop.create_task(cleanup_off_loop())
+
+        try:
+            if self._loop.is_running():
+                self._loop.call_soon_threadsafe(enqueue)
+                return
+        except (AttributeError, RuntimeError):
+            pass
+        threading.Thread(target=cleanup, daemon=True).start()
+
+    def _mark_closed(self, *, schedule_owner_cleanup: bool) -> bool:
+        """Latch closed state and invalidate attachment state atomically."""
+        should_schedule_cleanup = False
+        with self._subscription_lock:
+            transitioned = not self._closed
+            if transitioned:
+                self._closed = True
+                self._subscription_next_generation += 1
+            self._subscribed_session_id = None
+            if schedule_owner_cleanup and not self._owner_cleanup_scheduled:
+                self._owner_cleanup_scheduled = True
+                should_schedule_cleanup = True
+        if should_schedule_cleanup:
+            self._schedule_owner_cleanup()
+        return transitioned
 
     def subscribe_session(self, session_id: str) -> None:
         """Replace this socket's live-session stream subscription."""
@@ -257,6 +308,7 @@ class WSTransport:
         # scheduled INSIDE the lock so the on-the-wire order matches the buffer
         # order even if the coalesce timer fires on the loop at the same moment.
         from agent.async_utils import safe_schedule_threadsafe
+        schedule_failed = False
         with self._token_lock:
             self._pending_tokens.append(line)
             batch = self._pending_tokens
@@ -269,8 +321,11 @@ class WSTransport:
                 self._safe_send_many(batch), self._loop
             )
             if fut is None:
-                self._closed = True
-                return False
+                schedule_failed = True
+
+        if schedule_failed:
+            self._mark_closed(schedule_owner_cleanup=True)
+            return False
 
         try:
             fut.result(timeout=_WS_WRITE_TIMEOUT_S)
@@ -289,7 +344,7 @@ class WSTransport:
             )
             return not self._closed
         except Exception as exc:
-            self._closed = True
+            self._mark_closed(schedule_owner_cleanup=True)
             _log.warning(
                 "ws write failed peer=%s error_type=%s error=%s",
                 self._peer, type(exc).__name__, exc,
@@ -320,7 +375,6 @@ class WSTransport:
                     self._observer_batches.clear()
                     self._observer_drain_armed = False
                     self._observer_generation += 1
-                    self._closed = True
                     overflowed = True
                 else:
                     self._observer_batches.append([line])
@@ -330,6 +384,8 @@ class WSTransport:
                 should_arm = True
 
         if overflowed:
+            # _observer_lock is released before taking _subscription_lock.
+            self._mark_closed(schedule_owner_cleanup=True)
             _log.warning(
                 "ws observer queue full peer=%s — closing for replay-capable reconnect",
                 self._peer,
@@ -346,7 +402,7 @@ class WSTransport:
             try:
                 self._loop.call_soon_threadsafe(self._arm_observer_drain)
             except RuntimeError:
-                self._closed = True
+                self._mark_closed(schedule_owner_cleanup=True)
                 return False
         return not self._closed
 
@@ -458,7 +514,7 @@ class WSTransport:
                 # Latch while still holding the writer lock so queued batches
                 # observe the failure before they get a chance to touch the
                 # socket.
-                self._closed = True
+                self._mark_closed(schedule_owner_cleanup=True)
                 _log.warning(
                     "ws send failed peer=%s error_type=%s error=%s",
                     self._peer, type(exc).__name__, exc,
@@ -469,10 +525,7 @@ class WSTransport:
         # attach completion. If completion wins, handle_ws's subsequent owner
         # cleanup sees the claim; if close wins, completion observes _closed
         # and cannot claim after cleanup has already snapshotted ownership.
-        with self._subscription_lock:
-            self._closed = True
-            self._subscription_next_generation += 1
-            self._subscribed_session_id = None
+        self._mark_closed(schedule_owner_cleanup=False)
         with self._observer_lock:
             self._observer_batches.clear()
             self._observer_generation += 1
