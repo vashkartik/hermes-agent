@@ -1273,6 +1273,49 @@ def test_newer_switch_parks_unwatched_stale_resume_for_the_reaper(
         loop.close()
 
 
+def test_orphan_reap_rearms_while_parked_session_is_running(monkeypatch) -> None:
+    """A parked record protected by in-flight work keeps its reap timer.
+
+    Switching away from a mid-turn session parks it with exactly one scheduled
+    reap; if that timer fired during the turn and never rearmed, the record
+    would linger until the multi-hour idle TTL once the turn ended."""
+    captured: list = []
+
+    class FakeTimer:
+        def __init__(self, _delay, fn) -> None:
+            self.daemon = False
+            captured.append(fn)
+
+        def start(self) -> None:
+            return None
+
+    sid = "parked-running-reap"
+    session = {
+        "transport": server._detached_ws_transport,
+        "running": True,
+        "history_lock": threading.Lock(),
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 1.0)
+    try:
+        server._schedule_ws_orphan_reap(sid)
+        assert len(captured) == 1
+
+        # Fires mid-turn: the record survives AND the timer is rearmed.
+        captured[0]()
+        assert sid in server._sessions
+        assert len(captured) == 2
+
+        # A revived session (live transport) stops the chain.
+        session["transport"] = RecordingTransport()
+        captured[1]()
+        assert sid in server._sessions
+        assert len(captured) == 2
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_observer_is_queued_before_a_stalled_owner_write() -> None:
     sid = "owner-stall"
     observed_at: list[float] = []

@@ -1099,8 +1099,21 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         with _session_resume_lock:
             current = _sessions.get(sid)
             if not _ws_session_is_orphaned(current):
-                return
-            if _session_has_active_delegations(sid, current):
+                if (
+                    current is not None
+                    and not current.get("_finalized")
+                    and current.get("transport") is _detached_ws_transport
+                ):
+                    # Still parked, but protected by a running turn or accepted
+                    # work. This timer is the record's only prompt collector —
+                    # returning without rearming would strand the session until
+                    # the multi-hour idle TTL once the work finishes (routine
+                    # for a client that switches away mid-turn). Keep watching.
+                    reschedule = True
+                else:
+                    # Revived by a live transport, or already finalized/popped.
+                    return
+            elif _session_has_active_delegations(sid, current):
                 reschedule = True
             else:
                 session = _pop_session_by_id(sid)
@@ -1157,13 +1170,35 @@ def _close_sessions_for_transport(
         except Exception:
             logger.debug("session stream owner promotion failed sid=%s", sid, exc_info=True)
         if heir is not None and not _transport_is_dead(heir):
-            session["transport"] = heir
-            _emit(
-                "session.owner_changed",
-                sid,
-                {"reason": end_reason, "client": _stream_client_label(heir)},
-            )
-            continue
+            claim_heir = getattr(heir, "promote_session_if_subscribed", None)
+            if callable(claim_heir):
+                # Validate + install atomically under the heir's subscription
+                # lock. A heir that switches sessions between promotion and
+                # install has already detached itself from this stream — it
+                # must not be re-installed as the ungated legacy owner.
+                def assign_heir() -> bool:
+                    with _sessions_lock:
+                        if (
+                            _sessions.get(sid) is session
+                            and session.get("transport") is transport
+                        ):
+                            session["transport"] = heir
+                            return True
+                    return False
+
+                installed = bool(claim_heir(sid, assign_heir))
+            else:
+                session["transport"] = heir
+                installed = True
+            if installed:
+                _emit(
+                    "session.owner_changed",
+                    sid,
+                    {"reason": end_reason, "client": _stream_client_label(heir)},
+                )
+                continue
+            # The promoted heir vanished mid-install (its own disconnect or a
+            # session switch); fall through to the successor scan / park policy.
         if session.get("close_on_disconnect"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
