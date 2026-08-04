@@ -23,8 +23,9 @@ import { useComposerQueue } from './use-composer-queue'
 
 const SESSION_KEY = 'stored-session-queue-hook'
 
-function renderQueueHook(overrides: { busy?: boolean } = {}) {
+function renderQueueHook(overrides: { busy?: boolean; onCancel?: () => void } = {}) {
   const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
+  const onCancel = overrides.onCancel ?? vi.fn()
   const queueEditRef: { current: QueueEditState | null } = { current: null }
 
   const hook = renderHook(
@@ -37,6 +38,7 @@ function renderQueueHook(overrides: { busy?: boolean } = {}) {
         draftRef: { current: '' },
         focusInput: () => undefined,
         loadIntoComposer: () => undefined,
+        onCancel,
         onSubmit,
         queueEditRef,
         queueSessionKey: SESSION_KEY,
@@ -45,7 +47,7 @@ function renderQueueHook(overrides: { busy?: boolean } = {}) {
     { initialProps: { busy: overrides.busy ?? false } }
   )
 
-  return { hook, onSubmit }
+  return { hook, onCancel, onSubmit }
 }
 
 describe('useComposerQueue park integration', () => {
@@ -102,21 +104,27 @@ describe('useComposerQueue park integration', () => {
     expect(isQueueParked(SESSION_KEY)).toBe(false)
   })
 
-  it('submits a busy queued prompt atomically and lifts the park', async () => {
+  it('sendQueuedNow while busy unparks so the settle drain flows (no stale latch)', async () => {
     const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first' })
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'send me now' })
     parkQueuedPrompts(SESSION_KEY)
 
-    const { hook, onSubmit } = renderQueueHook({ busy: true })
+    const { hook, onCancel, onSubmit } = renderQueueHook({ busy: true })
     const target = getQueuedPrompts(SESSION_KEY).find(e => e.id !== first!.id)!
 
-    await act(async () => {
-      await hook.result.current.sendQueuedNow(target.id)
+    act(() => {
+      hook.result.current.sendQueuedNow(target.id)
     })
+
+    // The interrupt fired and the park lifted — this interrupt exists to reach
+    // the queue, not to halt it.
+    expect(onCancel).toHaveBeenCalledTimes(1)
+    expect(isQueueParked(SESSION_KEY)).toBe(false)
+
+    // Turn settles → the promoted entry drains.
+    hook.rerender({ busy: false })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
     expect(onSubmit.mock.calls[0]?.[0]).toBe('send me now')
-    expect(isQueueParked(SESSION_KEY)).toBe(false)
-    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['first'])
   })
 })

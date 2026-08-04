@@ -13,7 +13,6 @@
     "ignoreDeprecations": "6.0",
     "composite": true,
     "declaration": true,
-    "noEmit": false,
     "outDir": "build/electron-types"
   },
   "include": ["electron"],

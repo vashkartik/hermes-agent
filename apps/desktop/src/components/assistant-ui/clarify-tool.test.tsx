@@ -4,7 +4,6 @@ import type { ReactNode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerInsertRequest } from '@/app/chat/composer/focus'
-import type { HermesGateway } from '@/hermes'
 import { I18nProvider } from '@/i18n'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
@@ -12,46 +11,19 @@ import { $activeSessionId } from '@/store/session'
 
 import { ClarifyTool, readClarifyResult } from './clarify-tool'
 
-vi.mock('@/lib/haptics', () => ({
-  triggerHaptic: vi.fn()
+// The live pending card only renders while its message is running. Force that so
+// keyboard-navigation tests can exercise ClarifyToolPending directly.
+vi.mock('@assistant-ui/react', () => ({
+  useAuiState: () => true
 }))
 
-let mockMessageRunning = true
-
-// ClarifyTool reads the live message's running state via useAuiState, which
-// needs a full thread/message provider tree. Most tests answer the selector
-// with a running message instead of mounting a whole Thread; the remount test
-// flips it to complete to cover backend-authoritative recovery.
-vi.mock('@assistant-ui/react', async importOriginal => {
-  const mod = await importOriginal<Record<string, unknown>>()
-
-  return {
-    ...mod,
-    useAuiState: (selector: (state: unknown) => unknown) =>
-      selector({
-        message: { status: { type: mockMessageRunning ? 'running' : 'complete' } },
-        thread: { isRunning: mockMessageRunning }
-      })
-  }
+afterEach(() => {
+  cleanup()
+  clearClarifyRequest()
+  $activeSessionId.set(null)
+  $gateway.set(null)
+  vi.clearAllMocks()
 })
-
-function mockGateway() {
-  const request = vi.fn().mockResolvedValue({ ok: true })
-  $gateway.set({ request } as unknown as HermesGateway)
-
-  return request
-}
-
-function renderPendingClarify(args: Record<string, unknown>) {
-  const props = {
-    args,
-    result: undefined,
-    toolName: 'clarify',
-    type: 'tool-call'
-  } as unknown as ToolCallMessagePartProps
-
-  return render(<ClarifyTool {...props} />)
-}
 
 function renderClarify(ui: ReactNode) {
   return render(
@@ -80,84 +52,6 @@ function settledClarifyProps(
     type: 'tool-call'
   }
 }
-
-afterEach(() => {
-  cleanup()
-  mockMessageRunning = true
-  clearClarifyRequest()
-  $activeSessionId.set(null)
-  $gateway.set(null)
-  vi.clearAllMocks()
-})
-
-describe('ClarifyTool', () => {
-  it('renders tappable Yes/No choices for yes-no clarify prompts without explicit choices', async () => {
-    const request = mockGateway()
-    $activeSessionId.set('sess-1')
-    setClarifyRequest({
-      requestId: 'req-1',
-      question: 'PR #567 is green. Do you want me to owner-bypass via GitHub admin/squash merge?',
-      choices: null,
-      sessionId: 'sess-1'
-    })
-
-    renderPendingClarify({
-      question: 'PR #567 is green. Do you want me to owner-bypass via GitHub admin/squash merge?',
-      choices: null
-    })
-
-    expect(screen.getByRole('button', { name: /Yes$/ })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /No$/ })).toBeTruthy()
-    // The tappable chips lead; freeform stays available only as the "Other" escape hatch.
-    expect((screen.getByRole('textbox') as HTMLTextAreaElement).placeholder).toMatch(/other/i)
-
-    // Picking a choice selects it; Continue confirms and sends the answer.
-    fireEvent.click(screen.getByRole('button', { name: /No$/ }))
-    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
-
-    await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('clarify.respond', {
-        request_id: 'req-1',
-        answer: 'No'
-      })
-    })
-  })
-
-  it('keeps open-ended clarify prompts in freeform input mode', () => {
-    mockGateway()
-    $activeSessionId.set('sess-1')
-    setClarifyRequest({
-      requestId: 'req-2',
-      question: 'Which deployment target should I use?',
-      choices: null,
-      sessionId: 'sess-1'
-    })
-
-    renderPendingClarify({ question: 'Which deployment target should I use?', choices: null })
-
-    expect(screen.queryByRole('button', { name: /Yes$/ })).toBeNull()
-    expect(screen.queryByRole('button', { name: /No$/ })).toBeNull()
-    expect(screen.getByRole('textbox')).toBeTruthy()
-  })
-
-  it('reopens a backend-pending question after the transcript remounts as complete', () => {
-    mockGateway()
-    mockMessageRunning = false
-    $activeSessionId.set('sess-1')
-    setClarifyRequest({
-      requestId: 'req-remount',
-      question: 'Which option should I keep?',
-      choices: ['Alpha', 'Beta'],
-      sessionId: 'sess-1'
-    })
-
-    renderPendingClarify({ question: 'Which option should I keep?', choices: ['Alpha', 'Beta'] })
-
-    expect(screen.getByText('Which option should I keep?')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Alpha$/ })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Beta$/ })).toBeTruthy()
-  })
-})
 
 function liveClarifyProps(choices = ['staging', 'production']): ToolCallMessagePartProps {
   const args = { choices, question: 'Which deployment target?' }
@@ -404,13 +298,16 @@ describe('ClarifyTool keyboard navigation', () => {
 })
 
 describe('ClarifyTool pending marker', () => {
-  it('marks a live choices card so type-to-focus yields its shortcut keys', () => {
+  it('marks a live choices card with its row count so type-to-focus yields exactly its keys', () => {
     renderLiveClarify()
 
-    // The marker is what `composerFocusBlockedBySurface` keys off of, so the
-    // global type-to-focus listener stands down and A/B/C… + 1-9 + Enter reach
-    // the card instead of the composer.
-    expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
+    // `clarifyCardOwnsKey` reads the count off this marker to yield only the
+    // shortcuts the card renders (A..N + "Other", 1-9, Enter) and let every
+    // other printable through to the composer.
+    const card = document.querySelector('[data-clarify-choices]')
+
+    expect(card).toBeTruthy()
+    expect(Number(card?.getAttribute('data-clarify-choices'))).toBeGreaterThan(0)
   })
 
   it('does not mark a free-text (no-choice) pending card', () => {

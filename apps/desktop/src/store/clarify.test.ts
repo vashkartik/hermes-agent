@@ -5,10 +5,12 @@ import {
   $clarifyRequests,
   type ClarifyRequest,
   clearClarifyRequest,
+  hasClarifyRequest,
   normalizeChoices,
   setClarifyRequest,
-  syncPendingClarifyRequests
+  skipClarifyRequest
 } from './clarify'
+import { $gateway } from './gateway'
 import { $activeSessionId } from './session'
 
 function clarify(sessionId: string | null, requestId: string): ClarifyRequest {
@@ -80,107 +82,46 @@ describe('clarify store', () => {
     expect($clarifyRequests.get()['session-a']).toBeUndefined()
     expect($clarifyRequests.get()['session-b']?.requestId).toBe('other')
   })
+})
 
-  it('restores pending clarify requests for every backend session', async () => {
-    const request = vi.fn().mockResolvedValue({
-      requests: [
-        {
-          request_id: 'req-a',
-          session_id: 'session-a',
-          question: 'Question A',
-          choices: ['One', 'Two']
-        },
-        {
-          request_id: 'req-b',
-          session_id: 'session-b',
-          question: 'Question B',
-          choices: null
-        }
-      ]
-    })
+describe('skipClarifyRequest', () => {
+  const request = vi.fn(async () => ({ ok: true }))
 
-    await syncPendingClarifyRequests({ request } as never)
-
-    expect(request).toHaveBeenCalledWith('clarify.pending', {})
-    expect($clarifyRequests.get()).toEqual({
-      'session-a': {
-        requestId: 'req-a',
-        sessionId: 'session-a',
-        question: 'Question A',
-        choices: ['One', 'Two']
-      },
-      'session-b': {
-        requestId: 'req-b',
-        sessionId: 'session-b',
-        question: 'Question B',
-        choices: null
-      }
-    })
+  beforeEach(() => {
+    $clarifyRequests.set({})
+    request.mockClear()
+    $gateway.set({ request } as unknown as ReturnType<typeof $gateway.get>)
   })
 
-  it('ignores malformed or empty pending rows', async () => {
-    const request = vi.fn().mockResolvedValue({
-      requests: [
-        {
-          request_id: 'valid',
-          session_id: 'session-a',
-          question: 'Still valid',
-          choices: ['Yes']
-        },
-        { request_id: '', session_id: 'session-b', question: 'Missing id' },
-        { request_id: 'missing-question', session_id: 'session-c', question: '' },
-        { request_id: 'bad-session', session_id: 42, question: 'Wrong session' },
-        {
-          request_id: 'bad-choices',
-          session_id: 'session-d',
-          question: 'Wrong choices',
-          choices: ['Yes', 42]
-        },
-        null
-      ]
-    })
-
-    await syncPendingClarifyRequests({ request } as never)
-
-    expect($clarifyRequests.get()).toEqual({
-      'session-a': {
-        requestId: 'valid',
-        sessionId: 'session-a',
-        question: 'Still valid',
-        choices: ['Yes']
-      }
-    })
+  afterEach(() => {
+    $clarifyRequests.set({})
+    $gateway.set(null)
   })
 
-  it('replaying the same pending request preserves store identity', async () => {
-    const request = vi.fn().mockResolvedValue({
-      requests: [
-        {
-          request_id: 'req-a',
-          session_id: 'session-a',
-          question: 'Question A',
-          choices: ['One', 'Two']
-        }
-      ]
-    })
+  it('answers the session\u2019s clarify with an empty answer and drops it', async () => {
+    setClarifyRequest(clarify('session-a', 'req-a'))
+    setClarifyRequest(clarify('session-b', 'req-b'))
 
-    await syncPendingClarifyRequests({ request } as never)
-    const first = $clarifyRequests.get()
-    await syncPendingClarifyRequests({ request } as never)
+    await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
 
-    expect($clarifyRequests.get()).toBe(first)
+    expect(request).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-a', answer: '' })
+    expect(hasClarifyRequest('session-a')).toBe(false)
+    // A background session's question is untouched — only the one being typed
+    // over is skipped.
+    expect(hasClarifyRequest('session-b')).toBe(true)
   })
 
-  it('leaves existing live requests intact when replay is unavailable', async () => {
-    setClarifyRequest(clarify('session-live', 'req-live'))
-    const before = $clarifyRequests.get()
-    const request = vi.fn().mockRejectedValue(new Error('unknown method: clarify.pending'))
+  it('is a no-op when the session has no clarify parked', async () => {
+    await expect(skipClarifyRequest('session-a')).resolves.toBe(false)
+    expect(request).not.toHaveBeenCalled()
+  })
 
-    await expect(syncPendingClarifyRequests({ request } as never)).rejects.toThrow(
-      'unknown method: clarify.pending'
-    )
+  it('still reports the skip when the respond RPC fails', async () => {
+    setClarifyRequest(clarify('session-a', 'req-a'))
+    request.mockRejectedValueOnce(new Error('socket closed'))
 
-    expect($clarifyRequests.get()).toBe(before)
+    await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
+    expect(hasClarifyRequest('session-a')).toBe(false)
   })
 })
 

@@ -132,12 +132,17 @@ export interface SkillCommandDispatchResponse {
   type: 'skill'
   name: string
   message?: string
+  /** The invocation the UI renders (`/work fix the leak`). `message` is the
+   *  expanded skill body — model-facing scaffolding no surface may show. */
+  display?: string
 }
 
 export interface SendCommandDispatchResponse {
   type: 'send'
   message: string
   notice?: string
+  /** Set for a skill-bundle send: see SkillCommandDispatchResponse.display. */
+  display?: string
 }
 
 export interface PrefillCommandDispatchResponse {
@@ -153,14 +158,7 @@ export type CommandDispatchResponse =
   | SendCommandDispatchResponse
   | PrefillCommandDispatchResponse
 
-export type SidebarNavId =
-  | 'artifacts'
-  | 'command-center'
-  | 'memories'
-  | 'messaging'
-  | 'new-session'
-  | 'settings'
-  | 'skills'
+export type SidebarNavId = 'artifacts' | 'command-center' | 'messaging' | 'new-session' | 'settings' | 'skills'
 
 export interface SidebarNavItem {
   /** Built-in view id, or a contributed row's namespaced contribution id. */
