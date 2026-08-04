@@ -32,7 +32,7 @@ hermes chat [flags]
   --image PATH              Attach a local image to a single query
   -Q, --quiet               Suppress banner, spinner, tool previews
   --checkpoints             Enable filesystem checkpoints (/rollback)
-  --max-turns N             Cap tool-calling iterations
+  --max-turns N             Cap tool-calling iterations (default 500, `agent.max_turns`)
   --source TAG              Session source tag (default: cli)
 ```
 (plus the global flags above)
