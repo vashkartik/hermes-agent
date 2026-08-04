@@ -672,29 +672,34 @@ def test_send_failure_cleans_owner_claim_that_won_subscription_lock(
         loop.close()
 
 
-def test_send_failure_before_prompt_claim_cannot_reinstall_dead_owner(
+def test_send_failure_before_stdio_prompt_rebind_cannot_install_dead_owner(
     monkeypatch,
 ) -> None:
-    sid = "send-failure-before-prompt-claim"
-    prompt_reached_claim = threading.Event()
+    from hermes_cli import input_sanitize
+
+    sid = "send-failure-before-stdio-prompt-rebind"
+    prompt_before_lookup = threading.Event()
     release_prompt = threading.Event()
     cleanup_done = threading.Event()
     cleanup_results: list[tuple[int, int]] = []
-    responses: list[dict] = []
+    queued_responses: list[dict] = []
+    dispatch_responses: list[dict] = []
 
     class FailingWS:
         async def send_text(self, _line: str) -> None:
             raise RuntimeError("socket gone")
 
     loop = asyncio.new_event_loop()
-    transport = ws_mod.WSTransport(FailingWS(), loop, peer="prompt-claim-race-test")
-    previous_owner = RecordingTransport()
+    transport = ws_mod.WSTransport(
+        FailingWS(), loop, peer="stdio-prompt-rebind-race-test"
+    )
     session = {
         "history_lock": threading.Lock(),
         "running": True,
-        "transport": previous_owner,
+        "transport": server._stdio_transport,
     }
     original_cleanup = server._close_sessions_for_transport
+    original_sanitize = input_sanitize.sanitize_user_prompt_text
 
     def record_cleanup(owner, *, end_reason="ws_disconnect"):
         result = original_cleanup(owner, end_reason=end_reason)
@@ -702,54 +707,95 @@ def test_send_failure_before_prompt_claim_cannot_reinstall_dead_owner(
         cleanup_done.set()
         return result
 
-    def pause_before_prompt_claim(_session, _cfg=None) -> bool:
-        prompt_reached_claim.set()
+    def pause_before_session_lookup(raw_text: str) -> str:
+        prompt_before_lookup.set()
         assert release_prompt.wait(timeout=3)
-        return False
+        return original_sanitize(raw_text)
 
-    def submit_prompt() -> None:
-        token = server.bind_transport(transport)
-        try:
-            responses.append(
-                server.handle_request(
-                    {
-                        "id": "prompt-race",
-                        "method": "prompt.submit",
-                        "params": {"session_id": sid, "text": "hello"},
-                    }
-                )
+    def queue_prompt(rid, *_args):
+        response = server._ok(rid, {"status": "queued"})
+        queued_responses.append(response)
+        return response
+
+    def dispatch_prompt() -> None:
+        dispatch_responses.append(
+            server.dispatch(
+                {
+                    "id": "prompt-race",
+                    "method": "prompt.submit",
+                    "params": {"session_id": sid, "text": "hello"},
+                },
+                transport,
             )
-        finally:
-            server.reset_transport(token)
+        )
 
     monkeypatch.setattr(server, "_close_sessions_for_transport", record_cleanup)
-    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
-    monkeypatch.setattr(server, "_session_uses_compute_host", pause_before_prompt_claim)
     monkeypatch.setattr(
-        server,
-        "_handle_busy_submit",
-        lambda rid, *_args: server._ok(rid, {"status": "queued"}),
+        input_sanitize,
+        "sanitize_user_prompt_text",
+        pause_before_session_lookup,
     )
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_handle_busy_submit", queue_prompt)
     server._sessions[sid] = session
-    prompt_thread = threading.Thread(target=submit_prompt)
+    prompt_thread = threading.Thread(target=dispatch_prompt)
     try:
         prompt_thread.start()
-        assert prompt_reached_claim.wait(timeout=3)
+        assert prompt_before_lookup.wait(timeout=3)
         asyncio.run(transport._safe_send_many(["frame"]))
         assert cleanup_done.wait(timeout=3)
         assert cleanup_results == [(0, 0)]
+        assert session["transport"] is server._stdio_transport
 
         release_prompt.set()
         prompt_thread.join(timeout=3)
         assert not prompt_thread.is_alive()
 
-        assert responses[0]["result"]["status"] == "queued"
-        assert session["transport"] is previous_owner
+        assert queued_responses[0]["result"]["status"] == "queued"
+        assert dispatch_responses == queued_responses
+        assert session["transport"] is server._stdio_transport
         assert transport._closed
     finally:
         release_prompt.set()
         prompt_thread.join(timeout=3)
         transport.close()
+        server._sessions.pop(sid, None)
+        loop.close()
+
+
+def test_stdio_rebind_cannot_overwrite_successor_that_wins_before_claim() -> None:
+    sid = "stdio-rebind-successor-race"
+    successor = RecordingTransport()
+    session = {
+        "cols": 80,
+        "transport": server._stdio_transport,
+    }
+
+    class CoordinatedTransport(ws_mod.WSTransport):
+        def claim_session_if_live(self, claim_owner) -> bool:
+            with server._sessions_lock:
+                session["transport"] = successor
+            return super().claim_session_if_live(claim_owner)
+
+    loop = asyncio.new_event_loop()
+    candidate = CoordinatedTransport(object(), loop, peer="stdio-successor-race-test")
+    server._sessions[sid] = session
+    token = server.bind_transport(candidate)
+    try:
+        response = server.handle_request(
+            {
+                "id": "resize-race",
+                "method": "terminal.resize",
+                "params": {"session_id": sid, "cols": 120},
+            }
+        )
+
+        assert response["result"]["cols"] == 120
+        assert session["transport"] is successor
+    finally:
+        server.reset_transport(token)
+        candidate.close()
         server._sessions.pop(sid, None)
         loop.close()
 

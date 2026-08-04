@@ -2813,7 +2813,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
-def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
+def _rebind_ws_transport(sid: str, session: dict | None) -> None:
     """Upgrade a stdio-parked session to the calling WS transport.
 
     When a websocket drops mid-turn, ``handle_ws`` points every session it
@@ -2833,14 +2833,16 @@ def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
     t = current_transport()
     if t is None or t is _stdio_transport:
         return
-    sid = sid or str(session.get("_sid") or "") or _sid_for_session(session)
-    if session.get("transport") in (_stdio_transport, _detached_ws_transport):
+    parked_owner = session.get("transport")
+    if parked_owner in (_stdio_transport, _detached_ws_transport):
         # No live owner — the returning client takes the session back and the
         # fan-out registry is updated in the same step so both agree.
-        if sid:
-            subscribe_session(sid, t, owner=True)
-        else:
-            session["transport"] = t
+        _claim_prompt_transport(
+            sid,
+            session,
+            t,
+            expected_owner=parked_owner,
+        )
         return
     # A live owner exists: attach as a viewer so this peer still sees the
     # stream. Ownership is unchanged — stealing it here is what blanked the
@@ -2849,27 +2851,24 @@ def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
         subscribe_session(sid, t)
 
 
-def _sid_for_session(session: dict) -> str:
-    """Reverse-lookup a session's live id. Cheap: the registry is tiny."""
-    with _sessions_lock:
-        for sid, candidate in _sessions.items():
-            if candidate is session:
-                return sid
-    return ""
-
-
 def _claim_prompt_transport(
     sid: str,
     session: dict,
     transport: Transport,
     *,
     allow_legacy_takeover: bool = False,
+    expected_owner: Transport | None = None,
 ) -> bool:
-    """Rebind prompt ownership without reviving a closed or stale client."""
+    """Rebind ownership without reviving a closed or stale client."""
 
     def assign_owner() -> bool:
         with _sessions_lock:
             if _sessions.get(sid) is not session or session.get("_finalized"):
+                return False
+            if (
+                expected_owner is not None
+                and session.get("transport") is not expected_owner
+            ):
                 return False
             stream = _session_streams.get(sid)
             if stream is None:
@@ -2896,6 +2895,10 @@ def _claim_prompt_transport(
         if (
             (authoritative is not None and authoritative is not session)
             or session.get("_finalized")
+            or (
+                expected_owner is not None
+                and session.get("transport") is not expected_owner
+            )
         ):
             return False
         stream = _session_streams.get(sid)
@@ -2912,7 +2915,7 @@ def _sess_nowait(params, rid):
     sid = params.get("session_id") or ""
     s = _sessions.get(sid)
     if s is not None:
-        _rebind_ws_transport(s, sid)
+        _rebind_ws_transport(sid, s)
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
