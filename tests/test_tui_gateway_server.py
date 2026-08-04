@@ -898,6 +898,15 @@ class _BrokenStdout:
 
 def test_write_json_serializes_concurrent_writes(monkeypatch):
     out = _ChunkyStdout()
+    # Isolation from earlier tests' deferred agent builds: their 50ms
+    # _schedule_agent_build timers can fire DURING this test under CPU
+    # contention and emit a session frame through the stdio fallback into the
+    # patched stream (observed as a 9th, torn line in the nightly gate).
+    # Clearing the registry makes those timers' session lookups miss, and the
+    # short settle lets any already-started build thread finish emitting
+    # before the stream is swapped.
+    server._sessions.clear()
+    time.sleep(0.15)
     monkeypatch.setattr(server, "_real_stdout", out)
 
     threads = [
