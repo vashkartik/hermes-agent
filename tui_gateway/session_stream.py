@@ -126,9 +126,9 @@ class SessionStream:
     """
 
     __slots__ = (
-        "sid", "session_key", "profile_key", "_lock", "_subs", "_seq",
-        "_replay", "_replay_floor", "_turn_id", "_turn_request_id",
-        "_turn_terminal_seen", "_touched_at",
+        "sid", "session_key", "profile_key", "_lock", "_delivery_lock",
+        "_subs", "_seq", "_replay", "_replay_floor", "_turn_id",
+        "_turn_request_id", "_turn_terminal_seen", "_touched_at",
     )
 
     def __init__(self, sid: str, *, session_key: str = "", profile_key: str = "") -> None:
@@ -136,6 +136,14 @@ class SessionStream:
         self.session_key = session_key
         self.profile_key = profile_key
         self._lock = threading.RLock()
+        # Serialize whole deliveries without holding the state lock across
+        # transport I/O.  In particular, WSTransport failure handling takes
+        # its subscription lock, whose ordered-attach callback can re-enter
+        # this stream through attach().
+        # Real transports never synchronously re-enter session delivery. A
+        # non-reentrant lock makes that invariant explicit: recursive delivery
+        # would otherwise interleave a newer sequence into an older fan-out.
+        self._delivery_lock = threading.Lock()
         self._subs: list[Subscriber] = []
         self._seq = 0
         self._replay: deque[dict] = deque(maxlen=REPLAY_FRAMES or 1)
@@ -288,49 +296,69 @@ class SessionStream:
             return None
 
         event_type = params.get("type")
-        with self._lock:
-            if not self._subs:
-                return None
-            if event_type in TERMINAL_EVENT_TYPES:
-                if self._turn_terminal_seen:
-                    logger.debug(
-                        "suppressed duplicate terminal event sid=%s type=%s",
-                        self.sid, event_type,
-                    )
-                    return True
-                self._turn_terminal_seen = True
-            self._seq += 1
-            seq = self._seq
-            stamped = self._stamp(frame, seq)
-            self._touched_at = time.time()
-            if REPLAY_FRAMES:
-                if len(self._replay) == self._replay.maxlen and self._replay:
-                    self._replay_floor = (self._replay[0].get("params") or {}).get("seq") or 0
-                self._replay.append(stamped)
-                if self._replay_floor == 0 and self._replay:
-                    self._replay_floor = (self._replay[0].get("params") or {}).get("seq") or 0
+        with self._delivery_lock:
+            with self._lock:
+                if not self._subs:
+                    return None
+                if event_type in TERMINAL_EVENT_TYPES:
+                    if self._turn_terminal_seen:
+                        logger.debug(
+                            "suppressed duplicate terminal event sid=%s type=%s",
+                            self.sid, event_type,
+                        )
+                        return True
+                    self._turn_terminal_seen = True
+                self._seq += 1
+                seq = self._seq
+                stamped = self._stamp(frame, seq)
+                self._touched_at = time.time()
+                if REPLAY_FRAMES:
+                    if len(self._replay) == self._replay.maxlen and self._replay:
+                        self._replay_floor = (self._replay[0].get("params") or {}).get("seq") or 0
+                    self._replay.append(stamped)
+                    if self._replay_floor == 0 and self._replay:
+                        self._replay_floor = (self._replay[0].get("params") or {}).get("seq") or 0
+                # Freeze both membership and role. Ownership can change while
+                # writes run, but this frame keeps the routing decision made
+                # at its sequence point.
+                subscribers = [(sub, sub.owner) for sub in self._subs]
 
-            delivered = False
-            dead: list[Subscriber] = []
-            for sub in list(self._subs):
+            # Queue non-authoritative viewers first. WSTransport's observer
+            # path is bounded and nonblocking; generic/stdio transports retain
+            # their historical write() fallback.
+            results: list[tuple[Subscriber, bool]] = []
+            ordered = [item for item in subscribers if not item[1]]
+            ordered.extend(item for item in subscribers if item[1])
+            for sub, was_owner in ordered:
                 try:
-                    ok = sub.transport.write(stamped)
+                    writer = None
+                    if not was_owner:
+                        writer = getattr(sub.transport, "write_observer", None)
+                    if not callable(writer):
+                        writer = sub.transport.write
+                    ok = bool(writer(stamped))
                 except Exception:
                     logger.debug(
                         "session stream write raised sid=%s client=%s",
                         self.sid, sub.client, exc_info=True,
                     )
                     ok = False
-                if ok:
-                    sub.last_seq = seq
-                    delivered = True
-                else:
-                    dead.append(sub)
-            for sub in dead:
-                # A peer that reports "gone" is detached here; the WS teardown
-                # path will also call detach() and both are idempotent.
-                if sub in self._subs:
-                    self._subs.remove(sub)
+                results.append((sub, ok))
+
+            delivered = any(ok for _, ok in results)
+            with self._lock:
+                for sub, ok in results:
+                    # A detach followed by a reattach can install a new
+                    # Subscriber for the same transport while I/O is in
+                    # flight. Never update or remove that replacement.
+                    if not any(current is sub for current in self._subs):
+                        continue
+                    if ok:
+                        sub.last_seq = seq
+                    else:
+                        # WS teardown also detaches and both paths are
+                        # intentionally idempotent.
+                        self._subs.remove(sub)
             return delivered
 
     def replay_since(self, after_seq: int) -> tuple[list[dict], bool, int]:

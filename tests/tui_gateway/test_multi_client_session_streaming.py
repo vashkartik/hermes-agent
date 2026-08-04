@@ -672,6 +672,108 @@ def test_send_failure_cleans_owner_claim_that_won_subscription_lock(
         loop.close()
 
 
+def test_failed_delivery_does_not_deadlock_ordered_session_attach(
+    monkeypatch,
+) -> None:
+    """A failed owner write must not hold the stream lock while closing.
+
+    The pre-fix cycle was::
+
+        deliver: stream lock -> WSTransport.write -> subscription lock
+        attach:  subscription lock -> sessions lock -> stream lock
+
+    The bounded wrapper lets the regression unwind cleanly instead of leaving
+    two permanently blocked test threads behind.
+    """
+    from agent import async_utils
+
+    sid = "failed-delivery-ordered-attach"
+    write_scheduling = threading.Event()
+    attach_attempted = threading.Event()
+    attach_finished = threading.Event()
+    attach_stalled = threading.Event()
+    completion_finished = threading.Event()
+    attach_threads: list[threading.Thread] = []
+
+    loop = asyncio.new_event_loop()
+    transport = ws_mod.WSTransport(object(), loop, peer="delivery-attach-deadlock")
+    monkeypatch.setattr(transport, "_schedule_owner_cleanup", lambda: None)
+    generation = transport.begin_session_subscription()
+    session = {"transport": transport, "close_on_disconnect": False}
+    server._sessions[sid] = session
+    server.subscribe_session(sid, transport, owner=True, explicit=True)
+    stream = server.session_streams().get(sid)
+    assert stream is not None
+    real_subscribe_session = server.subscribe_session
+
+    def bounded_subscribe_session(*args, **kwargs):
+        result: list[bool] = []
+
+        def attach() -> None:
+            result.append(real_subscribe_session(*args, **kwargs))
+            attach_finished.set()
+
+        attach_attempted.set()
+        thread = threading.Thread(target=attach)
+        attach_threads.append(thread)
+        thread.start()
+        if not attach_finished.wait(timeout=2):
+            attach_stalled.set()
+            return False
+        return result[0]
+
+    def fail_schedule(coro, _loop):
+        coro.close()
+        write_scheduling.set()
+        assert attach_attempted.wait(timeout=3)
+        return None
+
+    monkeypatch.setattr(server, "subscribe_session", bounded_subscribe_session)
+    monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", fail_schedule)
+
+    deliver_thread = threading.Thread(
+        target=lambda: stream.deliver(
+            server._event_frame("message.start", sid, {})
+        )
+    )
+
+    def complete_subscription() -> None:
+        server._record_transport_subscription(
+            transport,
+            "session.resume",
+            {"session_id": sid},
+            {"result": {"session_id": sid}},
+            generation,
+        )
+        completion_finished.set()
+
+    complete_thread = threading.Thread(target=complete_subscription)
+    try:
+        deliver_thread.start()
+        assert write_scheduling.wait(timeout=3)
+        complete_thread.start()
+        complete_thread.join(timeout=3)
+        deliver_thread.join(timeout=3)
+        for thread in attach_threads:
+            thread.join(timeout=3)
+
+        assert completion_finished.is_set()
+        assert not complete_thread.is_alive()
+        assert not deliver_thread.is_alive()
+        assert all(not thread.is_alive() for thread in attach_threads)
+        assert not attach_stalled.is_set()
+    finally:
+        if complete_thread.ident is not None:
+            complete_thread.join(timeout=3)
+        deliver_thread.join(timeout=3)
+        for thread in attach_threads:
+            thread.join(timeout=3)
+        transport.close()
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
+        loop.close()
+
+
 def test_send_failure_before_stdio_prompt_rebind_cannot_install_dead_owner(
     monkeypatch,
 ) -> None:
@@ -1013,6 +1115,92 @@ def test_observer_is_queued_before_a_stalled_owner_write() -> None:
         server._sessions.pop(sid, None)
 
     assert observed_at and observed_at[0] - started < 0.05
+
+
+def test_durable_viewers_are_queued_before_owner_and_failed_viewer_detaches() -> None:
+    sid = "durable-owner-stall"
+    owner_started = threading.Event()
+    release_owner = threading.Event()
+    healthy_queued = threading.Event()
+    failed_queued = threading.Event()
+    blocking_viewer_write_called = threading.Event()
+    owner_saw_queued_viewers: list[bool] = []
+    delivery_result: list[bool] = []
+
+    class StalledOwner(RecordingTransport):
+        def write(self, obj: dict) -> bool:
+            owner_saw_queued_viewers.append(
+                healthy_queued.is_set() and failed_queued.is_set()
+            )
+            owner_started.set()
+            assert release_owner.wait(timeout=3)
+            return super().write(obj)
+
+    class DurableViewer(RecordingTransport):
+        def write(self, _obj: dict) -> bool:
+            blocking_viewer_write_called.set()
+            raise AssertionError("durable viewer used blocking write path")
+
+    class HealthyViewer(DurableViewer):
+        def write_observer(self, obj: dict) -> bool:
+            healthy_queued.set()
+            self.frames.append(obj)
+            return True
+
+    class OverflowedViewer(DurableViewer):
+        def write_observer(self, obj: dict) -> bool:
+            # WSTransport reports observer-queue overflow with False so the
+            # stream can detach it and let reconnect replay heal the gap.
+            self.frames.append(obj)
+            failed_queued.set()
+            return False
+
+    owner = StalledOwner()
+    healthy = HealthyViewer()
+    failed = OverflowedViewer()
+    for viewer in (healthy, failed):
+        viewer.subscribe_session(sid)
+    server._sessions[sid] = {"transport": owner}
+    assert server.subscribe_session(sid, owner, owner=True, explicit=True)
+    assert not server.subscribe_session(sid, healthy, explicit=True)
+    assert not server.subscribe_session(sid, failed, explicit=True)
+    for transport in (owner, healthy, failed):
+        server.register_live_transport(transport)
+
+    delivery_thread = threading.Thread(
+        target=lambda: delivery_result.append(
+            server.write_json(server._event_frame("tool.start", sid, {}))
+        )
+    )
+    try:
+        delivery_thread.start()
+        assert healthy_queued.wait(timeout=1)
+        assert failed_queued.wait(timeout=1)
+        # Viewer queues are nonblocking and run before the authoritative write.
+        assert owner_started.wait(timeout=1)
+        assert owner_saw_queued_viewers == [True]
+        assert not blocking_viewer_write_called.is_set()
+        release_owner.set()
+        delivery_thread.join(timeout=3)
+        assert not delivery_thread.is_alive()
+
+        stream = server.session_streams().get(sid)
+        assert stream is not None
+        replay, truncated, latest = stream.replay_since(0)
+        assert delivery_result == [True]
+        assert len(owner.frames) == len(healthy.frames) == len(failed.frames) == 1
+        assert owner.frames[0]["params"]["seq"] == 1
+        assert healthy.frames[0]["params"]["seq"] == 1
+        assert stream.subscriber_count() == 2
+        assert replay == [owner.frames[0]]
+        assert (truncated, latest) == (False, 1)
+    finally:
+        release_owner.set()
+        delivery_thread.join(timeout=3)
+        for transport in (owner, healthy, failed):
+            server.unregister_live_transport(transport)
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
 
 
 def test_owner_disconnect_promotes_a_live_subscriber(monkeypatch) -> None:
