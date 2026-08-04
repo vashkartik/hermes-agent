@@ -10371,10 +10371,6 @@ def cmd_dashboard(args):
         logger.debug("terminal config → env bridge failed for dashboard/serve",
                      exc_info=True)
 
-    if _headless_backend:
-        # Don't build the SPA, and tell mount_spa() (read at web_server import
-        # below) to disable it even if a stray dist exists. Set it first.
-        os.environ["HERMES_SERVE_HEADLESS"] = "1"
     # ── Config-driven web dist (dashboard.web_dist) ────────────────────
     # An embedding shell (the Ace desktop, a kiosk, a remote proxy) may want
     # this dashboard to serve a prebuilt desktop-renderer dist instead of the
@@ -10402,6 +10398,10 @@ def cmd_dashboard(args):
                     "serving the default web UI instead"
                 )
 
+    if _headless_backend:
+        # Don't build the SPA, and tell mount_spa() (read at web_server import
+        # below) to disable it even if a stray dist exists. Set it first.
+        os.environ["HERMES_SERVE_HEADLESS"] = "1"
     elif "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
         if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
             sys.exit(1)
