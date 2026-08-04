@@ -1532,6 +1532,7 @@ def test_stream_frame_selected_before_switch_cannot_enqueue_after_commit() -> No
             return super().write_observer_if_subscribed(session_id, obj)
 
     client = PausingWS(object(), loop, peer="gated-enqueue-test")
+    server._sessions[sid_old] = _live_session_dict("stored-gated-enqueue", client)
     try:
         generation = client.begin_session_subscription()
         assert client.complete_session_subscription(generation, sid_old)
@@ -1567,6 +1568,7 @@ def test_stream_frame_selected_before_switch_cannot_enqueue_after_commit() -> No
     finally:
         release_gate.set()
         client.close()
+        server._sessions.pop(sid_old, None)
         server.reset_session_streams()
         loop.close()
 
@@ -1929,10 +1931,14 @@ def test_conditional_close_excludes_claims_from_its_critical_section(
     try:
         assert server.subscribe_session(sid, old_owner, owner=True, explicit=True)
 
+        claim_results: list[bool] = []
+
         def racing_claim() -> None:
             assert reached_pop.wait(timeout=5)
-            server.subscribe_session(
-                sid, claimer, owner=True, force=True, explicit=True
+            claim_results.append(
+                server.subscribe_session(
+                    sid, claimer, owner=True, force=True, explicit=True
+                )
             )
             claim_done.set()
 
@@ -1955,6 +1961,11 @@ def test_conditional_close_excludes_claims_from_its_critical_section(
         assert not claim_thread.is_alive()
         assert claim_blocked_during_close == [True]
         assert sid not in server._sessions
+        # Close won: the late claim must FAIL rather than crown a ghost
+        # stream for the record that no longer exists.
+        assert claim_results == [False]
+        assert server._session_streams.get(sid) is None
+        assert server.session_owner(sid) is None
     finally:
         release_pop.set()
         server._sessions.pop(sid, None)

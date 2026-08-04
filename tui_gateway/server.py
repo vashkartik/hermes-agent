@@ -1886,6 +1886,12 @@ def subscribe_session(
     # RLock; in-lock callers (ordered commits, prompt claims) nest safely.
     with _sessions_lock:
         session = _sessions.get(sid)
+        if owner and (session is None or session.get("_finalized")):
+            # A claim that lost the race against a completed close must fail
+            # rather than crown a ghost stream for a record that no longer
+            # exists. Viewer attaches keep their historical semantics (the
+            # rebind path may legitimately mirror sids it just validated).
+            return False
         stream = _session_streams.ensure(
             sid,
             session_key=str((session or {}).get("session_key") or ""),
@@ -2590,6 +2596,13 @@ def _record_transport_subscription(
         # session's legacy routing). The handler already attached with the
         # caller's actual intent; the commit just re-affirms membership.
         commit_owner = method_name != "session.subscribe"
+        # claim/subscribe validated a LIVE record in their handler; if it
+        # vanished by commit time (a close won the race), the commit must fail
+        # without moving this socket's subscription off its previous valid
+        # attachment. Synthetic attach responses (session.resume/activate
+        # handlers overridden at the transport level) keep committing without
+        # a record, as documented below.
+        require_record = method_name in ("session.claim", "session.subscribe")
         read_subscription = getattr(transport, "current_session_subscription", None)
         deferred_cleanup: list[Callable[[], None]] = []
 
@@ -2604,6 +2617,8 @@ def _record_transport_subscription(
                     # this callback runs inside complete_session_subscription.
                     previous_sid = read_subscription()
                 session = _sessions.get(sid)
+                if session is None and require_record:
+                    return False
                 if session is not None:
                     if session.get("_finalized"):
                         return False
