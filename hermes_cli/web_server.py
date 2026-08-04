@@ -16071,6 +16071,33 @@ def _normalise_prefix(raw: Optional[str]) -> str:
     return normalise_prefix(raw)
 
 
+_DESKTOP_EMBED_SHIM_CACHE: "dict[str, str]" = {}
+
+
+def _desktop_embed_shim_script() -> str:
+    """Inline <script> for the serve-mode desktop bridge, or "".
+
+    Only fires when the served dist is a desktop RENDERER: the desktop build
+    ships ``electron-preload.js`` next to ``index.html``; the browser web UI
+    dist does not. Cached per dist path — the shim file is static.
+    """
+    try:
+        dist = str(WEB_DIST)
+        cached = _DESKTOP_EMBED_SHIM_CACHE.get(dist)
+        if cached is not None:
+            return cached
+        script = ""
+        if (WEB_DIST / "electron-preload.js").exists():
+            shim_path = Path(__file__).parent / "desktop_embed_shim.js"
+            body = shim_path.read_text(encoding="utf-8")
+            script = f"<script>{body}</script>"
+        _DESKTOP_EMBED_SHIM_CACHE[dist] = script
+        return script
+    except Exception:
+        _log.debug("desktop embed shim unavailable", exc_info=True)
+        return ""
+
+
 def _render_active_theme_bootstrap_css() -> str:
     """Critical-CSS shim for the active user theme.
 
@@ -16246,6 +16273,16 @@ def mount_spa(application: FastAPI):
         if theme_bootstrap:
             html = html.replace("</head>", f"{theme_bootstrap}</head>", 1)
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
+        # Serve-mode desktop bridge: when the served dist is a desktop
+        # renderer (it ships electron-preload.js; the browser web UI does
+        # not), inject the self-contained hermesDesktop shim AFTER the token
+        # bootstrap so the renderer can boot against this origin's own
+        # HTTP/WS in any host — plain browser tab, embedding webview or
+        # iframe — with no dependency on the host's bridge. A host bridge or
+        # proxy shim that got there first wins (the shim self-guards).
+        shim = _desktop_embed_shim_script()
+        if shim:
+            html = html.replace("</head>", f"{shim}</head>", 1)
         return HTMLResponse(
             html,
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"},

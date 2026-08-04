@@ -253,3 +253,45 @@ def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     assert runner_called["hit"] is False, (
         "POSIX must not take the Windows loop-factory branch"
     )
+
+
+class TestDesktopEmbedShim:
+    """Serve-mode bridge injection — the segregation contract.
+
+    When the dashboard serves a desktop RENDERER dist (marker:
+    electron-preload.js beside index.html), the served page must carry the
+    self-contained window.hermesDesktop shim so the renderer boots in any
+    host with no dependency on the host's Electron bridge or proxy. The
+    browser web UI dist must stay untouched.
+    """
+
+    def _make_dist(self, tmp_path, *, desktop: bool):
+        dist = tmp_path / ("desktop_dist" if desktop else "web_dist")
+        dist.mkdir()
+        (dist / "index.html").write_text("<html><head></head><body></body></html>")
+        if desktop:
+            (dist / "electron-preload.js").write_text("// bundled preload")
+        return dist
+
+    def test_desktop_dist_injects_shim(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(web_server, "WEB_DIST", self._make_dist(tmp_path, desktop=True))
+        web_server._DESKTOP_EMBED_SHIM_CACHE.clear()
+        script = web_server._desktop_embed_shim_script()
+        assert script.startswith("<script>") and script.endswith("</script>")
+        assert "hermesDesktop" in script
+        # Self-guarding: a host bridge that got there first must win.
+        assert "if (window.hermesDesktop) return" in script
+
+    def test_web_dist_is_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(web_server, "WEB_DIST", self._make_dist(tmp_path, desktop=False))
+        web_server._DESKTOP_EMBED_SHIM_CACHE.clear()
+        assert web_server._desktop_embed_shim_script() == ""
+
+    def test_cache_is_per_dist_path(self, tmp_path, monkeypatch):
+        desktop = self._make_dist(tmp_path, desktop=True)
+        web = self._make_dist(tmp_path, desktop=False)
+        web_server._DESKTOP_EMBED_SHIM_CACHE.clear()
+        monkeypatch.setattr(web_server, "WEB_DIST", desktop)
+        assert web_server._desktop_embed_shim_script() != ""
+        monkeypatch.setattr(web_server, "WEB_DIST", web)
+        assert web_server._desktop_embed_shim_script() == ""
