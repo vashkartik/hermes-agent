@@ -18,15 +18,27 @@
  * anyway).
  */
 
+import { atom } from 'nanostores'
+
 import { TRANSLATIONS } from './catalog'
 
 const HERMES_NAME_RE = /\bHermes(?: Desktop| Agent)?\b/g
+const HERMES_NAME_UPPER_RE = /\bHERMES(?: DESKTOP| AGENT)?\b/g
+
+/**
+ * The skin-announced agent name, for components that render the product name
+ * outside the i18n catalog (the chat intro wordmark). Null until a skin with
+ * a non-default branding.agent_name arrives.
+ */
+export const $agentBrandName = atom<string | null>(null)
 
 let appliedName: string | null = null
 
 /** Replace visible Hermes product-name mentions in one string. */
 export function brandString(value: string, agentName: string): string {
-  return value.replace(HERMES_NAME_RE, agentName)
+  return value
+    .replace(HERMES_NAME_UPPER_RE, agentName.toUpperCase())
+    .replace(HERMES_NAME_RE, agentName)
 }
 
 /** Deep in-place rebrand of a translations tree (objects/arrays of strings). */
@@ -80,6 +92,7 @@ export function applyAgentBranding(rawName: unknown): boolean {
   }
 
   appliedName = agentName
+  $agentBrandName.set(agentName)
 
   for (const locale of Object.keys(TRANSLATIONS) as Array<keyof typeof TRANSLATIONS>) {
     brandCatalogInPlace(TRANSLATIONS[locale], agentName)
@@ -99,4 +112,5 @@ export function applyAgentBranding(rawName: unknown): boolean {
 /** Test-only: clear the one-shot guard (catalog mutations are not restored). */
 export function __resetAgentBranding(): void {
   appliedName = null
+  $agentBrandName.set(null)
 }
