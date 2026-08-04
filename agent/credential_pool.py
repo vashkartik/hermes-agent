@@ -2300,6 +2300,11 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
+    token_changed = (
+        "access_token" in payload
+        and payload["access_token"] is not None
+        and payload["access_token"] != existing.access_token
+    )
     for key, value in payload.items():
         if key in {"id", "priority"} or value is None:
             continue
@@ -2311,6 +2316,15 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
         elif key in _EXTRA_KEYS:
             if existing.extra.get(key) != value:
                 extra_updates[key] = value
+    # When the credential token itself changes (key rotation), clear any
+    # exhaustion/error state — the old status is stale for the new key.
+    if token_changed and existing.last_status is not None:
+        field_updates["last_status"] = None
+        field_updates["last_status_at"] = None
+        field_updates["last_error_code"] = None
+        field_updates["last_error_reason"] = None
+        field_updates["last_error_message"] = None
+        field_updates["last_error_reset_at"] = None
     if field_updates or extra_updates:
         if extra_updates:
             field_updates["extra"] = {**existing.extra, **extra_updates}
@@ -2728,6 +2742,31 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
     return changed, active_sources
 
 
+# Prefer ~/.hermes/.env over os.environ — the user's config file is the
+# authoritative source for Hermes credentials. Stale env vars from parent
+# processes (Codex CLI, test scripts, etc.) should not override deliberate
+# changes to the .env file. load_env() memoizes on the .env mtime, so
+# per-call reads (pool seeding, per-turn credential refresh) cost a stat()
+# when the file is unchanged.
+def get_env_prefer_dotenv(key: str) -> str:
+    env_file = load_env()
+    raw = env_file.get(key, "").strip()
+    scoped_value = (_get_secret(key, "") or "").strip()
+    # If .env contains an unresolved op:// reference, prefer the
+    # already-resolved value supplied by the active secret scope (or by
+    # os.environ in legacy single-profile mode), set by
+    # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw
+    # "op://Vault/Item/field" string would otherwise win and every
+    # provider auth attempt would receive a URL instead of a key.  This
+    # happens during a partial migration, or when the user wrote op://
+    # references straight into .env rather than the secrets.onepassword
+    # config block.  For every non-op:// value the original
+    # .env-takes-precedence behaviour is preserved unchanged.
+    if raw.startswith("op://") and scoped_value:
+        return scoped_value
+    return raw or scoped_value
+
+
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
@@ -2746,27 +2785,10 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     if provider == "copilot":
         return False, active_sources
 
-    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
-    # authoritative source for Hermes credentials. Stale env vars from parent
-    # processes (Codex CLI, test scripts, etc.) should not override deliberate
-    # changes to the .env file.
-    def _get_env_prefer_dotenv(key: str) -> str:
-        env_file = load_env()
-        raw = env_file.get(key, "").strip()
-        scoped_value = (_get_secret(key, "") or "").strip()
-        # If .env contains an unresolved op:// reference, prefer the
-        # already-resolved value supplied by the active secret scope (or by
-        # os.environ in legacy single-profile mode), set by
-        # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw
-        # "op://Vault/Item/field" string would otherwise win and every
-        # provider auth attempt would receive a URL instead of a key.  This
-        # happens during a partial migration, or when the user wrote op://
-        # references straight into .env rather than the secrets.onepassword
-        # config block.  For every non-op:// value the original
-        # .env-takes-precedence behaviour is preserved unchanged.
-        if raw.startswith("op://") and scoped_value:
-            return scoped_value
-        return raw or scoped_value
+    # The .env-preferring resolution lives at module level
+    # (``get_env_prefer_dotenv``) so the pool seeder and the per-turn
+    # credential refresh share one implementation.
+    _get_env_prefer_dotenv = get_env_prefer_dotenv
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
