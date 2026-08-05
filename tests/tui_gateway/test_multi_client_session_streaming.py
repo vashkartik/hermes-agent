@@ -2140,6 +2140,72 @@ def test_build_settled_before_commit_replays_terminal_event(monkeypatch) -> None
         loop.close()
 
 
+def test_switched_away_durable_client_cannot_legacy_take_the_session(
+    monkeypatch,
+) -> None:
+    """Durable opt-in survives a session switch.
+
+    The switch-release detaches the per-stream Subscriber and its explicit
+    flag with it; a later old-session RPC re-attached the client through the
+    rebind path as NON-explicit, so session_is_owned_by treated it as a legacy
+    client and its stale prompt.submit forcibly reclaimed the session from the
+    current owner instead of returning 4092.
+    """
+    loop = asyncio.new_event_loop()
+    client = _RecordingWS(object(), loop, peer="sticky-durable-client")
+    x_owner = RecordingTransport()
+    sid_a = "sticky-durable-a"
+    sid_b = "sticky-durable-b"
+    server._sessions[sid_a] = session_a = _live_session_dict("stored-sticky-a", client)
+    server._sessions[sid_b] = _live_session_dict("stored-sticky-b", RecordingTransport())
+    server.register_live_transport(client)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(
+        server, "_handle_busy_submit", lambda rid, *_a, **_k: server._ok(rid, {"status": "queued"})
+    )
+    try:
+        generation = client.begin_session_subscription()
+        assert client.complete_session_subscription(generation, sid_a)
+        assert server.subscribe_session(sid_a, client, owner=True, explicit=True)
+
+        activate = server.dispatch(
+            {"jsonrpc": "2.0", "id": "activate-sticky-b",
+             "method": "session.activate", "params": {"session_id": sid_b}},
+            client,
+        )
+        assert activate is not None and "error" not in activate
+        assert client.observes_session(sid_b)
+
+        # Another durable device takes over the abandoned session.
+        x_owner.subscribe_session(sid_a)
+        assert server.subscribe_session(
+            sid_a, x_owner, owner=True, force=True, explicit=True
+        )
+        session_a["running"] = True
+
+        # The switched-away client's stale prompt must be refused, never
+        # allowed to force-take the session back as a "legacy" client.
+        response = server.dispatch(
+            {"jsonrpc": "2.0", "id": "stale-prompt-a",
+             "method": "prompt.submit",
+             "params": {"session_id": sid_a, "text": "stale"}},
+            client,
+        )
+        assert response is not None
+        assert "error" in response, f"stale prompt accepted: {response}"
+        assert response["error"]["code"] == 4092
+        assert server.session_owner(sid_a) is x_owner
+        assert session_a["transport"] is x_owner
+    finally:
+        server.unregister_live_transport(client)
+        client.close()
+        server._sessions.pop(sid_a, None)
+        server._sessions.pop(sid_b, None)
+        server.reset_session_streams()
+        loop.close()
+
+
 def test_conditional_close_excludes_claims_from_its_critical_section(
     monkeypatch,
 ) -> None:

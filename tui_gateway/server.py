@@ -1892,6 +1892,20 @@ def subscribe_session(
             # exists. Viewer attaches keep their historical semantics (the
             # rebind path may legitimately mirror sids it just validated).
             return False
+        # Durable opt-in is sticky at the TRANSPORT level, not just per
+        # stream: a session switch detaches the Subscriber (and its explicit
+        # flag with it), and a later old-session RPC re-attaches through the
+        # rebind path as non-explicit — which would let this client's stale
+        # prompt force-take the session from its current owner like a legacy
+        # client instead of being told 4092. Once a socket attaches
+        # explicitly anywhere, every later attach keeps the contract.
+        if explicit:
+            try:
+                transport._hermes_durable_client = True
+            except Exception:
+                pass
+        elif getattr(transport, "_hermes_durable_client", False):
+            explicit = True
         stream = _session_streams.ensure(
             sid,
             session_key=str((session or {}).get("session_key") or ""),
