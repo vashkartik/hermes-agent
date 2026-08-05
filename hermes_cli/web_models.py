@@ -313,6 +313,30 @@ class SessionImport(BaseModel):
     profile: Optional[str] = None
 
 
+class SessionMessageAppend(BaseModel):
+    """Body of ``POST /api/sessions/{session_id}/messages``.
+
+    External transcript writers (the Ace desktop shell's cron→home-chat
+    delivery, scripts) append one message per request. Semantic validation
+    (allowed roles, length caps, source charset) lives in the route handler
+    so the error surface is a 400 with an actionable detail string rather
+    than a pydantic 422.
+    """
+
+    role: str
+    content: str
+    # Writer provenance tag recorded in the message's display_metadata
+    # (e.g. Ace sends ``ace-cron-home-delivery``).
+    source: Optional[str] = None
+    # Idempotency key stored as the row's ``platform_message_id``; a retry
+    # carrying the same key returns the original row instead of appending
+    # a duplicate.
+    dedupe_key: Optional[str] = None
+    # Append into another profile's store (opens its state.db). Omit for
+    # the current/default profile.
+    profile: Optional[str] = None
+
+
 # --- from web_server.py (originally lines 12082-12090) ---
 
 class SessionRename(BaseModel):

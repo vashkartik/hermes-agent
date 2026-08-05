@@ -1663,6 +1663,22 @@ class CompressionSessionClosedError(RuntimeError):
         )
 
 
+class SessionArchivedError(RuntimeError):
+    """An opted-in writer targeted a session that is archived at write time.
+
+    Raised only when :meth:`SessionDB.append_message` is called with
+    ``reject_archived=True`` — the check runs inside the write transaction,
+    so a concurrent archive cannot slip a message into an archived session
+    between a route-level pre-check and the INSERT. Default writers (live
+    agent transcript flushes) never opt in: archiving a session mid-turn
+    must not abort the user's turn.
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        super().__init__(f"Session {session_id!r} is archived")
+
+
 class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
@@ -6254,9 +6270,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
+        reject_archived: bool = False,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
+
+        ``reject_archived`` refuses the append when the session row is
+        archived, checked INSIDE the write transaction so a concurrent
+        archive can't land between a caller's pre-check and the INSERT
+        (raises :class:`SessionArchivedError`). Opt-in — used by the
+        dashboard append route; live agent flushes keep the default because
+        archiving a session mid-turn must not abort the user's turn.
 
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
@@ -6323,6 +6347,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            if reject_archived:
+                archived_row = conn.execute(
+                    "SELECT archived FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if archived_row is not None and archived_row["archived"]:
+                    raise SessionArchivedError(session_id)
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -7850,6 +7881,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id, platform_message_id),
             )
             return cursor.fetchone() is not None
+
+    def _decode_message_row(self, row) -> Dict[str, Any]:
+        """Decode a raw ``messages`` row the way :meth:`get_messages` does
+        (content parts, display_metadata) for single-row lookup helpers."""
+        msg = dict(row)
+        if "content" in msg:
+            msg["content"] = self._decode_content(msg["content"])
+        if msg.get("display_metadata") is not None:
+            msg["display_metadata"] = self._decode_display_metadata(
+                msg["display_metadata"]
+            )
+        return msg
+
+    def find_message_by_platform_id(
+        self, session_id: str, platform_message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Row-returning sibling of :meth:`has_platform_message_id`.
+
+        Returns the earliest message carrying the given external id (decoded
+        like :meth:`get_messages` rows), or None. Used by the dashboard
+        append route to answer a deduplicated retry with the original row's
+        id instead of just a boolean.
+        """
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND platform_message_id = ? "
+                "ORDER BY id LIMIT 1",
+                (session_id, platform_message_id),
+            ).fetchone()
+        return self._decode_message_row(row) if row is not None else None
+
+    def get_last_message(
+        self, session_id: str, visible_only: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recently inserted message row for a session, or None.
+
+        Insertion order is AUTOINCREMENT ``id`` (same rationale as
+        :meth:`get_messages`). ``visible_only`` restricts the scan to rows a
+        user-visible transcript (GET with ``include_compacted``) would show
+        — ``active`` or ``compacted`` — so the dashboard append route's
+        retry-dedupe compares against what a reader actually sees, skipping
+        trailing rewound/undone rows instead of being blinded by them.
+        """
+        visibility_clause = (
+            " AND (active = 1 OR compacted = 1)" if visible_only else ""
+        )
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                f"SELECT * FROM messages WHERE session_id = ?{visibility_clause} "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return self._decode_message_row(row) if row is not None else None
 
     # =========================================================================
     # Export and cleanup

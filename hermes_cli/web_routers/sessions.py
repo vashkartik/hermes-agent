@@ -14,6 +14,8 @@ the late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 
 import asyncio  # noqa: F401 — used by handlers
 import logging
+import re
+import threading
 import time  # noqa: F401
 from typing import Any, Dict, List, Optional  # noqa: F401
 
@@ -23,6 +25,7 @@ from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
     SessionImport,
+    SessionMessageAppend,
     SessionPrune,
     SessionRename,
 )
@@ -630,6 +633,205 @@ async def get_session_messages(
             "returned": len(messages),
         },
     }
+
+
+# --- POST /api/sessions/{session_id}/messages (transcript append) ----------
+#
+# Allowed roles are deliberately narrow: ``tool`` rows need tool_call_id
+# pairing and ``system`` rows would splice instructions into replay, so an
+# external writer gets neither.
+_SESSION_APPEND_ROLES = frozenset({"user", "assistant"})
+_SESSION_APPEND_MAX_CONTENT_CHARS = 1_000_000
+# Writer provenance tag (recorded in display_metadata): the shape Ace's
+# cron→home delivery sends (``ace-cron-home-delivery``) plus room for other
+# dotted/namespaced writer ids.
+_SESSION_APPEND_SOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}")
+_SESSION_APPEND_MAX_DEDUPE_KEY_CHARS = 200
+# Keyless retry-dedupe window: an identical (role, content, source) POST
+# landing right after its twin is a transport-level retry, not a new
+# message. 15 minutes comfortably covers client timeout + backoff retries
+# while leaving deliberate re-sends of the same text (rare through this
+# programmatic route) possible after the window.
+_SESSION_APPEND_DEDUPE_WINDOW_S = 900.0
+# Serializes the dedupe-check + append critical section. The sidecar is the
+# sole state.db writer in the desktop deployment, so an in-process lock is
+# enough to make concurrent identical retries collapse to one row.
+_session_append_lock = threading.Lock()
+
+
+@manage_router.post("/api/sessions/{session_id}/messages")
+async def append_session_message(
+    session_id: str,
+    body: SessionMessageAppend,
+    profile: Optional[str] = None,
+):
+    """Append one message to a session's visible transcript.
+
+    The write lands on the session's live tip: the id is resolved exactly
+    like the GET handler above (exact/prefix match, then
+    ``resolve_resume_session_id`` follows the compression chain), so a
+    message appended here is immediately visible to the next GET and to a
+    desktop resume of the same conversation.
+
+    Retry semantics (the Ace cron→home delivery in ace-coder#178 is the
+    canonical client): a request carrying ``dedupe_key`` is idempotent on
+    that key (stored as ``platform_message_id``, same mechanism as the
+    gateway's #47237 guard). Without a key, a POST identical in (role,
+    content, source) to the transcript's last visible message within a
+    15-minute window is answered with the existing row instead of a
+    duplicate. Ambiguous transport failures on the client side can
+    therefore be retried safely; responses carry ``deduplicated: true``
+    when the row already existed.
+
+    Error contract: 404 unknown session (client drops its pin and
+    re-picks), 405 never happens once this route exists (GET-only builds
+    return it — Ace's capability probe), 409 archived or
+    compression-closed (no write happened; re-resolve and retry), 503
+    compression in progress (no write happened; retry shortly).
+    """
+    from hermes_state import (
+        CompressionSessionClosedError,
+        SessionArchivedError,
+        SessionCompressionInProgressError,
+    )
+
+    if body.role not in _SESSION_APPEND_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail="role must be one of: user, assistant",
+        )
+    if not body.content or not body.content.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="content must be a non-empty string",
+        )
+    if len(body.content) > _SESSION_APPEND_MAX_CONTENT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "content exceeds the maximum length of "
+                f"{_SESSION_APPEND_MAX_CONTENT_CHARS} characters"
+            ),
+        )
+    if body.source is not None and not _SESSION_APPEND_SOURCE_RE.fullmatch(body.source):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "source must be 1-120 characters of [A-Za-z0-9._:-] "
+                "starting with an alphanumeric"
+            ),
+        )
+    if body.dedupe_key is not None and (
+        not body.dedupe_key.strip()
+        or len(body.dedupe_key) > _SESSION_APPEND_MAX_DEDUPE_KEY_CHARS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "dedupe_key must be 1-"
+                f"{_SESSION_APPEND_MAX_DEDUPE_KEY_CHARS} non-blank characters"
+            ),
+        )
+    # ``?profile=`` is accepted for symmetry with the GET routes, but a
+    # conflicting body value would silently write into the wrong store —
+    # reject instead of guessing.
+    if profile and body.profile and profile != body.profile:
+        raise HTTPException(
+            status_code=400,
+            detail="profile query parameter and body value disagree",
+        )
+    target_profile = body.profile or profile
+
+    def _matches_last_visible(last: Optional[Dict[str, Any]]) -> bool:
+        # ``last`` is the transcript's last VISIBLE row (the query skips
+        # rewound/undone rows), so a rewound twin never matches here: the
+        # last visible row is then some other message and the retry appends
+        # fresh — "ensure the message is in the transcript" semantics.
+        if not last:
+            return False
+        if last.get("role") != body.role or last.get("content") != body.content:
+            return False
+        last_source = (last.get("display_metadata") or {}).get("source")
+        if (last_source or None) != (body.source or None):
+            return False
+        try:
+            age = abs(time.time() - float(last.get("timestamp") or 0))
+        except (TypeError, ValueError):
+            return False
+        return age <= _SESSION_APPEND_DEDUPE_WINDOW_S
+
+    def _append():
+        db = _open_session_db_for_profile(target_profile, read_only=False)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            sid = db.resolve_resume_session_id(sid)
+            session = db.get_session(sid)
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if session.get("archived"):
+                raise HTTPException(status_code=409, detail="Session is archived")
+            with _session_append_lock:
+                if body.dedupe_key:
+                    existing = db.find_message_by_platform_id(sid, body.dedupe_key)
+                    if existing:
+                        return {
+                            "ok": True,
+                            "session_id": sid,
+                            "message_id": existing["id"],
+                            "deduplicated": True,
+                        }
+                else:
+                    last = db.get_last_message(sid, visible_only=True)
+                    if _matches_last_visible(last):
+                        return {
+                            "ok": True,
+                            "session_id": sid,
+                            "message_id": last["id"],
+                            "deduplicated": True,
+                        }
+                try:
+                    message_id = db.append_message(
+                        sid,
+                        role=body.role,
+                        content=body.content,
+                        platform_message_id=body.dedupe_key or None,
+                        display_metadata=(
+                            {"source": body.source} if body.source else None
+                        ),
+                        # Belt-and-braces on the pre-check above: re-checked
+                        # inside the write txn so a concurrent archive can't
+                        # slip a message into an archived session.
+                        reject_archived=True,
+                    )
+                except SessionArchivedError:
+                    raise HTTPException(
+                        status_code=409, detail="Session is archived"
+                    )
+                except SessionCompressionInProgressError:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Session is being compressed; retry shortly",
+                    )
+                except CompressionSessionClosedError:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Session was closed by compression; retry to land "
+                            "on the continuation"
+                        ),
+                    )
+            return {
+                "ok": True,
+                "session_id": sid,
+                "message_id": message_id,
+                "deduplicated": False,
+            }
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_append)
 
 
 @manage_router.delete("/api/sessions/{session_id}")
