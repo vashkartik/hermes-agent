@@ -494,6 +494,25 @@ class SessionStream:
             self._touched_at = time.time()
             return self._turn_id
 
+    def rearm_turn_if_terminal_seen(self, request_id: Optional[str] = None) -> bool:
+        """Begin a fresh turn only when the previous one delivered its terminal.
+
+        Synthetic turn entries (goal continuation, auto-continue, notification
+        delivery) start turns without a ``prompt.submit``; without re-arming,
+        their terminal frame would be suppressed as a duplicate of the previous
+        turn's and every attached client would stay stuck busy. Entries that
+        already armed (``prompt.submit``, the queued drain) keep their
+        request-id binding — this is a no-op for them.
+        """
+        with self._lock:
+            if not self._turn_terminal_seen:
+                return False
+            self._turn_id += 1
+            self._turn_request_id = request_id
+            self._turn_terminal_seen = False
+            self._touched_at = time.time()
+            return True
+
     def turn_request_id(self) -> Optional[str]:
         with self._lock:
             return self._turn_request_id

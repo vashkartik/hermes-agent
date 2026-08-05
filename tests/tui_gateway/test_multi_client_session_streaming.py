@@ -2140,6 +2140,47 @@ def test_build_settled_before_commit_replays_terminal_event(monkeypatch) -> None
         loop.close()
 
 
+def test_synthetic_turn_entry_rearms_the_terminal_gate(monkeypatch) -> None:
+    """A turn started outside prompt.submit still delivers its terminal.
+
+    Goal continuation, auto-continue, and notification turns enter through
+    _run_prompt_submit without the prompt.submit/queued-drain
+    begin_session_turn; after the previous turn's terminal, the fan-out
+    suppressed the synthetic turn's terminal as a duplicate — every attached
+    client stayed stuck busy.
+    """
+    sid = "synthetic-turn-rearm"
+    client = RecordingTransport()
+    session = _live_session_dict("stored-synthetic-rearm", client)
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_claim_update_turn", lambda _session: False)
+    try:
+        assert server.subscribe_session(sid, client, owner=True, explicit=True)
+        stream = server._session_streams.get(sid)
+        assert stream is not None
+        # The previous turn ran to completion: its terminal was delivered.
+        stream.begin_turn(None)
+        assert stream.deliver(
+            server._event_frame("message.complete", sid, {"text": "done"})
+        )
+        frames_before = len(client.frames)
+
+        # A synthetic entry (auto-continue shape; the update-blocked branch
+        # emits a terminal error) must re-arm the gate so its terminal reaches
+        # the client instead of being suppressed as a duplicate.
+        server._run_prompt_submit(
+            "synthetic-rid", sid, session, "continue", display_kind="auto_continue"
+        )
+        terminal_types = [
+            (frame.get("params") or {}).get("type")
+            for frame in client.frames[frames_before:]
+        ]
+        assert "error" in terminal_types
+    finally:
+        server._sessions.pop(sid, None)
+        server.reset_session_streams()
+
+
 def test_switched_away_durable_client_cannot_legacy_take_the_session(
     monkeypatch,
 ) -> None:

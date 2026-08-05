@@ -10691,6 +10691,15 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> None:
+    # Common turn-entry boundary: synthetic turns (goal continuation,
+    # auto-continue, notification delivery) reach here without the
+    # prompt.submit/queued-drain begin_session_turn. If the previous turn
+    # already delivered its terminal, re-arm the fan-out so this turn's
+    # terminal is not suppressed as a duplicate; armed entries keep their
+    # request-id binding (no-op).
+    stream = _session_streams.get(sid)
+    if stream is not None:
+        stream.rearm_turn_if_terminal_seen()
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
