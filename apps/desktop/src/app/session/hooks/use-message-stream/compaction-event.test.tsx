@@ -18,6 +18,7 @@ import { useMessageStream } from './index'
 const SID = 'session-1'
 const OTHER_SID = 'session-2'
 let handleEvent: ((event: RpcEvent) => void) | null = null
+const hydrateFromStoredSession = vi.fn(async () => undefined)
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(SID)
@@ -26,7 +27,7 @@ function Harness() {
 
   const stream = useMessageStream({
     activeSessionIdRef,
-    hydrateFromStoredSession: vi.fn(async () => undefined),
+    hydrateFromStoredSession,
     queryClient: queryClientRef.current,
     refreshHermesConfig: vi.fn(async () => undefined),
     refreshSessions: vi.fn(async () => undefined),
@@ -81,6 +82,7 @@ function QueueHarness({ onSubmit }: { onSubmit: ChatBarProps['onSubmit'] }) {
 describe('useMessageStream compaction lifecycle', () => {
   beforeEach(() => {
     handleEvent = null
+    hydrateFromStoredSession.mockClear()
     window.localStorage.clear()
     $compactingSessions.set({})
     $queuedPromptsBySession.set({})
@@ -157,6 +159,27 @@ describe('useMessageStream compaction lifecycle', () => {
     setSessionCompacting(SID, true)
     emit('message.delta', { text: 'later independent turn' })
     expect($compactingSessions.get()).toEqual({ [OTHER_SID]: true, [SID]: true })
+  })
+
+  it('suppresses stored-transcript hydration for a compacted turn that resumed', async () => {
+    await mountStream()
+
+    emit('status.update', { kind: 'compacting' })
+    // The first post-summarization output retires the phase LABEL only.
+    emit('message.delta', { text: 'post-compaction output' })
+    expect(isSessionCompacting(SID)).toBe(false)
+
+    // The per-turn compacted marker must survive until completion: an empty
+    // terminal frame would otherwise hydrate the stored summary-only
+    // transcript over the live scrollback.
+    emit('message.complete', {})
+    expect(hydrateFromStoredSession).not.toHaveBeenCalled()
+
+    // The suppression is per compacted turn, not sticky: a later
+    // non-compacted empty completion hydrates normally.
+    emit('message.delta', { text: 'next turn output' })
+    emit('message.complete', {})
+    expect(hydrateFromStoredSession).toHaveBeenCalledTimes(1)
   })
 
   it('does not make a queued follow-up eligible until the original turn resumes after compacted', async () => {
