@@ -126,9 +126,9 @@ class SessionStream:
     """
 
     __slots__ = (
-        "sid", "session_key", "profile_key", "_lock", "_subs", "_seq",
-        "_replay", "_replay_floor", "_turn_id", "_turn_request_id",
-        "_turn_terminal_seen", "_touched_at",
+        "sid", "session_key", "profile_key", "_lock", "_delivery_lock",
+        "_subs", "_seq", "_replay", "_replay_floor", "_turn_id",
+        "_turn_request_id", "_turn_terminal_seen", "_touched_at",
     )
 
     def __init__(self, sid: str, *, session_key: str = "", profile_key: str = "") -> None:
@@ -136,6 +136,14 @@ class SessionStream:
         self.session_key = session_key
         self.profile_key = profile_key
         self._lock = threading.RLock()
+        # Serialize whole deliveries without holding the state lock across
+        # transport I/O.  In particular, WSTransport failure handling takes
+        # its subscription lock, whose ordered-attach callback can re-enter
+        # this stream through attach().
+        # Real transports never synchronously re-enter session delivery. A
+        # non-reentrant lock makes that invariant explicit: recursive delivery
+        # would otherwise interleave a newer sequence into an older fan-out.
+        self._delivery_lock = threading.Lock()
         self._subs: list[Subscriber] = []
         self._seq = 0
         self._replay: deque[dict] = deque(maxlen=REPLAY_FRAMES or 1)
@@ -194,6 +202,7 @@ class SessionStream:
         explicit: bool = False,
         client: str = "",
         is_dead: Optional[Callable[[Any], bool]] = None,
+        on_owner: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Attach ``transport``; return True when it holds ownership.
 
@@ -202,6 +211,12 @@ class SessionStream:
         slot is held by a dead/detached peer takes over implicitly — that is
         the reconnect case.  Re-attaching an already-present transport is
         idempotent and never downgrades it.
+
+        ``on_owner`` runs under the stream lock whenever this call reports
+        ownership, so the caller's mirror of the owner (the legacy
+        ``session["transport"]`` slot) commits atomically with the ownership
+        flip — racing claims can never leave the two disagreeing. It must be
+        cheap and lock-free.
         """
         with self._lock:
             existing = self._find(transport)
@@ -215,6 +230,8 @@ class SessionStream:
             existing.explicit = existing.explicit or explicit
 
             if not owner:
+                if existing.owner and on_owner is not None:
+                    on_owner()
                 return existing.owner
 
             current = next((s for s in self._subs if s.owner and s is not existing), None)
@@ -226,6 +243,8 @@ class SessionStream:
                     return False
                 current.owner = False
             existing.owner = True
+            if on_owner is not None:
+                on_owner()
             return True
 
     def detach(self, transport: Any) -> bool:
@@ -237,21 +256,58 @@ class SessionStream:
             self._subs.remove(sub)
             return sub.owner
 
-    def promote_next_owner(self) -> Any:
-        """Hand ownership to the longest-attached remaining peer.
+    def demote_owner(self, transport: Any) -> bool:
+        """Clear ownership if ``transport`` currently holds it.
 
-        Called when the owner disconnects while another device is still
-        watching: the session must survive on the surviving client rather than
-        be detached to the orphan reaper. Returns the new owner transport, or
-        ``None`` when nobody is left.
+        Used when a promotion's validated installation fails (the heir
+        switched away or a newer claim moved the legacy slot): the registry
+        must never keep crowning a transport the slot rejected — a dead or
+        departed registry owner makes ``session_is_owned_by`` grant every
+        viewer mutation at once.
         """
         with self._lock:
-            if any(sub.owner for sub in self._subs):
-                return next(sub.transport for sub in self._subs if sub.owner)
-            if not self._subs:
+            sub = self._find(transport)
+            if sub is None or not sub.owner:
+                return False
+            sub.owner = False
+            return True
+
+    def promote_next_owner(
+        self,
+        *,
+        is_dead: Optional[Callable[[Any], bool]] = None,
+        on_owner: Optional[Callable[[Any], None]] = None,
+    ) -> Any:
+        """Hand ownership to the longest-attached remaining peer.
+
+        Called when the owner disconnects or switches away while another
+        device is still watching: the session must survive on the surviving
+        client rather than be detached to the orphan reaper. Returns the new
+        owner transport, or ``None`` when nobody (live) is left.
+
+        ``is_dead`` filters candidates so a dead socket is never crowned.
+        ``on_owner`` runs under the stream lock only when this call actually
+        promotes a new owner, receiving the promoted transport — the caller's
+        legacy ``session["transport"]`` mirror commits atomically with the
+        promotion, so a racing forced claim (which also commits owner+mirror
+        under this lock) can never win the registry while the mirror keeps
+        the heir. An already-present owner is returned without invoking it;
+        whoever installed that owner already mirrored it.
+        """
+        with self._lock:
+            current = next((s.transport for s in self._subs if s.owner), None)
+            if current is not None:
+                return current
+            candidates = [
+                sub for sub in self._subs
+                if not (is_dead(sub.transport) if is_dead else False)
+            ]
+            if not candidates:
                 return None
-            heir = min(self._subs, key=lambda s: s.attached_at)
+            heir = min(candidates, key=lambda s: s.attached_at)
             heir.owner = True
+            if on_owner is not None:
+                on_owner(heir.transport)
             return heir.transport
 
     # -- delivery -----------------------------------------------------------
@@ -288,7 +344,43 @@ class SessionStream:
             return None
 
         event_type = params.get("type")
+        with self._delivery_lock:
+            return self._deliver_locked(frame, event_type)
+
+    def deliver_resolved(
+        self, build_frame: Callable[[Any], Optional[dict]]
+    ) -> Optional[bool]:
+        """Stamp and fan out a frame built from state read at delivery time.
+
+        ``build_frame`` receives the CURRENT owner transport (or ``None``) and
+        may return ``None`` to skip. Resolution, frame construction, and the
+        sequence stamp happen in ONE state-lock critical section (ownership
+        transitions also take that lock), so a frame can never be sequenced
+        after a transition while carrying pre-transition content — the
+        announcement each peer receives last always names the newest owner.
+        ``build_frame`` runs under the stream lock: it must be cheap and
+        lock-free.
+        """
+        with self._delivery_lock:
+            return self._deliver_locked(None, None, resolve=build_frame)
+
+    def _deliver_locked(
+        self,
+        frame: Optional[dict],
+        event_type: Any,
+        *,
+        resolve: Optional[Callable[[Any], Optional[dict]]] = None,
+    ) -> Optional[bool]:
+        """Body of :meth:`deliver`; caller holds ``_delivery_lock``."""
         with self._lock:
+            if resolve is not None:
+                owner = next(
+                    (sub.transport for sub in self._subs if sub.owner), None
+                )
+                frame = resolve(owner)
+                if frame is None:
+                    return None
+                event_type = (frame.get("params") or {}).get("type")
             if not self._subs:
                 return None
             if event_type in TERMINAL_EVENT_TYPES:
@@ -309,29 +401,69 @@ class SessionStream:
                 self._replay.append(stamped)
                 if self._replay_floor == 0 and self._replay:
                     self._replay_floor = (self._replay[0].get("params") or {}).get("seq") or 0
+            # Freeze both membership and role. Ownership can change while
+            # writes run, but this frame keeps the routing decision made
+            # at its sequence point.
+            subscribers = [(sub, sub.owner) for sub in self._subs]
 
-            delivered = False
-            dead: list[Subscriber] = []
-            for sub in list(self._subs):
-                try:
-                    ok = sub.transport.write(stamped)
-                except Exception:
-                    logger.debug(
-                        "session stream write raised sid=%s client=%s",
-                        self.sid, sub.client, exc_info=True,
-                    )
-                    ok = False
+        # Queue non-authoritative viewers first. WSTransport's observer
+        # path is bounded and nonblocking; generic/stdio transports retain
+        # their historical write() fallback.
+        results: list[tuple[Subscriber, bool]] = []
+        ordered = [item for item in subscribers if not item[1]]
+        ordered.extend(item for item in subscribers if item[1])
+        for sub, was_owner in ordered:
+            try:
+                # Durable sockets — those tracking a committed session
+                # subscription — accept frames through the session-gated
+                # enqueue: the subscription check and queue admission are
+                # one atomic step under the transport's subscription lock,
+                # so a frame selected here before a switch committed can
+                # never enqueue after it — for OWNERS as well as viewers
+                # (the ungated owner write was the leak). Sockets with no
+                # tracked subscription (legacy clients attached server-side
+                # by the rebind/prompt-reclaim paths) and transports
+                # without the gate (stdio, in-process) keep their
+                # historical writer: they never committed an attach, so
+                # there is no newer subscription to protect.
+                gated = getattr(
+                    sub.transport, "write_observer_if_subscribed", None
+                )
+                tracked = getattr(
+                    sub.transport, "current_session_subscription", None
+                )
+                if callable(gated) and callable(tracked) and tracked() is not None:
+                    ok = bool(gated(self.sid, stamped))
+                else:
+                    writer = None
+                    if not was_owner:
+                        writer = getattr(sub.transport, "write_observer", None)
+                    if not callable(writer):
+                        writer = sub.transport.write
+                    ok = bool(writer(stamped))
+            except Exception:
+                logger.debug(
+                    "session stream write raised sid=%s client=%s",
+                    self.sid, sub.client, exc_info=True,
+                )
+                ok = False
+            results.append((sub, ok))
+
+        delivered = any(ok for _, ok in results)
+        with self._lock:
+            for sub, ok in results:
+                # A detach followed by a reattach can install a new
+                # Subscriber for the same transport while I/O is in
+                # flight. Never update or remove that replacement.
+                if not any(current is sub for current in self._subs):
+                    continue
                 if ok:
                     sub.last_seq = seq
-                    delivered = True
                 else:
-                    dead.append(sub)
-            for sub in dead:
-                # A peer that reports "gone" is detached here; the WS teardown
-                # path will also call detach() and both are idempotent.
-                if sub in self._subs:
+                    # WS teardown also detaches and both paths are
+                    # intentionally idempotent.
                     self._subs.remove(sub)
-            return delivered
+        return delivered
 
     def replay_since(self, after_seq: int) -> tuple[list[dict], bool, int]:
         """Frames newer than ``after_seq``.
@@ -361,6 +493,25 @@ class SessionStream:
             self._turn_terminal_seen = False
             self._touched_at = time.time()
             return self._turn_id
+
+    def rearm_turn_if_terminal_seen(self, request_id: Optional[str] = None) -> bool:
+        """Begin a fresh turn only when the previous one delivered its terminal.
+
+        Synthetic turn entries (goal continuation, auto-continue, notification
+        delivery) start turns without a ``prompt.submit``; without re-arming,
+        their terminal frame would be suppressed as a duplicate of the previous
+        turn's and every attached client would stay stuck busy. Entries that
+        already armed (``prompt.submit``, the queued drain) keep their
+        request-id binding — this is a no-op for them.
+        """
+        with self._lock:
+            if not self._turn_terminal_seen:
+                return False
+            self._turn_id += 1
+            self._turn_request_id = request_id
+            self._turn_terminal_seen = False
+            self._touched_at = time.time()
+            return True
 
     def turn_request_id(self) -> Optional[str]:
         with self._lock:

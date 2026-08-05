@@ -77,6 +77,13 @@ describe('ComposerControls shortcut tooltips', () => {
 
     await expectShortcutTooltip('Queue message', 'Ctrl+↵')
   })
+
+  it('shows a disabled Queue action instead of voice while compaction has no draft', () => {
+    renderControls({ busy: true, busyAction: 'queue', canSubmit: false, hasComposerPayload: false })
+
+    expect((screen.getByRole('button', { name: 'Queue message' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Start voice conversation' })).toBeNull()
+  })
 })
 
 describe('wake-word ear visibility', () => {

@@ -47,6 +47,7 @@ class TestMem0V3Tools:
 
     def _make_provider(self, monkeypatch, backend):
         provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
         provider.initialize("test-session")
         provider._user_id = "u123"
         provider._agent_id = "hermes"
@@ -85,6 +86,7 @@ class TestMem0UpdateDelete:
 
     def _make_provider(self, monkeypatch, backend):
         provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
         provider.initialize("test-session")
         provider._user_id = "u123"
         provider._agent_id = "hermes"
@@ -117,6 +119,7 @@ class TestMem0ErrorHandling:
 
     def _make_provider(self, monkeypatch, backend):
         provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
         provider.initialize("test-session")
         provider._user_id = "u123"
         provider._agent_id = "hermes"
@@ -128,6 +131,7 @@ class TestMem0V3Internal:
 
     def _make_provider(self, monkeypatch, backend):
         provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
         provider.initialize("test-session")
         provider._user_id = "u123"
         provider._agent_id = "hermes"
@@ -157,6 +161,7 @@ class TestMem0Prefetch:
 
     def _make_provider(self, backend):
         provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
         provider.initialize("test-session")
         provider._user_id = "u123"
         provider._agent_id = "hermes"
@@ -267,6 +272,7 @@ class TestMem0ModeSwitch:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("MEM0_API_KEY", "test-key")
         provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
         provider.initialize("test")
         assert provider._mode == "platform"
 
@@ -277,6 +283,7 @@ class TestMem0ModeSwitch:
         config_path.write_text('{"user_id": "old-user"}')
         monkeypatch.setenv("MEM0_API_KEY", "test-key")
         provider = Mem0MemoryProvider()
+        provider._create_backend = lambda: None  # type: ignore[method-assign]
         provider.initialize("test")
         assert provider._mode == "platform"
         assert provider._user_id == "old-user"

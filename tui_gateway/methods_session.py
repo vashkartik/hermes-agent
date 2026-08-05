@@ -106,7 +106,7 @@ def _(rid, params: dict) -> dict:
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
-            "transport": current_transport() or _stdio_transport,
+            "transport": _request_session_transport(),
         }
         _register_session_cwd(_sessions[sid])
     _bind_creator_as_owner(sid)

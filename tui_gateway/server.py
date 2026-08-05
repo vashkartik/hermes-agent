@@ -161,6 +161,10 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_defer_session_ownership: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_gateway_defer_session_ownership",
+    default=False,
+)
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -327,6 +331,14 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
+
+
+def _request_session_transport() -> Transport:
+    """Choose initial ownership without pre-committing an ordered attach."""
+    transport = current_transport() or _stdio_transport
+    if _defer_session_ownership.get() and transport is not _stdio_transport:
+        return _detached_ws_transport
+    return transport
 
 
 class _SlashWorker:
@@ -1087,8 +1099,21 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         with _session_resume_lock:
             current = _sessions.get(sid)
             if not _ws_session_is_orphaned(current):
-                return
-            if _session_has_active_delegations(sid, current):
+                if (
+                    current is not None
+                    and not current.get("_finalized")
+                    and current.get("transport") is _detached_ws_transport
+                ):
+                    # Still parked, but protected by a running turn or accepted
+                    # work. This timer is the record's only prompt collector —
+                    # returning without rearming would strand the session until
+                    # the multi-hour idle TTL once the work finishes (routine
+                    # for a client that switches away mid-turn). Keep watching.
+                    reschedule = True
+                else:
+                    # Revived by a live transport, or already finalized/popped.
+                    return
+            elif _session_has_active_delegations(sid, current):
                 reschedule = True
             else:
                 session = _pop_session_by_id(sid)
@@ -1139,28 +1164,129 @@ def _close_sessions_for_transport(
         # unattended half of the handoff story (desktop sleeps, phone keeps the
         # turn) and it settles immediately, inside this teardown.
         heir = None
+        stream = None
+        # on_owner fires only when promote_next_owner actually CROWNS someone;
+        # an already-current owner (e.g. a claim that raced this teardown) is
+        # returned without it — and must never be demoted below.
+        promoted_here: list[Any] = []
         try:
             stream = _session_streams.get(sid)
-            heir = stream.promote_next_owner() if stream is not None else None
+            # Dead sockets are never crowned: a dead registry owner makes
+            # session_is_owned_by grant every viewer mutation at once.
+            heir = (
+                stream.promote_next_owner(
+                    is_dead=_transport_is_dead, on_owner=promoted_here.append
+                )
+                if stream is not None
+                else None
+            )
         except Exception:
             logger.debug("session stream owner promotion failed sid=%s", sid, exc_info=True)
         if heir is not None and not _transport_is_dead(heir):
-            session["transport"] = heir
-            _emit(
-                "session.owner_changed",
-                sid,
-                {"reason": end_reason, "client": _stream_client_label(heir)},
-            )
-            continue
+            claim_heir = getattr(heir, "promote_session_if_subscribed", None)
+            if callable(claim_heir):
+                # Validate + install atomically under the heir's subscription
+                # lock. A heir that switches sessions between promotion and
+                # install has already detached itself from this stream — it
+                # must not be re-installed as the ungated legacy owner.
+                def assign_heir() -> bool:
+                    with _sessions_lock:
+                        if (
+                            _sessions.get(sid) is session
+                            and session.get("transport") is transport
+                        ):
+                            session["transport"] = heir
+                            return True
+                    return False
+
+                installed = bool(claim_heir(sid, assign_heir))
+            else:
+                session["transport"] = heir
+                installed = True
+            if installed:
+                _announce_session_owner(sid, end_reason, fallback=heir)
+                continue
+            # An heir THIS teardown promoted vanished mid-install (its own
+            # disconnect, a session switch, or a newer claim moved the slot).
+            # Never leave the registry crowning a transport the slot rejected —
+            # but an owner someone else installed (a racing claim) was not our
+            # promotion and stays crowned.
+            if promoted_here:
+                try:
+                    if stream is not None:
+                        stream.demote_owner(heir)
+                except Exception:
+                    logger.debug(
+                        "failed-install owner demotion failed sid=%s", sid, exc_info=True
+                    )
+        # Ownership can move (a racing claim, a resume) between the owned
+        # snapshot above and here; a session that is no longer this
+        # transport's must not be closed or parked by its old owner's exit.
+        with _sessions_lock:
+            if (
+                _sessions.get(sid) is not session
+                or session.get("transport") is not transport
+            ):
+                continue
         if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
+            # The predicate revalidates atomically under the teardown funnel's
+            # own lock: a claim landing after the check above must keep its
+            # freshly-claimed session, so only a still-orphaned record closes.
+            if _close_session_by_id(
+                sid,
+                end_reason=end_reason,
+                predicate=lambda current: current is session
+                and current.get("transport") is transport,
+            ):
+                reaped += 1
         else:
+            with _live_transports_lock:
+                successor = None
+                for candidate in _live_transports:
+                    if candidate is transport or _transport_is_dead(candidate):
+                        continue
+                    claim = getattr(candidate, "promote_session_if_subscribed", None)
+                    if not callable(claim):
+                        continue
+
+                    def assign_successor() -> bool:
+                        # Keep assignment inside the candidate's subscription
+                        # lock and the live registry lock. A concurrent switch
+                        # or disconnect lands wholly before or after this claim.
+                        with _sessions_lock:
+                            if (
+                                _sessions.get(sid) is not session
+                                or session.get("transport") is not transport
+                            ):
+                                return False
+                            # Registry + legacy slot commit as one step
+                            # (attach mirrors under the stream lock), so the
+                            # promoted successor is the stream owner too —
+                            # not a slot-only owner beside an ownerless or
+                            # stale registry.
+                            return bool(
+                                subscribe_session(sid, candidate, owner=True)
+                            )
+
+                    if claim(sid, assign_successor):
+                        successor = candidate
+                        break
+            if successor is not None:
+                continue
             # Point detached sessions at the drop sentinel (NOT real stdio) so
             # _ws_session_is_orphaned recognizes them and the grace-reap can
             # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            session["transport"] = _detached_ws_transport
-            detached += 1
+            # The owned snapshot above can go stale while successor selection
+            # runs. Re-check authoritative ownership before parking the
+            # session so teardown cannot clobber a concurrent activate/resume.
+            with _sessions_lock:
+                if (
+                    _sessions.get(sid) is not session
+                    or session.get("transport") is not transport
+                ):
+                    continue
+                session["transport"] = _detached_ws_transport
+                detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
             except Exception:
@@ -1650,8 +1776,9 @@ def write_json(obj: dict) -> bool:
     Precedence:
 
     1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+       plus connected WebSocket clients subscribed to that same live session.
+       The owner remains the authoritative write result, while observers mirror
+       the live stream without crossing session or profile boundaries.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -1670,7 +1797,29 @@ def write_json(obj: dict) -> bool:
                 _note_stream_activity(sid, obj)
                 return delivered
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+            with _live_transports_lock:
+                candidates = [transport for transport in _live_transports if transport is not t]
+            delivered = False
+            for transport in candidates:
+                try:
+                    write_if_subscribed = getattr(
+                        transport, "write_observer_if_subscribed", None
+                    )
+                    if callable(write_if_subscribed):
+                        delivered = write_if_subscribed(sid, obj) or delivered
+                except Exception:
+                    # Mirroring is best-effort: one stale observer must not
+                    # break the authoritative session stream.
+                    logger.debug(
+                        "session-event observer write failed sid=%s type=%s",
+                        sid,
+                        (obj.get("params") or {}).get("type"),
+                        exc_info=True,
+                    )
+            # Mirror first: a suspended authoritative socket may wait up to the
+            # transport timeout, but a healthy observer still sees the frame.
+            owner_delivered = t.write(obj)
+            return owner_delivered or delivered
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -1728,23 +1877,58 @@ def subscribe_session(
     """
     if not sid or transport is None:
         return False
-    session = _sessions.get(sid)
-    stream = _session_streams.ensure(
-        sid,
-        session_key=str((session or {}).get("session_key") or ""),
-        profile_key=str((session or {}).get("profile_home") or ""),
-    )
-    became_owner = stream.attach(
-        transport,
-        owner=owner,
-        force=force,
-        explicit=explicit,
-        client=_stream_client_label(transport),
-        is_dead=_transport_is_dead,
-    )
-    if became_owner and session is not None:
-        session["transport"] = transport
-    return became_owner
+    # One lifecycle serialization domain: ownership mutation shares
+    # ``_sessions_lock`` with the conditional-close predicate+pop
+    # (``_close_session_by_id``) and the release path, so a claim can never
+    # interleave inside their critical sections — a last-instant claim either
+    # lands wholly before (the predicate sees it and preserves the session) or
+    # wholly after (the record is already gone). ``_sessions_lock`` is an
+    # RLock; in-lock callers (ordered commits, prompt claims) nest safely.
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if owner and (session is None or session.get("_finalized")):
+            # A claim that lost the race against a completed close must fail
+            # rather than crown a ghost stream for a record that no longer
+            # exists. Viewer attaches keep their historical semantics (the
+            # rebind path may legitimately mirror sids it just validated).
+            return False
+        # Durable opt-in is sticky at the TRANSPORT level, not just per
+        # stream: a session switch detaches the Subscriber (and its explicit
+        # flag with it), and a later old-session RPC re-attaches through the
+        # rebind path as non-explicit — which would let this client's stale
+        # prompt force-take the session from its current owner like a legacy
+        # client instead of being told 4092. Once a socket attaches
+        # explicitly anywhere, every later attach keeps the contract.
+        if explicit:
+            try:
+                transport._hermes_durable_client = True
+            except Exception:
+                pass
+        elif getattr(transport, "_hermes_durable_client", False):
+            explicit = True
+        stream = _session_streams.ensure(
+            sid,
+            session_key=str((session or {}).get("session_key") or ""),
+            profile_key=str((session or {}).get("profile_home") or ""),
+        )
+        # The legacy-slot mirror commits inside the stream's ownership lock:
+        # two racing claims otherwise interleave so the registry crowns one
+        # owner while ``session["transport"]`` keeps the other, and disconnect
+        # cleanup (which selects by the legacy slot) then misses the real owner.
+        mirror = None
+        if session is not None:
+            def mirror() -> None:
+                session["transport"] = transport
+
+        return stream.attach(
+            transport,
+            owner=owner,
+            force=force,
+            explicit=explicit,
+            client=_stream_client_label(transport),
+            is_dead=_transport_is_dead,
+            on_owner=mirror,
+        )
 
 
 def unsubscribe_session(sid: str, transport: Any) -> bool:
@@ -1753,6 +1937,42 @@ def unsubscribe_session(sid: str, transport: Any) -> bool:
     if stream is None:
         return False
     return stream.detach(transport)
+
+
+def _announce_session_owner(sid: str, reason: str, *, fallback: Any = None) -> None:
+    """Publish ``session.owner_changed`` naming the owner AT DELIVERY TIME.
+
+    Ownership transitions from different paths (promotion on switch/disconnect,
+    forced ``session.claim``) can announce concurrently; capturing the owner in
+    the caller lets a stale transition publish after a newer one and leave
+    peers believing the wrong final owner. Resolving the owner inside the
+    stream's delivery serialization makes the later-delivered announcement
+    always reflect the newer state. ``fallback`` covers the no-stream /
+    no-subscriber case, where the historical single-transport emit applies and
+    no rival transition can race it.
+    """
+
+    def build_frame(owner: Any) -> dict | None:
+        current = owner if owner is not None else fallback
+        if current is None:
+            return None
+        return _event_frame(
+            "session.owner_changed",
+            sid,
+            {"reason": reason, "client": _stream_client_label(current)},
+        )
+
+    stream = _session_streams.get(sid)
+    if stream is not None:
+        delivered = stream.deliver_resolved(build_frame)
+        if delivered is not None:
+            return
+    if fallback is not None:
+        _emit(
+            "session.owner_changed",
+            sid,
+            {"reason": reason, "client": _stream_client_label(fallback)},
+        )
 
 
 def session_owner(sid: str) -> Any:
@@ -1851,6 +2071,8 @@ def _bind_creator_as_owner(sid: str) -> None:
     gateway keeps the historical single-transport route untouched (no stream,
     no ``seq`` stamping, no ownership checks).
     """
+    if _defer_session_ownership.get():
+        return
     t = current_transport()
     if t is None or t is _stdio_transport or t is _detached_ws_transport:
         return
@@ -2266,6 +2488,268 @@ def handle_request(req: dict) -> dict | None:
     return fn(rid, params)
 
 
+_SESSION_SUBSCRIPTION_METHODS = frozenset(
+    {
+        "prompt.submit",
+        "session.activate",
+        "session.branch",
+        "session.claim",
+        "session.create",
+        "session.resume",
+        "session.subscribe",
+    }
+)
+
+
+def _schedule_rejected_deferred_subscription(sid: str) -> None:
+    """Reap request-created state that no transport successfully claimed."""
+    with _sessions_lock:
+        if not _ws_session_is_orphaned(_sessions.get(sid)):
+            return
+    try:
+        _schedule_ws_orphan_reap(sid)
+    except Exception:
+        logger.debug(
+            "rejected subscription orphan scheduling failed sid=%s",
+            sid,
+            exc_info=True,
+        )
+
+
+def _release_stale_session_attachment(
+    previous_sid: str,
+    transport: Transport,
+    *,
+    reason: str = "session_switch",
+) -> tuple[bool, Callable[[], None] | None]:
+    """Close ``transport``'s attachment to the session it is leaving.
+
+    A socket observes exactly one session; when an attach RPC commits a newer
+    one (or the client explicitly unsubscribes), the old stream must not keep
+    this client in its fan-out — the owner slot writes through the ungated
+    ``write`` path, so a stale owner keeps receiving the abandoned session's
+    private frames. Mirrors the disconnect policy scoped to one session: a
+    watching peer inherits ownership, else the record parks on the drop
+    sentinel for the grace reaper (which rearms across running/pending work,
+    so a background turn survives).
+
+    Runs under ``_sessions_lock`` (and, on the switch path, the committing
+    transport's subscription lock). Returns ``(was_owner, deferred)``; the
+    deferred callable carries the emit/reap side effects and must be invoked
+    only after those locks are released.
+    """
+    stream = _session_streams.get(previous_sid)
+    was_owner = bool(stream.detach(transport)) if stream is not None else False
+    session = _sessions.get(previous_sid)
+    if session is None or session.get("_finalized"):
+        return was_owner, None
+    if not was_owner and session.get("transport") is not transport:
+        return was_owner, None
+    promoted: list[Any] = []
+    if was_owner and stream is not None:
+        try:
+            def _mirror(next_owner: Any) -> None:
+                # Runs under the stream lock, atomically with the promotion.
+                # A racing forced claim serializes on that lock and commits
+                # owner + mirror in one step too, so the registry owner and
+                # the legacy slot can never diverge between them.
+                session["transport"] = next_owner
+                promoted.append(next_owner)
+
+            stream.promote_next_owner(is_dead=_transport_is_dead, on_owner=_mirror)
+        except Exception:
+            logger.debug(
+                "stale-attachment owner promotion failed sid=%s",
+                previous_sid,
+                exc_info=True,
+            )
+    if promoted:
+        heir = promoted[0]
+
+        def _announce() -> None:
+            # Resolved at delivery time: a forced claim that landed right
+            # after the promotion is what peers hear about, not the stale heir.
+            _announce_session_owner(previous_sid, reason, fallback=heir)
+
+        return was_owner, _announce
+    if session.get("transport") is transport:
+        session["transport"] = _detached_ws_transport
+
+        def _reap() -> None:
+            try:
+                _schedule_ws_orphan_reap(previous_sid)
+            except Exception:
+                pass
+
+        return was_owner, _reap
+    return was_owner, None
+
+
+def _resync_committed_session(sid: str) -> None:
+    """Replay a settled build's terminal event to a freshly-committed client.
+
+    A deferred session record is parked on the drop sentinel until the ordered
+    commit installs its owner; an agent build that settled inside that window
+    emitted its ``session.info`` / ``error`` into the void, leaving the
+    renderer with stale lazy state. Terminal transitions must reach the
+    renderer, so re-emit the settled state once the attachment commits.
+    """
+    session = _sessions.get(sid)
+    if session is None or session.get("_finalized"):
+        return
+    ready = session.get("agent_ready")
+    if ready is None or not ready.is_set():
+        return
+    try:
+        err = session.get("agent_error")
+        if err:
+            _emit("error", sid, {"message": str(err)})
+        else:
+            _emit_session_info_for_session(sid, session)
+    except Exception:
+        logger.debug("post-commit session resync failed sid=%s", sid, exc_info=True)
+
+
+def _record_transport_subscription(
+    transport: Transport,
+    method_name: str,
+    params: dict,
+    response: dict | None,
+    generation: object | None,
+) -> dict | None:
+    """Bind a WebSocket transport to the live session returned by an attach RPC.
+
+    Returns a replacement RESPONSE when the handler's success must not reach
+    the client (a claim/subscribe whose target vanished before the ordered
+    commit); the caller delivers it instead of the stale success. ``None``
+    means deliver the original response unchanged.
+    """
+    if method_name not in _SESSION_SUBSCRIPTION_METHODS or not isinstance(response, dict):
+        return None
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+    sid = result.get("session_id") or params.get("session_id")
+    complete_subscription = getattr(transport, "complete_session_subscription", None)
+    if sid and generation is not None and callable(complete_subscription):
+        sid = str(sid)
+        # prompt.submit keeps its takeover semantics (_claim_prompt_transport);
+        # only the switch-shaped attaches close the previous attachment.
+        release_stale = method_name != "prompt.submit"
+        # session.subscribe may be a watch-only attach: its commit must not
+        # upgrade a viewer to owner (that would steal an ownerless stdio/Ink
+        # session's legacy routing). The handler already attached with the
+        # caller's actual intent; the commit just re-affirms membership.
+        commit_owner = method_name != "session.subscribe"
+        # claim/subscribe validated a LIVE record in their handler; if it
+        # vanished by commit time (a close won the race), the commit must fail
+        # without moving this socket's subscription off its previous valid
+        # attachment. Synthetic attach responses (session.resume/activate
+        # handlers overridden at the transport level) keep committing without
+        # a record, as documented below.
+        require_record = method_name in ("session.claim", "session.subscribe")
+        # session.claim's forceful takeover happens HERE, not in its handler,
+        # so a stale-generation rejection leaves no trace (see the handler).
+        commit_force = method_name == "session.claim"
+        read_subscription = getattr(transport, "current_session_subscription", None)
+        deferred_cleanup: list[Callable[[], None]] = []
+        # Why the commit failed matters: only a vanished/finalized record turns
+        # the handler's success into an error below. A stale-generation or
+        # closed-socket rejection never invokes claim_owner, so this stays
+        # empty there and the historical response passes through unchanged.
+        record_missing: list[bool] = []
+
+        def claim_owner() -> bool:
+            # Keep ownership and subscription as one ordered commit. A stale
+            # response must never redirect the authoritative event path before
+            # its generation is rejected by the transport.
+            with _sessions_lock:
+                previous_sid = None
+                if release_stale and callable(read_subscription):
+                    # Safe under the transport's reentrant subscription lock:
+                    # this callback runs inside complete_session_subscription.
+                    previous_sid = read_subscription()
+                session = _sessions.get(sid)
+                if session is None and require_record:
+                    record_missing.append(True)
+                    return False
+                if session is not None:
+                    if session.get("_finalized"):
+                        if require_record:
+                            record_missing.append(True)
+                        return False
+                    # Commit through the durable stream registry. A second live
+                    # client joins as a viewer; only a missing/dead owner is
+                    # replaced (or displaced, for a claim's explicit handoff),
+                    # and subscribe_session keeps the legacy transport slot in
+                    # sync when ownership really changes.
+                    subscribe_session(
+                        sid,
+                        transport,
+                        owner=commit_owner,
+                        force=commit_force,
+                        explicit=commit_force,
+                    )
+                    if commit_force:
+                        deferred_cleanup.append(
+                            lambda: _announce_session_owner(
+                                sid, "claimed", fallback=transport
+                            )
+                        )
+                    if method_name != "prompt.submit":
+                        # A deferred record is parked on the drop sentinel
+                        # until this commit; a build that settled inside that
+                        # window emitted its terminal event into the void.
+                        deferred_cleanup.append(
+                            lambda: _resync_committed_session(sid)
+                        )
+                # A session-less sid (synthetic handlers used by transport-level
+                # callers) still commits the subscription move, so the stale
+                # release below applies either way.
+                if previous_sid and previous_sid != sid:
+                    _, deferred = _release_stale_session_attachment(
+                        previous_sid, transport
+                    )
+                    if deferred is not None:
+                        deferred_cleanup.append(deferred)
+                return True
+
+        committed = complete_subscription(generation, sid, claim_owner)
+        for cleanup in deferred_cleanup:
+            cleanup()
+        if not committed:
+            if method_name != "prompt.submit":
+                _schedule_rejected_deferred_subscription(sid)
+            if record_missing:
+                # The handler built success against a record that vanished
+                # before the ordered commit (a close won the race). Returning
+                # the stale success would tell the client it now owns/watches
+                # a session that no longer exists while its socket stays on
+                # the previous subscription — fail the RPC honestly instead.
+                # The previous attachment was preserved by the failed commit.
+                # Stale-generation / closed-socket rejections keep returning
+                # the historical response: the target is still live and the
+                # client's newer attachment already won.
+                return _err(
+                    response.get("id"),
+                    4001,
+                    "session closed before the attachment committed",
+                )
+        return None
+    subscribe_transport = getattr(transport, "subscribe_session", None)
+    if sid and callable(subscribe_transport):
+        subscribe_transport(str(sid))
+    return None
+
+
+def _begin_transport_subscription(transport: Transport, method_name: str) -> object | None:
+    """Reserve attach-response ordering for transports that support it."""
+    if method_name not in _SESSION_SUBSCRIPTION_METHODS:
+        return None
+    begin_subscription = getattr(transport, "begin_session_subscription", None)
+    return begin_subscription() if callable(begin_subscription) else None
+
+
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
@@ -2286,11 +2770,32 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             return normalized
 
         _rid, method, _params = normalized
+        subscription_generation = _begin_transport_subscription(t, method)
+        defer_ownership_token = None
+        if (
+            method in _SESSION_SUBSCRIPTION_METHODS
+            and method != "prompt.submit"
+            and subscription_generation is not None
+        ):
+            defer_ownership_token = _defer_session_ownership.set(True)
         if method not in _LONG_HANDLERS:
-            return handle_request(req)
+            try:
+                response = handle_request(req)
+                replacement = _record_transport_subscription(
+                    t, method, _params, response, subscription_generation
+                )
+                if replacement is not None:
+                    response = replacement
+                return response
+            finally:
+                if defer_ownership_token is not None:
+                    _defer_session_ownership.reset(defer_ownership_token)
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
+        if defer_ownership_token is not None:
+            _defer_session_ownership.reset(defer_ownership_token)
+            defer_ownership_token = None
 
         def run():
             try:
@@ -2298,6 +2803,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
             if resp is not None:
+                replacement = _record_transport_subscription(
+                    t, method, _params, resp, subscription_generation
+                )
+                if replacement is not None:
+                    resp = replacement
                 t.write(resp)
 
         _pool.submit(lambda: ctx.run(run))
@@ -2638,7 +3148,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
-def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
+def _rebind_ws_transport(sid: str, session: dict | None) -> None:
     """Upgrade a stdio-parked session to the calling WS transport.
 
     When a websocket drops mid-turn, ``handle_ws`` points every session it
@@ -2653,17 +3163,21 @@ def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
     """
     if not session:
         return
+    if _defer_session_ownership.get():
+        return
     t = current_transport()
     if t is None or t is _stdio_transport:
         return
-    sid = sid or str(session.get("_sid") or "") or _sid_for_session(session)
-    if session.get("transport") in (_stdio_transport, _detached_ws_transport):
+    parked_owner = session.get("transport")
+    if parked_owner in (_stdio_transport, _detached_ws_transport):
         # No live owner — the returning client takes the session back and the
         # fan-out registry is updated in the same step so both agree.
-        if sid:
-            subscribe_session(sid, t, owner=True)
-        else:
-            session["transport"] = t
+        _claim_prompt_transport(
+            sid,
+            session,
+            t,
+            expected_owner=parked_owner,
+        )
         return
     # A live owner exists: attach as a viewer so this peer still sees the
     # stream. Ownership is unchanged — stealing it here is what blanked the
@@ -2672,20 +3186,71 @@ def _rebind_ws_transport(session: dict | None, sid: str = "") -> None:
         subscribe_session(sid, t)
 
 
-def _sid_for_session(session: dict) -> str:
-    """Reverse-lookup a session's live id. Cheap: the registry is tiny."""
+def _claim_prompt_transport(
+    sid: str,
+    session: dict,
+    transport: Transport,
+    *,
+    allow_legacy_takeover: bool = False,
+    expected_owner: Transport | None = None,
+) -> bool:
+    """Rebind ownership without reviving a closed or stale client."""
+
+    def assign_owner() -> bool:
+        with _sessions_lock:
+            if _sessions.get(sid) is not session or session.get("_finalized"):
+                return False
+            if (
+                expected_owner is not None
+                and session.get("transport") is not expected_owner
+            ):
+                return False
+            stream = _session_streams.get(sid)
+            if stream is None:
+                session["transport"] = transport
+                return True
+            # Durable clients may only retain ownership they still hold. A
+            # legacy client has no session.claim RPC, so prompt.submit keeps
+            # the newer base's compatibility takeover while queued drains do
+            # not displace a successor that already owns the session.
+            force = allow_legacy_takeover and not stream.is_explicit(transport)
+            if not force and not session_is_owned_by(sid, transport):
+                return False
+            return subscribe_session(sid, transport, owner=True, force=force)
+
+    claim_if_live = getattr(transport, "claim_session_if_live", None)
+    if callable(claim_if_live):
+        return bool(claim_if_live(assign_owner))
+    if _transport_is_dead(transport):
+        return False
+    # Non-WS transports have no lifecycle lock. Preserve their historical
+    # assignment semantics while rejecting known-dead or conflicting owners.
     with _sessions_lock:
-        for sid, candidate in _sessions.items():
-            if candidate is session:
-                return sid
-    return ""
+        authoritative = _sessions.get(sid)
+        if (
+            (authoritative is not None and authoritative is not session)
+            or session.get("_finalized")
+            or (
+                expected_owner is not None
+                and session.get("transport") is not expected_owner
+            )
+        ):
+            return False
+        stream = _session_streams.get(sid)
+        if stream is None:
+            session["transport"] = transport
+            return True
+        force = allow_legacy_takeover and not stream.is_explicit(transport)
+        if not force and not session_is_owned_by(sid, transport):
+            return False
+        return subscribe_session(sid, transport, owner=True, force=force)
 
 
 def _sess_nowait(params, rid):
     sid = params.get("session_id") or ""
     s = _sessions.get(sid)
     if s is not None:
-        _rebind_ws_transport(s, sid)
+        _rebind_ws_transport(sid, s)
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
@@ -6952,7 +7517,7 @@ def _init_session(
             "model_override": None,
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
-            "transport": current_transport() or _stdio_transport,
+            "transport": _request_session_transport(),
         }
     _init_owns_db = False
     if session_db is not None:
@@ -8004,6 +8569,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    queued_transport = None
     with session["history_lock"]:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
@@ -8019,12 +8585,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None and _session_streams.get(sid) is None:
-            session["transport"] = queued["transport"]
-    if queued.get("transport") is not None and _session_streams.get(sid) is not None:
-        # Fan-out sessions re-attach through the registry so the queuing client
-        # never displaces a live owner (the other device may be driving now).
-        subscribe_session(sid, queued["transport"], owner=True)
+        queued_transport = queued.get("transport")
+    if queued_transport is not None:
+        # Claim under the transport's lifecycle lock, but never displace a
+        # successor that took ownership while this prompt was queued.
+        _claim_prompt_transport(sid, session, queued_transport)
     # Arm the drained turn with the request id that accepted it, so its
     # terminal event settles the right ledger record (the client that queued
     # the prompt may have reconnected since and be polling request.status).
@@ -8270,7 +8835,7 @@ def _deferred_session_record(
         "source": source,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
-        "transport": current_transport() or _stdio_transport,
+        "transport": _request_session_transport(),
     }
 
 
@@ -8491,7 +9056,7 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
-    if transport is not None:
+    if transport is not None and not _defer_session_ownership.get():
         # Attach the resuming client to the fan-out. It takes ownership only
         # when nobody live holds it (reconnect); otherwise it joins as a viewer
         # so the device that already owns the session keeps streaming. Done
@@ -8580,20 +9145,27 @@ def _(rid, params: dict) -> dict:
 
 @method("session.unsubscribe")
 def _(rid, params: dict) -> dict:
-    """Detach this client from a session's stream without closing it."""
+    """Detach this client from a session's stream without closing it.
+
+    A full release: the stream detach alone left the legacy transport slot
+    (and the socket's own subscription) pointing at this client, so a sole
+    owner that unsubscribed kept receiving the session's private frames
+    through the ungated fallback route. A watching peer inherits ownership;
+    with nobody left the record parks for the grace reaper.
+    """
     sid = str(params.get("session_id") or "")
     transport = current_transport()
-    was_owner = unsubscribe_session(sid, transport) if transport is not None else False
-    if was_owner:
-        # Explicit release: hand the session to whoever is still watching so a
-        # deliberate handoff settles immediately rather than via the reaper.
-        stream = _session_streams.get(sid)
-        heir = stream.promote_next_owner() if stream is not None else None
-        session = _sessions.get(sid)
-        if heir is not None and session is not None:
-            session["transport"] = heir
-            _emit("session.owner_changed", sid,
-                  {"reason": "released", "client": _stream_client_label(heir)})
+    if not sid or transport is None:
+        return _ok(rid, {"session_id": sid, "released_ownership": False})
+    with _sessions_lock:
+        was_owner, deferred = _release_stale_session_attachment(
+            sid, transport, reason="released"
+        )
+    clear_subscription = getattr(transport, "clear_session_subscription", None)
+    if callable(clear_subscription):
+        clear_subscription(sid)
+    if deferred is not None:
+        deferred()
     return _ok(rid, {"session_id": sid, "released_ownership": was_owner})
 
 
@@ -8612,10 +9184,24 @@ def _(rid, params: dict) -> dict:
     transport = current_transport()
     if transport is None:
         return _err(rid, 4005, "session.claim requires a client transport")
-    owner = subscribe_session(sid, transport, owner=True, force=True, explicit=True)
-    if owner:
-        _emit("session.owner_changed", sid,
-              {"reason": "claimed", "client": _stream_client_label(transport)})
+    ordered = callable(
+        getattr(transport, "begin_session_subscription", None)
+    ) and callable(getattr(transport, "complete_session_subscription", None))
+    if ordered:
+        # The forceful claim, its owner announcement, and the previous-session
+        # release all commit inside the ordered subscription commit (see
+        # _record_transport_subscription). A claim whose generation goes stale
+        # must leave no trace — mutating here let the losing socket keep the
+        # target's ownership and legacy slot while observing its newer session,
+        # dropping the target's frames for everyone and leaking private ones
+        # through the stale fallback.
+        owner = True
+    else:
+        # Transports without the ordered-commit machinery (stdio entry) keep
+        # the historical in-handler claim; nothing can reorder around them.
+        owner = subscribe_session(sid, transport, owner=True, force=True, explicit=True)
+        if owner:
+            _announce_session_owner(sid, "claimed", fallback=transport)
     stream = _session_streams.get(sid)
     return _ok(rid, {
         "session_id": sid,
@@ -10105,6 +10691,15 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> None:
+    # Common turn-entry boundary: synthetic turns (goal continuation,
+    # auto-continue, notification delivery) reach here without the
+    # prompt.submit/queued-drain begin_session_turn. If the previous turn
+    # already delivered its terminal, re-arm the fan-out so this turn's
+    # terminal is not suppressed as a duplicate; armed entries keep their
+    # request-id binding (no-op).
+    stream = _session_streams.get(sid)
+    if stream is not None:
+        stream.rearm_turn_if_terminal_seen()
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None

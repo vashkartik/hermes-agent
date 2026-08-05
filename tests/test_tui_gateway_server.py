@@ -14429,10 +14429,16 @@ def test_session_close_rpc_claims_then_tears_down(monkeypatch):
 
 def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
     seen = []
-    monkeypatch.setattr(
-        server, "_close_session_by_id",
-        lambda sid, *, end_reason: bool(seen.append((sid, end_reason))) or True,
-    )
+
+    def record_close(sid, *, end_reason, predicate=None):
+        # Mirror the real funnel's atomic revalidation contract: the teardown
+        # passes a predicate so a claim landing before the close survives.
+        if predicate is not None and not predicate(server._sessions.get(sid) or {}):
+            return False
+        seen.append((sid, end_reason))
+        return True
+
+    monkeypatch.setattr(server, "_close_session_by_id", record_close)
     # Detached session "b" would schedule a real grace-reap threading.Timer that
     # outlives the test; grace=0 short-circuits it so no thread lingers.
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)

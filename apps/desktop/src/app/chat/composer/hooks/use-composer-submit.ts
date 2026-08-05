@@ -75,6 +75,10 @@ export function useComposerSubmit({
   stashAt
 }: UseComposerSubmitArgs) {
   const scope = useComposerScope()
+  // The gateway can briefly publish running=false while its automatic
+  // compactor still owns the turn. Keep submissions on the busy/queue path
+  // until the structured compaction lifecycle says the turn has resumed.
+  const turnBusy = busy || compacting
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
@@ -163,7 +167,7 @@ export function useComposerSubmit({
 
     if (queueEdit) {
       exitQueuedEdit('save')
-    } else if (busy) {
+    } else if (turnBusy) {
       // Slash commands should execute immediately even while the agent is
       // busy — they're client-side operations (/yolo, /skin, /new, /help,
       // etc.) or self-contained gateway RPCs (/status, /compress).  onSubmit
@@ -184,9 +188,11 @@ export function useComposerSubmit({
         // Attachments can't ride a redirect (no tool-result image carriage) —
         // queue the whole payload for the next turn.
         queueCurrentDraft()
-      } else {
+      } else if (!compacting) {
         // Stop button (the only way to reach here while busy with an empty
         // composer — empty Enter is short-circuited in the keydown handler).
+        // Compaction instead exposes a disabled Queue action until there is a
+        // payload; a defensive form submit during that interval is a no-op.
         triggerHaptic('cancel')
         void Promise.resolve(onCancel())
       }
@@ -227,7 +233,7 @@ export function useComposerSubmit({
   }
 
   const queueDraft = () => {
-    if (disabled || !busy) {
+    if (disabled || !turnBusy) {
       return
     }
 

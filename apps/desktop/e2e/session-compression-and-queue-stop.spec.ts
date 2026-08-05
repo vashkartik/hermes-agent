@@ -106,6 +106,7 @@ auxiliary:
   test('queues an Enter-submitted draft instead of steering while compaction is active', async ({}, testInfo) => {
     const { page } = fixture
     const queued = 'E2E_QUEUED_DURING_COMPACTION'
+    const trigger = 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(1500)
 
     // A normal message crosses the tiny configured context budget. The mock
     // blocks only the resulting summary request, so these assertions run
@@ -119,12 +120,15 @@ auxiliary:
     await waitForTranscript(page, MOCK_REPLY)
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_TWO '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
-    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(1500))
+    await pasteAndSend(page, trigger)
     await fixture.mock.waitForHeldCompletion()
     await expect(page.getByRole('status', { name: 'Summarizing thread' }).last()).toBeVisible()
 
     const primary = page.locator('[data-slot="composer-root"] button[type="submit"]')
     await expect(primary).toHaveAttribute('aria-label', 'Queue message')
+    await expect(primary).toBeDisabled()
+    await page.keyboard.press('Enter')
+    expect(fixture.mock.heldCompletionCount()).toBe(1)
 
     await send(page, queued)
     await expect(page.getByText('1 Queued')).toBeVisible()
@@ -135,5 +139,20 @@ auxiliary:
     fixture.mock.releaseHeldStream()
     await expect.poll(() => receivedUserTexts().filter(text => text === queued).length).toBe(1)
     expect(fixture.mock.heldCompletionCount()).toBe(1)
+
+    // `compacted` means only that the summarizer returned; the original turn
+    // still has to continue. The queued follow-up must not reach inference until
+    // that original continuation has reached inference first.
+    const received = receivedUserTexts()
+    const triggerRequestIndexes = received.flatMap((text, index) =>
+      text.includes('E2E_TRIGGER_AUTOMATIC_COMPACTION') ? [index] : []
+    )
+    const queuedIndex = received.indexOf(queued)
+
+    // The first occurrence triggers automatic compaction. The second is the
+    // original turn actually resuming against the compacted context.
+    expect(triggerRequestIndexes.length).toBeGreaterThanOrEqual(2)
+    expect(queuedIndex).toBeGreaterThanOrEqual(0)
+    expect(triggerRequestIndexes[1]).toBeLessThan(queuedIndex)
   })
 })

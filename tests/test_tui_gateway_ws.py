@@ -153,6 +153,199 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     assert events == ["accept", "ready_after_0"]
 
 
+def test_ws_observer_write_does_not_wait_for_a_suspended_client():
+    send_started = threading.Event()
+    release_send = asyncio.Event()
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            send_started.set()
+            await release_send.wait()
+            sent.append(line)
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    transport = ws_mod.WSTransport(FakeWS(), loop, peer='observer-stall-test')
+    outcome = {}
+
+    def write_observer():
+        try:
+            outcome['result'] = transport.write_observer({'kind': 'observer'})
+        except Exception as exc:  # pragma: no cover - assertion reports details
+            outcome['error'] = exc
+
+    writer = threading.Thread(target=write_observer)
+    try:
+        writer.start()
+        writer.join(timeout=0.25)
+        assert not writer.is_alive(), 'observer write blocked on the suspended socket'
+        assert outcome == {'result': True}
+        assert send_started.wait(timeout=1)
+
+        loop.call_soon_threadsafe(release_send.set)
+        deadline = time.time() + 2
+        while not sent and time.time() < deadline:
+            time.sleep(0.01)
+        assert sent == [json.dumps({'kind': 'observer'})]
+    finally:
+        transport.close()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_ws_observer_preserves_reasoning_text_and_completion_order():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line)["params"]["type"])
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    transport = ws_mod.WSTransport(FakeWS(), loop, peer="observer-order-test")
+    frames = [
+        server._event_frame("reasoning.delta", "sid", {"text": "why"}),
+        server._event_frame("message.delta", "sid", {"text": "answer"}),
+        server._event_frame("message.complete", "sid", {"text": "answer"}),
+    ]
+    try:
+        assert all(transport.write_observer(frame) for frame in frames)
+        deadline = time.time() + 2
+        while len(sent) < len(frames) and time.time() < deadline:
+            time.sleep(0.01)
+        assert sent == ["reasoning.delta", "message.delta", "message.complete"]
+    finally:
+        transport.close()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_ws_observer_to_owner_handoff_does_not_reorder_completion():
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line)["params"]["type"])
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    transport = ws_mod.WSTransport(FakeWS(), loop, peer="observer-handoff-test")
+    try:
+        assert transport.write_observer(server._event_frame("message.delta", "sid", {"text": "partial"}))
+        assert transport.write(server._event_frame("message.complete", "sid", {"text": "partial"}))
+        deadline = time.time() + 2
+        while len(sent) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert sent == ["message.delta", "message.complete"]
+    finally:
+        transport.close()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_ws_observer_backlog_overflow_disconnects_instead_of_dropping_lifecycle_frames():
+    class FakeWS:
+        async def send_text(self, _line):
+            return None
+
+    loop = asyncio.new_event_loop()
+    transport = ws_mod.WSTransport(FakeWS(), loop, peer="observer-bound-test")
+    try:
+        for index in range(ws_mod._OBSERVER_BATCH_QUEUE_MAX):
+            assert transport.write_observer(
+                server._event_frame("approval.request", "sid", {"index": index})
+            )
+
+        assert not transport.write_observer(
+            server._event_frame("clarify.request", "sid", {})
+        )
+        assert transport._closed is True
+        assert not transport._observer_batches
+    finally:
+        transport.close()
+        loop.close()
+
+
+def test_ws_observer_events_precede_async_rpc_responses():
+    async def scenario():
+        sent = []
+
+        class FakeWS:
+            async def send_text(self, line):
+                frame = json.loads(line)
+                sent.append(frame.get("id") or frame.get("params", {}).get("type"))
+
+        transport = ws_mod.WSTransport(
+            FakeWS(), asyncio.get_running_loop(), peer="observer-async-handoff-test"
+        )
+        try:
+            assert transport.write_observer(
+                server._event_frame("message.delta", "sid", {"text": "old"})
+            )
+            assert await transport.write_async(
+                {"jsonrpc": "2.0", "id": "activate", "result": {"session_id": "sid"}}
+            )
+            assert sent == ["message.delta", "activate"]
+        finally:
+            transport.close()
+
+    asyncio.run(scenario())
+
+
+def test_ws_concurrent_owner_handoff_preserves_enqueue_order():
+    sent = []
+    took_observer_lines = threading.Event()
+    allow_handoff = threading.Event()
+
+    class FakeWS:
+        async def send_text(self, line):
+            frame = json.loads(line)
+            sent.append(frame.get("id") or frame.get("params", {}).get("payload", {}).get("text"))
+
+    loop = asyncio.new_event_loop()
+    transport = ws_mod.WSTransport(FakeWS(), loop, peer="concurrent-handoff-test")
+    original_merge = ws_mod.WSTransport._merge_observer_lines_for_owner
+    worker: threading.Thread | None = None
+
+    def paused_merge(self):
+        original_merge(self)
+        if not took_observer_lines.is_set():
+            took_observer_lines.set()
+            assert allow_handoff.wait(timeout=1)
+
+    ws_mod.WSTransport._merge_observer_lines_for_owner = paused_merge
+    try:
+        assert transport.write_observer(
+            server._event_frame("message.delta", "sid", {"text": "old"})
+        )
+        worker = threading.Thread(
+            target=lambda: loop.run_until_complete(
+                transport.write_async({"jsonrpc": "2.0", "id": "response", "result": {}})
+            )
+        )
+        worker.start()
+        assert took_observer_lines.wait(timeout=1)
+        assert transport.write(server._event_frame("message.delta", "sid", {"text": "new"}))
+        allow_handoff.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert sent == ["old", "new", "response"]
+    finally:
+        allow_handoff.set()
+        if worker is not None:
+            worker.join(timeout=2)
+        ws_mod.WSTransport._merge_observer_lines_for_owner = original_merge
+        transport.close()
+        loop.close()
+
+
 def test_ws_transport_serializes_concurrent_sends():
     active_sends = 0
     max_active_sends = 0

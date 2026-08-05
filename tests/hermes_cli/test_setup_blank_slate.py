@@ -65,6 +65,11 @@ class TestBlankSlateMinimalToolsets:
 
 
 class TestBlankSlateMinimizeConfig:
+    def test_max_turns_matches_runtime_default(self):
+        cfg = {}
+        _blank_slate_minimize_config(cfg)
+        assert cfg["agent"]["max_turns"] == 500
+
     def test_optional_features_turned_off(self):
         cfg = {}
         _blank_slate_minimize_config(cfg)

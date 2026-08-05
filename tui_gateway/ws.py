@@ -29,7 +29,8 @@ import json
 import logging
 import socket
 import threading
-from typing import Any
+from collections import deque
+from typing import Any, Callable
 
 from tui_gateway import server
 
@@ -58,6 +59,11 @@ _STREAMING_EVENT_TYPES = frozenset({
 # Max time a streamed token waits in the buffer before flush (~30 fps). Short
 # enough to stay imperceptible to the live token cadence.
 _TOKEN_COALESCE_S = 0.033
+# A secondary dashboard must never backpressure the agent-owning client. Keep
+# observer lifecycle batches bounded; if a suspended peer falls this far behind,
+# disconnect it and let session replay heal on resume.
+_OBSERVER_BATCH_QUEUE_MAX = 256
+_OBSERVER_BATCH_FRAME_MAX = 128
 
 # Advertised in ``gateway.ready`` so Desktop / mobile can tell a gateway that
 # supports one durable session across several devices from an older one. Bump
@@ -123,6 +129,155 @@ class WSTransport:
         # writes need an async boundary because several batches can be queued on
         # the owning loop while it recovers from a stall.
         self._send_lock = asyncio.Lock()
+        self._observer_lock = threading.Lock()
+        self._observer_batches: deque[list[str]] = deque()
+        self._observer_drain_armed = False
+        self._observer_flush_handle: asyncio.TimerHandle | None = None
+        self._observer_generation = 0
+        # RLock permits a subscribed observer write to latch a failure after
+        # releasing _observer_lock while write_observer_if_subscribed still
+        # owns the subscription lock. No closed-state path nests observer ->
+        # subscription, preserving the subscription -> observer order.
+        self._subscription_lock = threading.RLock()
+        self._subscribed_session_id: str | None = None
+        self._subscription_next_generation = 0
+        self._subscription_committed_generation = 0
+        self._owner_cleanup_scheduled = False
+
+    def _schedule_owner_cleanup(self) -> None:
+        """Detach/reap sessions claimed just before this transport failed."""
+
+        def cleanup() -> None:
+            try:
+                server._close_sessions_for_transport(
+                    self,
+                    end_reason="ws_transport_failure",
+                )
+            except Exception:
+                _log.debug(
+                    "ws failure owner cleanup failed peer=%s",
+                    self._peer,
+                    exc_info=True,
+                )
+
+        async def cleanup_off_loop() -> None:
+            await asyncio.to_thread(cleanup)
+
+        def enqueue() -> None:
+            self._loop.create_task(cleanup_off_loop())
+
+        try:
+            if self._loop.is_running():
+                self._loop.call_soon_threadsafe(enqueue)
+                return
+        except (AttributeError, RuntimeError):
+            pass
+        threading.Thread(target=cleanup, daemon=True).start()
+
+    def _mark_closed(self, *, schedule_owner_cleanup: bool) -> bool:
+        """Latch closed state and invalidate attachment state atomically."""
+        should_schedule_cleanup = False
+        with self._subscription_lock:
+            transitioned = not self._closed
+            if transitioned:
+                self._closed = True
+                self._subscription_next_generation += 1
+            self._subscribed_session_id = None
+            if schedule_owner_cleanup and not self._owner_cleanup_scheduled:
+                self._owner_cleanup_scheduled = True
+                should_schedule_cleanup = True
+        if should_schedule_cleanup:
+            self._schedule_owner_cleanup()
+        return transitioned
+
+    def subscribe_session(self, session_id: str) -> None:
+        """Replace this socket's live-session stream subscription."""
+        with self._subscription_lock:
+            self._subscription_next_generation += 1
+            self._subscription_committed_generation = self._subscription_next_generation
+            self._subscribed_session_id = session_id
+
+    def begin_session_subscription(self) -> int:
+        """Reserve an ordering token for an attach RPC before it starts."""
+        with self._subscription_lock:
+            self._subscription_next_generation += 1
+            return self._subscription_next_generation
+
+    def complete_session_subscription(
+        self,
+        generation: int,
+        session_id: str,
+        claim_owner: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Commit ownership unless a newer successful attach already won."""
+        with self._subscription_lock:
+            if self._closed:
+                return False
+            if generation < self._subscription_committed_generation:
+                return False
+            if claim_owner is not None and not claim_owner():
+                return False
+            self._subscription_committed_generation = generation
+            self._subscribed_session_id = session_id
+            return True
+
+    def claim_session_if_live(self, claim_owner: Callable[[], bool]) -> bool:
+        """Commit session ownership only while this socket remains live."""
+        with self._subscription_lock:
+            if self._closed:
+                return False
+            return bool(claim_owner())
+
+    def observes_session(self, session_id: str) -> bool:
+        with self._subscription_lock:
+            return self._subscribed_session_id == session_id
+
+    def current_session_subscription(self) -> str | None:
+        """Session id this socket currently observes.
+
+        ``_subscription_lock`` is reentrant, so an attach commit may read the
+        subscription it is about to replace from inside its own
+        ``complete_session_subscription`` claim callback.
+        """
+        with self._subscription_lock:
+            return self._subscribed_session_id
+
+    def clear_session_subscription(self, session_id: str) -> bool:
+        """Drop the subscription if it still points at ``session_id``.
+
+        Bumps the committed generation so a stale in-flight attach commit
+        cannot resurrect a subscription the client explicitly released.
+        """
+        with self._subscription_lock:
+            if self._subscribed_session_id != session_id:
+                return False
+            self._subscription_next_generation += 1
+            self._subscription_committed_generation = self._subscription_next_generation
+            self._subscribed_session_id = None
+            return True
+
+    def write_observer_if_subscribed(self, session_id: str, obj: dict) -> bool:
+        """Queue ``obj`` only while this socket still observes ``session_id``.
+
+        Keep the subscription lock through acceptance into the observer queue
+        so a concurrent attach cannot commit a new subscription between the
+        session check and enqueue.
+        """
+        with self._subscription_lock:
+            if self._closed or self._subscribed_session_id != session_id:
+                return False
+            return self.write_observer(obj)
+
+    def promote_session_if_subscribed(
+        self,
+        session_id: str,
+        promote: Callable[[], bool],
+    ) -> bool:
+        """Run an ownership promotion while the subscription is locked."""
+        with self._subscription_lock:
+            if self._closed or self._subscribed_session_id != session_id:
+                return False
+            return bool(promote())
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -132,10 +287,30 @@ class WSTransport:
             return False
         return params.get("type") in _STREAMING_EVENT_TYPES
 
+    def _merge_observer_lines_for_owner(self) -> None:
+        """Atomically move queued mirror frames into the direct-write queue."""
+        with self._observer_lock:
+            if not self._observer_batches:
+                return
+            lines = [line for batch in self._observer_batches for line in batch]
+            self._observer_batches.clear()
+            self._observer_drain_armed = False
+            self._observer_generation += 1
+            handle = self._observer_flush_handle
+            self._observer_flush_handle = None
+            # Keep the observer lock until the lines are in the owner queue.
+            # A concurrent direct delta can then only append after these older
+            # frames, never between extraction and handoff.
+            with self._token_lock:
+                self._pending_tokens.extend(lines)
+        if handle is not None:
+            self._loop.call_soon_threadsafe(handle.cancel)
+
     def write(self, obj: dict) -> bool:
         if self._closed:
             return False
 
+        self._merge_observer_lines_for_owner()
         line = json.dumps(obj, ensure_ascii=False)
 
         try:
@@ -164,6 +339,7 @@ class WSTransport:
         # scheduled INSIDE the lock so the on-the-wire order matches the buffer
         # order even if the coalesce timer fires on the loop at the same moment.
         from agent.async_utils import safe_schedule_threadsafe
+        schedule_failed = False
         with self._token_lock:
             self._pending_tokens.append(line)
             batch = self._pending_tokens
@@ -176,8 +352,11 @@ class WSTransport:
                 self._safe_send_many(batch), self._loop
             )
             if fut is None:
-                self._closed = True
-                return False
+                schedule_failed = True
+
+        if schedule_failed:
+            self._mark_closed(schedule_owner_cleanup=True)
+            return False
 
         try:
             fut.result(timeout=_WS_WRITE_TIMEOUT_S)
@@ -196,12 +375,121 @@ class WSTransport:
             )
             return not self._closed
         except Exception as exc:
-            self._closed = True
+            self._mark_closed(schedule_owner_cleanup=True)
             _log.warning(
                 "ws write failed peer=%s error_type=%s error=%s",
                 self._peer, type(exc).__name__, exc,
             )
             return False
+
+    def write_observer(self, obj: dict) -> bool:
+        """Queue a mirrored session event without blocking its agent thread."""
+        if self._closed:
+            return False
+
+        line = json.dumps(obj, ensure_ascii=False)
+        should_arm = False
+        overflowed = False
+        with self._observer_lock:
+            if (
+                self._is_streaming_frame(obj)
+                and self._observer_batches
+                and len(self._observer_batches[-1]) < _OBSERVER_BATCH_FRAME_MAX
+            ):
+                self._observer_batches[-1].append(line)
+            else:
+                if len(self._observer_batches) >= _OBSERVER_BATCH_QUEUE_MAX:
+                    # Lifecycle and interactive frames are not replayable on the
+                    # same socket. Disconnect instead of silently evicting one;
+                    # reconnect/resume can hydrate a coherent transcript and
+                    # recover pending prompts.
+                    self._observer_batches.clear()
+                    self._observer_drain_armed = False
+                    self._observer_generation += 1
+                    overflowed = True
+                else:
+                    self._observer_batches.append([line])
+            if not overflowed and not self._observer_drain_armed:
+                self._observer_drain_armed = True
+                self._observer_generation += 1
+                should_arm = True
+
+        if overflowed:
+            # _observer_lock is released before taking _subscription_lock.
+            self._mark_closed(schedule_owner_cleanup=True)
+            _log.warning(
+                "ws observer queue full peer=%s — closing for replay-capable reconnect",
+                self._peer,
+            )
+            try:
+                self._loop.call_soon_threadsafe(
+                    lambda: self._loop.create_task(self._close_after_observer_overflow())
+                )
+            except RuntimeError:
+                pass
+            return False
+
+        if should_arm:
+            try:
+                self._loop.call_soon_threadsafe(self._arm_observer_drain)
+            except RuntimeError:
+                self._mark_closed(schedule_owner_cleanup=True)
+                return False
+        return not self._closed
+
+    async def _close_after_observer_overflow(self) -> None:
+        close = getattr(self._ws, "close", None)
+        if not callable(close):
+            return
+        try:
+            result = close(
+                code=1013, reason="observer backlog overflow; reconnect to resume"
+            )
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            _log.debug("ws overflow close failed peer=%s", self._peer, exc_info=True)
+
+    def _arm_observer_drain(self) -> None:
+        """Coalesce observer frames, then start one drain on the owning loop."""
+        with self._observer_lock:
+            if self._closed:
+                self._observer_batches.clear()
+                self._observer_drain_armed = False
+                return
+            if (
+                not self._observer_drain_armed
+                or not self._observer_batches
+                or self._observer_flush_handle is not None
+            ):
+                return
+            self._observer_flush_handle = self._loop.call_later(
+                _TOKEN_COALESCE_S, self._start_observer_drain
+            )
+
+    def _start_observer_drain(self) -> None:
+        with self._observer_lock:
+            self._observer_flush_handle = None
+            if self._closed or not self._observer_drain_armed or not self._observer_batches:
+                return
+            generation = self._observer_generation
+        self._loop.create_task(self._drain_observer_batches(generation))
+
+    async def _drain_observer_batches(self, generation: int) -> None:
+        while not self._closed:
+            with self._observer_lock:
+                if generation != self._observer_generation:
+                    return
+                if not self._observer_batches:
+                    self._observer_drain_armed = False
+                    return
+                batch = self._observer_batches.popleft()
+            await self._safe_send_many(batch)
+
+        with self._observer_lock:
+            if generation == self._observer_generation:
+                self._observer_batches.clear()
+                self._observer_drain_armed = False
 
     def _arm_token_flush(self) -> None:
         """Arm the coalesce timer. Runs on the loop thread (call_soon_threadsafe)."""
@@ -235,6 +523,7 @@ class WSTransport:
         # control frame) as ONE serialized batch. Sending them in two lock
         # acquisitions would let a later batch slip between the pending tokens
         # and the frame that drained them.
+        self._merge_observer_lines_for_owner()
         with self._token_lock:
             batch = self._pending_tokens
             self._pending_tokens = []
@@ -256,14 +545,25 @@ class WSTransport:
                 # Latch while still holding the writer lock so queued batches
                 # observe the failure before they get a chance to touch the
                 # socket.
-                self._closed = True
+                self._mark_closed(schedule_owner_cleanup=True)
                 _log.warning(
                     "ws send failed peer=%s error_type=%s error=%s",
                     self._peer, type(exc).__name__, exc,
                 )
 
     def close(self) -> None:
-        self._closed = True
+        # Serialize the explicit lifecycle close against an in-flight ordered
+        # attach completion. If completion wins, handle_ws's subsequent owner
+        # cleanup sees the claim; if close wins, completion observes _closed
+        # and cannot claim after cleanup has already snapshotted ownership.
+        self._mark_closed(schedule_owner_cleanup=False)
+        with self._observer_lock:
+            self._observer_batches.clear()
+            self._observer_generation += 1
+        observer_handle = self._observer_flush_handle
+        if observer_handle is not None:
+            observer_handle.cancel()
+            self._observer_flush_handle = None
         # Cancel any pending coalesce flush. close() runs on the loop thread
         # (the handle_ws finally), so touching the TimerHandle here is safe.
         handle = self._token_flush_handle

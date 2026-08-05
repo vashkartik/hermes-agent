@@ -194,6 +194,9 @@ export function useMessageStream({
   const nativeSubagentSessionsRef = useRef<Set<string>>(new Set())
   // Turns that auto-compacted: skip post-turn hydrate so live scrollback survives.
   const compactedTurnRef = useRef<Set<string>>(new Set())
+  // Active auto-compaction PHASE (label retirement); distinct from the per-turn
+  // compacted marker above, which survives until completion decides hydration.
+  const compactingPhaseRef = useRef<Set<string>>(new Set())
   // Last session we applied a session.info cwd for — lets us tell an agent
   // relocating the SAME session (follow it) from a session switch (don't yank).
   const lastCwdInfoSessionRef = useRef<null | string>(null)
@@ -756,6 +759,7 @@ export function useMessageStream({
     appendReasoningDelta,
     activeSessionIdRef,
     compactedTurnRef,
+    compactingPhaseRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
     completeAssistantMessage,

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $compactingSessions, setSessionCompacting } from '@/store/compaction'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { $notifications, clearNotifications } from '@/store/notifications'
@@ -217,6 +218,7 @@ describe('usePromptActions /title', () => {
 
   afterEach(() => {
     cleanup()
+    $compactingSessions.set({})
     vi.restoreAllMocks()
   })
 
@@ -573,6 +575,7 @@ describe('usePromptActions /compress', () => {
       />
     )
 
+    setSessionCompacting(RUNTIME_SESSION_ID, true)
     await handle!.submitText('/compress')
 
     // The dedicated RPC is the TUI's path and has no slash-worker pipe
@@ -585,6 +588,7 @@ describe('usePromptActions /compress', () => {
     )
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+    expect($compactingSessions.get()).toEqual({})
   })
 
   it('replaces the transcript from the response messages', async () => {

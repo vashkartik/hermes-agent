@@ -140,12 +140,22 @@ def _(rid, params: dict) -> dict:
         # Re-bind to the current client transport for this request. This keeps
         # streaming events on the active websocket even if an earlier
         # disconnect or fallback moved the session transport to stdio. The
-        # guard above already established that this client may drive the
-        # session; the peer it displaces stays attached to the fan-out.
-        if _session_streams.get(sid) is not None:
-            subscribe_session(sid, t, owner=True, force=True)
-        else:
-            session["transport"] = t
+        # guard above established intent, but ownership can move between that
+        # check and this atomic claim — a failed claim means another client
+        # took the session meanwhile, and proceeding would interleave turns.
+        if not _claim_prompt_transport(
+            sid,
+            session,
+            t,
+            allow_legacy_takeover=True,
+        ) and not _transport_is_dead(t):
+            # A dead submitter keeps the accepted-work contract (the prompt
+            # still queues and drains client-independently); a LIVE submitter
+            # whose claim lost means another client owns the session now.
+            return _err(
+                rid, 4092,
+                "session is owned by another client — call session.claim to take over",
+            )
 
     # ── Execute-once on retry ───────────────────────────────────────
     # A client that reconnects mid-turn resubmits with the same request_id

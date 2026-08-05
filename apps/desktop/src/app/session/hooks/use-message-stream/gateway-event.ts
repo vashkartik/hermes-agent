@@ -162,6 +162,7 @@ interface GatewayEventDeps {
   activeGatewayProfile: string
   activeSessionIdRef: MutableRefObject<string | null>
   compactedTurnRef: MutableRefObject<Set<string>>
+  compactingPhaseRef: MutableRefObject<Set<string>>
   lastCwdInfoSessionRef: MutableRefObject<string | null>
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
   appendAssistantDelta: (sessionId: string, delta: string) => void
@@ -200,6 +201,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     activeGatewayProfile,
     activeSessionIdRef,
     compactedTurnRef,
+    compactingPhaseRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
     completeAssistantMessage,
@@ -274,10 +276,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       // Mid-turn compaction does not emit another message.start. The first
       // model output or tool event proves summarization has finished and the
-      // turn has resumed, so retire the phase label without waiting for the
-      // whole turn to complete.
-      if (sessionId && COMPACTION_RESUME_EVENT_TYPES.has(event.type) && compactedTurnRef.current.has(sessionId)) {
+      // turn has resumed, so retire the phase LABEL without waiting for the
+      // whole turn to complete. The per-turn compacted marker is separate and
+      // must survive until completion consumes it: it suppresses the post-turn
+      // hydration that would replace live scrollback with the stored
+      // summary-only transcript.
+      if (sessionId && COMPACTION_RESUME_EVENT_TYPES.has(event.type) && compactingPhaseRef.current.has(sessionId)) {
         setSessionCompacting(sessionId, false)
+        compactingPhaseRef.current.delete(sessionId)
       }
 
       if (sessionId && DRAFT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
@@ -359,6 +365,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const modelChanged = typeof payload?.model === 'string'
         const providerChanged = typeof payload?.provider === 'string'
         const runningChanged = typeof payload?.running === 'boolean'
+
         // The backend stamps model/provider (as strings) on EVERY session.info,
         // so the presence flags above are true on every heartbeat/turn edge —
         // fine for the cheap atom writes below (nanostores skips identical
@@ -541,6 +548,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         flushQueuedDeltas(sessionId)
         pruneFinishedSessionSubagents(sessionId)
         setSessionCompacting(sessionId, false)
+        compactingPhaseRef.current.delete(sessionId)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
         // A fresh turn on this session optimistically clears its billing wall;
@@ -711,6 +719,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // last item stuck pending/in_progress. Finished lists keep their linger.
         clearActiveSessionTodos(sessionId)
         setSessionCompacting(sessionId, false)
+        compactingPhaseRef.current.delete(sessionId)
+        // The compacted-turn marker is NOT cleared here: completeAssistantMessage
+        // consumes it to decide whether post-turn hydration is destructive.
 
         flushQueuedDeltas(sessionId)
 
@@ -1075,9 +1086,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       } else if (event.type === 'status.update') {
         if (sessionId && payload?.kind === 'compacting') {
           setSessionCompacting(sessionId, true)
+          compactingPhaseRef.current.add(sessionId)
           compactedTurnRef.current.add(sessionId)
-        } else if (sessionId && payload?.kind === 'compacted') {
+        } else if (sessionId && payload?.kind === 'ready') {
+          // The gateway emits ready only when a standalone manual
+          // session.compress operation has settled. Unlike automatic
+          // compaction, there is no original model turn left to resume.
           setSessionCompacting(sessionId, false)
+          compactingPhaseRef.current.delete(sessionId)
           compactedTurnRef.current.delete(sessionId)
         } else if (sessionId && payload?.kind === 'process') {
           // The gateway's notification poller announces background process
@@ -1086,6 +1102,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         } else if (sessionId && payload?.kind === 'goal') {
           applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
         }
+        // `compacted` closes only the compression operation; the original turn
+        // explicitly continues afterward. Keep the latch until the first model,
+        // tool, or text event above proves that continuation is visible, or a
+        // terminal event clears it.
       } else if (event.type === 'review.summary') {
         // Self-improvement background review saved something to memory/skills
         // and emitted a persistent summary (Python formats it as
@@ -1155,6 +1175,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           clearClarifyRequest(undefined, sessionId)
           clearActiveSessionTodos(sessionId)
           setSessionCompacting(sessionId, false)
+          compactingPhaseRef.current.delete(sessionId)
           compactedTurnRef.current.delete(sessionId)
         }
 
