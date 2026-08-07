@@ -888,16 +888,30 @@ def _startup_env_secret(name: str) -> str:
         return os.getenv(name, "").strip()
 
 
+def matrix_deps_present() -> bool:
+    """PASSIVE probe: are the ``platform.matrix`` packages installed?
+
+    Registry ``check_fn`` — called from status displays and config loading,
+    so it must never install anything.  The ACTIVE lazy-installer
+    (``check_matrix_requirements``) is registered as ``ensure_deps_fn``
+    and runs from ``create_adapter()`` when this returns False (#79812).
+    """
+    try:
+        from tools.lazy_deps import is_available
+        return is_available("platform.matrix")
+    except Exception:  # pragma: no cover — defensive
+        return False
+
+
 def check_matrix_requirements() -> bool:
     """Return True if the Matrix adapter can be used.
 
-    Lazy-installs the full ``platform.matrix`` feature group via
-    ``tools.lazy_deps.ensure_and_bind`` whenever any of the declared
-    packages (mautrix, Markdown, aiosqlite, asyncpg, aiohttp-socks) is
-    missing — not just mautrix itself.  Previously this short-circuited on
-    ``import mautrix``, which left the other four packages uninstalled
-    forever and broke E2EE connect with ``No module named 'asyncpg'``
-    (#31116).  Rebinds module-level type globals on success.
+    Combined credentials + deps answer for setup/status callers.  The
+    registry's ``ensure_deps_fn`` is the deps-only
+    :func:`ensure_matrix_deps` below — credentials must NOT gate the
+    installer (they're handled by ``is_connected``, which also accepts
+    ``PlatformConfig.extra``-configured setups that these env checks
+    would wrongly veto).
     """
     token = _startup_env_secret("MATRIX_ACCESS_TOKEN")
     password = _startup_env_secret("MATRIX_PASSWORD")
@@ -910,6 +924,20 @@ def check_matrix_requirements() -> bool:
         logger.warning("Matrix: MATRIX_HOMESERVER not set")
         return False
 
+    return ensure_matrix_deps()
+
+
+def ensure_matrix_deps() -> bool:
+    """ACTIVE deps-only installer (registry ``ensure_deps_fn``).
+
+    Lazy-installs the full ``platform.matrix`` feature group via
+    ``tools.lazy_deps.ensure_and_bind`` whenever any of the declared
+    packages (mautrix, Markdown, aiosqlite, asyncpg, aiohttp-socks) is
+    missing — not just mautrix itself.  Previously this short-circuited on
+    ``import mautrix``, which left the other four packages uninstalled
+    forever and broke E2EE connect with ``No module named 'asyncpg'``
+    (#31116).  Rebinds module-level type globals on success.
+    """
     # Check whether any package in the platform.matrix feature group is
     # missing.  ``feature_missing`` is cheap (per-spec importlib.metadata
     # lookups) and correctly handles ``mautrix[encryption]`` by stripping
@@ -5079,13 +5107,21 @@ async def _standalone_send(
         except ImportError:
             pass
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.put(url, headers=headers, json=payload) as resp:
-                if resp.status not in {200, 201}:
-                    body = await resp.text()
-                    return {"error": f"Matrix API error ({resp.status}): {body}"}
-                data = await resp.json()
-        return {"success": True, "platform": "matrix", "chat_id": chat_id, "message_id": data.get("event_id")}
+        # Use asyncio.wait_for() instead of aiohttp.ClientTimeout to avoid
+        # "Timeout context manager should be used inside a task" errors when
+        # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+        async with aiohttp.ClientSession() as session:
+            async def _do_send():
+                async with session.put(url, headers=headers, json=payload) as resp:
+                    if resp.status not in {200, 201}:
+                        body = await resp.text()
+                        return {"error": f"Matrix API error ({resp.status}): {body}"}
+                    data = await resp.json()
+                    return {"success": True, "platform": "matrix", "chat_id": chat_id, "message_id": data.get("event_id")}
+            try:
+                return await asyncio.wait_for(_do_send(), timeout=30)
+            except asyncio.TimeoutError:
+                return {"error": "Matrix API timeout (30s)"}
     except Exception as e:
         return {"error": f"Matrix send failed: {e}"}
 
@@ -5268,7 +5304,8 @@ def register(ctx) -> None:
         name="matrix",
         label="Matrix",
         adapter_factory=_build_adapter,
-        check_fn=check_matrix_requirements,
+        check_fn=matrix_deps_present,
+        ensure_deps_fn=ensure_matrix_deps,
         is_connected=_is_connected,
         required_env=["MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN"],
         install_hint="pip install 'mautrix[encryption]'",
