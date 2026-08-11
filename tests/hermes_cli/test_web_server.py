@@ -398,6 +398,51 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
+    def test_append_session_message_delivers_once_and_dedupes(self):
+        """POST /api/sessions/{id}/messages durably appends and is idempotent.
+
+        The Ace resident-home controller's delivery contract: a child result or
+        scheduled message lands in the home transcript exactly once, a retry
+        with the same dedupe_key is a no-op, a missing session 404s, and empty
+        content 400s.
+        """
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        writer = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            writer.create_session("home-sess", source="cli")
+        finally:
+            writer.close()
+
+        payload = {
+            "content": "child bg_ab12 finished: shipped the report",
+            "role": "assistant",
+            "display_kind": "ace_home_delivery",
+            "dedupe_key": "ace:deliver:job1:run1",
+        }
+        first = self.client.post("/api/sessions/home-sess/messages", json=payload)
+        assert first.status_code == 200, first.text
+        assert first.json()["deduped"] is False
+        assert first.json()["message_id"] is not None
+
+        # Idempotent retry after an ambiguous response — no second row.
+        retry = self.client.post("/api/sessions/home-sess/messages", json=payload)
+        assert retry.status_code == 200
+        assert retry.json()["deduped"] is True
+
+        got = self.client.get("/api/sessions/home-sess/messages?limit=100&offset=0").json()
+        delivered = [
+            m for m in got["messages"]
+            if "child bg_ab12 finished" in str(m.get("content", ""))
+        ]
+        assert len(delivered) == 1, "delivered exactly once"
+
+        missing = self.client.post("/api/sessions/nope/messages", json={"content": "x"})
+        assert missing.status_code == 404
+        empty = self.client.post("/api/sessions/home-sess/messages", json={"content": "  "})
+        assert empty.status_code == 400
+
     @pytest.mark.parametrize("missing_column", ["archived", "pinned"])
     def test_get_sessions_heals_stale_schema_store(self, missing_column):
         import sqlite3
