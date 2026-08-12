@@ -1696,6 +1696,7 @@ export const ja = defineLocale({
     noWorkspace: 'ワークスペースなし',
     projectEmpty: 'セッションはまだありません',
     noSessions: 'セッションはまだありません',
+    noFilterMatches: 'このフィルターに一致するセッションはありません',
     projects: {
       sectionLabel: 'プロジェクト',
       home: 'ホーム',
@@ -1739,6 +1740,9 @@ export const ja = defineLocale({
       baseBranchPlaceholder: 'ブランチを検索…',
       baseBranchNone: 'ブランチが見つかりません',
       startWorkFailed: 'ワークツリーを作成できませんでした',
+      worktreeProjectLabel: 'プロジェクト',
+      worktreeProjectPlaceholder: 'プロジェクトを検索…',
+      worktreeProjectNone: 'フォルダのあるプロジェクトがありません',
       convertBranch: 'ブランチを変換…',
       convertBranchTitle: 'ブランチを変換',
       convertBranchDesc: 'チェックアウト済みのブランチを開くか、空いているブランチのワークツリーを作成します。',
@@ -1747,6 +1751,7 @@ export const ja = defineLocale({
       branchOpenExisting: '開く',
       branchSwitchHome: 'ホームを切替',
       branchCreateWorktree: '新しいワークツリー',
+      branchTrackRemote: 'リモートを追跡',
       branchesLoading: 'ブランチを読み込み中…',
       noBranches: 'ブランチが見つかりません',
       removeWorktree: 'ワークツリーを削除',
@@ -1780,6 +1785,7 @@ export const ja = defineLocale({
       waitingForAnswer: '回答を待っています',
       finishedUnread: '完了 — 未読',
       backgroundRunning: 'バックグラウンドタスク実行中',
+      draftSession: '下書き — 未送信',
       handoffOrigin: platform => `${platform} から引き継ぎ`,
       ownedByProfile: profile => `プロファイル: ${profile}`,
       renamed: '名前を変更しました',
@@ -1799,6 +1805,10 @@ export const ja = defineLocale({
       thisWeek: '今週',
       lastWeek: '先週',
       thisMonth: '今月'
+    },
+    statusDivider: {
+      working: '実行中',
+      done: '完了'
     }
   },
 
@@ -2401,10 +2411,6 @@ export const ja = defineLocale({
 
   preview: {
     tab: 'プレビュー',
-    closeTab: label => `${label} を閉じる`,
-    closeOthers: '他を閉じる',
-    closeToRight: '右側を閉じる',
-    closeAll: 'すべて閉じる',
     closePane: 'プレビューペインを閉じる',
     loading: 'プレビューを読み込み中',
     unavailable: 'プレビューは利用できません',

@@ -1,2 +1,1 @@
-StanleyStetson
-# upstream sync 2026-08-04
+StanleyStetson <StanleyStetson@users.noreply.github.com>
