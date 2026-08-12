@@ -23,6 +23,7 @@ from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
     SessionImport,
+    SessionMessageAppend,
     SessionPrune,
     SessionRename,
 )
@@ -630,6 +631,48 @@ async def get_session_messages(
             "returned": len(messages),
         },
     }
+
+
+@manage_router.post("/api/sessions/{session_id}/messages")
+async def append_session_message_endpoint(session_id: str, body: SessionMessageAppend):
+    """Append one message to a session transcript (Ace resident-home delivery).
+
+    The Ace desktop resident-home controller calls this to deliver a background
+    child's result or a scheduled message into the canonical home session so it
+    persists in the transcript. ``dedupe_key`` is idempotent: a retry with the
+    same key on the same session returns the existing row without re-inserting.
+    404 when the session does not exist so the caller can re-pick its home.
+    """
+    content = (body.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content required")
+
+    def _append():
+        db = _open_session_db_for_profile(body.profile, read_only=False)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                return None
+            sid = db.resolve_resume_session_id(sid)
+            if body.dedupe_key and db.has_platform_message_id(sid, body.dedupe_key):
+                return {"session_id": sid, "message_id": None, "deduped": True}
+            row_id = db.append_message(
+                session_id=sid,
+                role=body.role,
+                content=content,
+                display_kind=body.display_kind,
+                display_metadata=body.display_metadata,
+                platform_message_id=body.dedupe_key,
+                observed=True,
+            )
+            return {"session_id": sid, "message_id": row_id, "deduped": False}
+        finally:
+            db.close()
+
+    result = await asyncio.to_thread(_append)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return result
 
 
 @manage_router.delete("/api/sessions/{session_id}")

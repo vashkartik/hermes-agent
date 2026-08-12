@@ -326,6 +326,36 @@ class SessionRename(BaseModel):
     profile: Optional[str] = None
 
 
+class SessionMessageAppend(BaseModel):
+    """Append one message to a session transcript (Ace resident-home delivery).
+
+    Used by the Ace desktop resident-home controller to deliver a background
+    child's result or a scheduled message into the canonical home session,
+    durably, so it survives reload. ``dedupe_key`` makes the append idempotent:
+    a second append with the same key on the same session is a no-op, so a
+    client retry after an ambiguous response never double-delivers.
+    """
+
+    content: str
+    role: str = "assistant"
+    display_kind: Optional[str] = None
+    display_metadata: Optional[Dict[str, Any]] = None
+    # Idempotency token (stored as the message's platform id). Re-appending the
+    # same key on the same session returns the existing row without inserting.
+    dedupe_key: Optional[str] = None
+    # Append into a session belonging to another (local) profile. Omit for the
+    # current/default profile.
+    profile: Optional[str] = None
+
+    @field_validator("role")
+    @classmethod
+    def _role_allowed(cls, value: str) -> str:
+        allowed = {"assistant", "user", "system", "tool"}
+        if value not in allowed:
+            raise ValueError(f"role must be one of {sorted(allowed)}")
+        return value
+
+
 # --- from web_server.py (originally lines 12149-12174) ---
 
 class SessionPrune(BaseModel):
