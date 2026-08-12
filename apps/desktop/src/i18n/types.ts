@@ -244,7 +244,8 @@ export interface Translations {
     unmuteHaptics: string
     openSettings: string
     openStarmap: string
-    openKeybinds: string
+    enterHud: string
+    exitHud: string
     layoutEditor: string
     layoutEditorTitle: string
   }
@@ -316,6 +317,18 @@ export interface Translations {
       failed: string
       empty: string
       kinds: { bundled: string; disk: string; runtime: string }
+      agent: {
+        title: string
+        blurb: string
+        empty: string
+        loadFailed: string
+        portable: string
+        search: string
+        noMatches: string
+        toggleFailed: (name: string) => string
+        updateBackendToManage: string
+        sources: Record<string, string>
+      }
     }
     notifications: {
       title: string
@@ -1552,6 +1565,7 @@ export interface Translations {
     noWorkspace: string
     projectEmpty: string
     noSessions: string
+    noFilterMatches: string
     projects: {
       sectionLabel: string
       home: string
@@ -1598,6 +1612,9 @@ export interface Translations {
       baseBranchPlaceholder: string
       baseBranchNone: string
       startWorkFailed: string
+      worktreeProjectLabel: string
+      worktreeProjectPlaceholder: string
+      worktreeProjectNone: string
       convertBranch: string
       convertBranchTitle: string
       convertBranchDesc: string
@@ -1606,6 +1623,7 @@ export interface Translations {
       branchOpenExisting: string
       branchSwitchHome: string
       branchCreateWorktree: string
+      branchTrackRemote: string
       branchesLoading: string
       noBranches: string
       removeWorktree: string
@@ -1642,6 +1660,7 @@ export interface Translations {
       waitingForAnswer: string
       finishedUnread: string
       backgroundRunning: string
+      draftSession: string
       handoffOrigin: (platform: string) => string
       ownedByProfile: (profile: string) => string
       renamed: string
@@ -1661,6 +1680,10 @@ export interface Translations {
       thisWeek: string
       lastWeek: string
       thisMonth: string
+    }
+    statusDivider: {
+      working: string
+      done: string
     }
   }
 
@@ -2176,10 +2199,6 @@ export interface Translations {
 
   preview: {
     tab: string
-    closeTab: (label: string) => string
-    closeOthers: string
-    closeToRight: string
-    closeAll: string
     closePane: string
     loading: string
     unavailable: string
