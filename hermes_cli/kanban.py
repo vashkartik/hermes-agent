@@ -84,6 +84,18 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     }
 
 
+def _print_controller_projection(projection: dict[str, Any]) -> None:
+    print(
+        f"Controller {projection['protocol']} "
+        f"correlation={projection['correlation_id']} "
+        f"assignee={projection['controller_assignee']}"
+    )
+    for stage in projection["status_projection"]:
+        marker = "✓" if stage["reached"] else "·"
+        when = f" @ {stage['occurred_at']}" if stage["occurred_at"] else ""
+        print(f"  {marker} {stage['status']}{when}")
+
+
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     st = getattr(args, "state_type", None)
     sn = getattr(args, "state_name", None)
@@ -571,6 +583,36 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
+
+    p_controller_opt_in = sub.add_parser(
+        "controller-opt-in",
+        help="Bind a task to the ace.controller.v1 envelope protocol",
+    )
+    p_controller_opt_in.add_argument("task_id")
+    p_controller_opt_in.add_argument("--controller-assignee", required=True)
+    p_controller_opt_in.add_argument("--correlation-id", required=True)
+    p_controller_opt_in.add_argument("--ace-identity", required=True)
+
+    p_controller_event = sub.add_parser(
+        "controller-event",
+        help="Record one typed ace.controller.v1 envelope",
+    )
+    p_controller_event.add_argument("task_id")
+    p_controller_event.add_argument(
+        "event_type", type=str.upper, choices=sorted(kb.CONTROLLER_EVENT_TYPES),
+    )
+    p_controller_event.add_argument("--idempotency-key", required=True)
+    p_controller_event.add_argument("--occurred-at", required=True)
+    p_controller_event.add_argument("--correlation-id", required=True)
+    p_controller_event.add_argument("--ace-identity", required=True)
+    p_controller_event.add_argument("--payload", default=None,
+                                    help="Optional redacted JSON event payload")
+    p_controller_event.add_argument("--ace-receipt", default=None,
+                                    help="JSON object; required for TRANSITION")
+    p_controller_event.add_argument("--terminal-receipt", default=None,
+                                    help="JSON object; required for RETURN")
+    p_controller_event.add_argument("--vector-ack", default=None,
+                                    help="JSON object; required for RETURN")
 
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
@@ -1102,6 +1144,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
+            "controller-opt-in": _cmd_controller_opt_in,
+            "controller-event": _cmd_controller_event,
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
@@ -1682,6 +1726,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        controller = kb.controller_status_projection(conn, args.task_id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1725,6 +1770,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 for r in runs
             ],
         }
+        if controller is not None:
+            payload["controller"] = controller
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
@@ -1789,6 +1836,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  started:   {_fmt_ts(task.started_at)}")
     if task.completed_at:
         print(f"  completed: {_fmt_ts(task.completed_at)}")
+    if controller:
+        print()
+        _print_controller_projection(controller)
     if parents:
         print(f"  parents:   {', '.join(parents)}")
     if children:
@@ -2098,6 +2148,61 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
+    return 0
+
+
+def _cmd_controller_opt_in(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        projection = kb.opt_in_controller_task(
+            conn,
+            args.task_id,
+            controller_assignee=args.controller_assignee,
+            correlation_id=args.correlation_id,
+            ace_identity=args.ace_identity,
+        )
+    _print_controller_projection(projection)
+    return 0
+
+
+def _controller_cli_object(raw: Optional[str], name: str) -> Optional[dict]:
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--{name.replace('_', '-')}: invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"--{name.replace('_', '-')} must be a JSON object")
+    return value
+
+
+def _cmd_controller_event(args: argparse.Namespace) -> int:
+    payload = _controller_cli_object(args.payload, "payload")
+    ace_receipt = _controller_cli_object(args.ace_receipt, "ace_receipt")
+    terminal_receipt = _controller_cli_object(
+        args.terminal_receipt, "terminal_receipt"
+    )
+    vector_ack = _controller_cli_object(args.vector_ack, "vector_ack")
+    with kb.connect_closing() as conn:
+        result = kb.record_controller_envelope(
+            conn,
+            args.task_id,
+            event_type=args.event_type,
+            idempotency_key=args.idempotency_key,
+            occurred_at=args.occurred_at,
+            correlation_id=args.correlation_id,
+            ace_identity=args.ace_identity,
+            payload=payload,
+            ace_receipt=ace_receipt,
+            terminal_receipt=terminal_receipt,
+            vector_ack=vector_ack,
+        )
+        projection = kb.controller_status_projection(conn, args.task_id) or {}
+    print(
+        f"Controller {result.envelope.event_type} "
+        f"{'duplicate' if result.duplicate else 'recorded'}"
+    )
+    _print_controller_projection(projection)
     return 0
 
 
@@ -3306,6 +3411,7 @@ Common subcommands:
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
+  `controller-opt-in <id> …` Bind ace.controller.v1; `controller-event <id> <type> …` records an envelope
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
