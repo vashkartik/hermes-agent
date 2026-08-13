@@ -9831,7 +9831,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "status", "archived", "unblocked", "controller_envelope",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -9853,6 +9853,16 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     who = getattr(task, "assignee", None) or ""
     tag = f"@{who} " if who else ""
     payload = getattr(ev, "payload", None) or {}
+    if kind == "controller_envelope":
+        from hermes_cli import kanban_db as _kb
+
+        event_type = str(payload.get("event_type") or "").upper()
+        stages = _kb.controller_event_stages(event_type)
+        if stages:
+            return f"🔁 {board_tag}{tag}Kanban {task_id} controller — {' · '.join(stages)}"
+        if event_type == "ESCALATE":
+            return f"🟥 {board_tag}{tag}Kanban {task_id} controller ESCALATE"
+        return None
     if kind == "completed":
         handoff = ""
         summary = payload.get("summary")

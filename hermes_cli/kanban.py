@@ -57,7 +57,7 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    return {
+    result = {
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -82,6 +82,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
+    if t.metadata is not None:
+        result["metadata"] = t.metadata
+    return result
 
 
 def _print_controller_projection(projection: dict[str, Any]) -> None:
@@ -342,6 +345,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument(
+        "--metadata",
+        default=None,
+        help="Optional task metadata JSON; controller v1 uses metadata.controller",
+    )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1586,6 +1594,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    metadata = None
+    if getattr(args, "metadata", None):
+        try:
+            metadata = json.loads(args.metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must decode to an object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1610,6 +1627,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            metadata=metadata,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

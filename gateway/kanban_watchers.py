@@ -178,7 +178,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # done/archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "controller_envelope")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -433,7 +433,25 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "controller_envelope":
+                            event_type = (
+                                str(ev.payload.get("event_type") or "").upper()
+                                if ev.payload else ""
+                            )
+                            stages = _kb.controller_event_stages(event_type)
+                            if stages:
+                                msg = (
+                                    f"🔁 {board_tag}{tag}Kanban {sub['task_id']} "
+                                    f"controller — {' · '.join(stages)}"
+                                )
+                            elif event_type == "ESCALATE":
+                                msg = (
+                                    f"🟥 {board_tag}{tag}Kanban {sub['task_id']} "
+                                    "controller ESCALATE"
+                                )
+                            else:
+                                continue
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to

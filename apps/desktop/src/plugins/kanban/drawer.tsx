@@ -45,6 +45,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { ControllerStatus } from './controller-status'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -795,6 +796,12 @@ export function TaskDrawer({
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={k.diagnosticsN(task.diagnostics.length)}>
                 <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
+              </Section>
+            )}
+
+            {task.controller && (
+              <Section label={k.controller}>
+                <ControllerStatus controller={task.controller} label={k.controller} />
               </Section>
             )}
 

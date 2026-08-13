@@ -232,11 +232,23 @@ def test_controller_envelopes_project_and_fail_closed_through_http(client):
         json={"title": "controlled", "assignee": "ace-controller"},
     ).json()["task"]
     task_id = task["id"]
+    skill = (
+        Path.home()
+        / ".hermes"
+        / "profiles"
+        / "ace-controller"
+        / "skills"
+        / "orchestration"
+        / "vector-controller"
+        / "SKILL.md"
+    )
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text("---\nname: vector-controller\n---\n", encoding="utf-8")
     binding = {
         "protocol": "ace.controller.v1",
         "controller_assignee": "ace-controller",
-        "correlation_id": "corr-http",
-        "ace_identity": "ace:http",
+        "correlation_id": f"kanban:{task_id}",
+        "ace_identity": f"ace:pending:{task_id}",
     }
     opt_in = client.post(
         f"/api/plugins/kanban/tasks/{task_id}/controller/opt-in",
@@ -254,8 +266,8 @@ def test_controller_envelopes_project_and_fail_closed_through_http(client):
         "event_type": "OUTBOUND",
         "idempotency_key": "http-outbound",
         "occurred_at": "2026-08-13T12:00:01Z",
-        "correlation_id": "corr-http",
-        "ace_identity": "ace:http",
+        "correlation_id": f"kanban:{task_id}",
+        "ace_identity": f"ace:pending:{task_id}",
         "payload": {"route": "Vector"},
     }
     recorded = client.post(event_url, json=outbound)

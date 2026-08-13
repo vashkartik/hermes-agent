@@ -162,6 +162,8 @@ def _task_dict(
     controller: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    if d.get("metadata") is None:
+        d.pop("metadata", None)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -741,6 +743,7 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 @router.post("/tasks")
@@ -770,6 +773,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
             board=board,
+            metadata=payload.metadata,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {
@@ -982,6 +986,9 @@ class UpdateTaskBody(BaseModel):
     # override doesn't silently reset the depth the operator chose.
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # Task-owned metadata is separate from completion/review handoff metadata.
+    # Only task_metadata.controller can opt a card into controller v1.
+    task_metadata: Optional[dict] = None
 
 
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
@@ -1146,26 +1153,22 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
 
         # --- title / body -------------------------------------------------
-        if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+        if (
+            payload.title is not None
+            or payload.body is not None
+            or payload.task_metadata is not None
+        ):
+            try:
+                kanban_db.update_task_content(
+                    conn,
+                    task_id,
+                    title=payload.title,
+                    body=payload.body,
+                    metadata=payload.task_metadata,
+                    update_metadata=payload.task_metadata is not None,
                 )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+            except (ValueError, kanban_db.ControllerEnvelopeError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         updated = kanban_db.get_task(conn, task_id)
         return {

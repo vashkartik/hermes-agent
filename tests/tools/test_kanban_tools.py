@@ -80,6 +80,106 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_typed_controller_tools_register_and_ingest_full_flow(worker_env):
+    from pathlib import Path
+
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    skill = (
+        Path.home()
+        / ".hermes"
+        / "profiles"
+        / "test-worker"
+        / "skills"
+        / "orchestration"
+        / "vector-controller"
+        / "SKILL.md"
+    )
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text("---\nname: vector-controller\n---\n", encoding="utf-8")
+
+    invalidate_check_fn_cache()
+    schemas = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {schema["function"]["name"] for schema in schemas}
+    assert {"kanban_controller_opt_in", "kanban_controller_event"} <= names
+
+    opted = json.loads(kt._handle_controller_opt_in({
+        "correlation_id": "tool-correlation",
+        "ace_identity": "ace:tool-worker",
+    }))
+    assert opted["ok"] is True
+    assert opted["controller"]["protocol"] == "ace.controller.v1"
+
+    common = {
+        "correlation_id": "tool-correlation",
+        "ace_identity": "ace:tool-worker",
+    }
+    outbound = json.loads(kt._handle_controller_event({
+        **common,
+        "event_type": "OUTBOUND",
+        "idempotency_key": "tool-outbound",
+        "occurred_at": "2026-08-13T12:00:01Z",
+        "payload": {"route": "Vector"},
+    }))
+    assert outbound["ok"] is True and outbound["duplicate"] is False
+    duplicate = json.loads(kt._handle_controller_event({
+        **common,
+        "event_type": "OUTBOUND",
+        "idempotency_key": "tool-outbound",
+        "occurred_at": "2026-08-13T12:00:01Z",
+        "payload": {"route": "Vector"},
+    }))
+    assert duplicate["duplicate"] is True
+
+    transition = json.loads(kt._handle_controller_event({
+        **common,
+        "event_type": "TRANSITION",
+        "idempotency_key": "tool-transition",
+        "occurred_at": "2026-08-13T12:00:02Z",
+        "ace_receipt": {"run_id": "ace-run-1"},
+    }))
+    assert transition["ok"] is True
+    returned = json.loads(kt._handle_controller_event({
+        **common,
+        "event_type": "RETURN",
+        "idempotency_key": "tool-return",
+        "occurred_at": "2026-08-13T12:00:03Z",
+        "terminal_receipt": {"state": "done"},
+        "vector_ack": {"delivered": True},
+    }))
+    assert returned["ok"] is True
+    assert [
+        stage["status"] for stage in returned["controller"]["status_projection"]
+    ] == ["SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED"]
+    assert all(stage["reached"] for stage in returned["controller"]["status_projection"])
+
+    shown = json.loads(kt._handle_show({}))
+    assert shown["controller"]["terminal"] is True
+
+
+def test_controller_agent_tool_rejects_foreign_task(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="foreign controller target")
+    finally:
+        conn.close()
+
+    rejected = json.loads(kt._handle_controller_event({
+        "task_id": other,
+        "event_type": "OUTBOUND",
+        "idempotency_key": "foreign",
+        "occurred_at": "2026-08-13T12:00:01Z",
+        "correlation_id": "foreign",
+        "ace_identity": "ace:foreign",
+    }))
+    assert "refusing to mutate" in rejected["error"]
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

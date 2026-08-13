@@ -191,6 +191,50 @@ class TestCollectKanbanNotifications:
         assert "cross-profile delivery" in texts[0]
         assert _sub_rows(tid) == []
 
+    def test_delivers_structured_controller_stages_once(self, monkeypatch):
+        monkeypatch.setattr(
+            kb,
+            "_is_authorized_controller_assignee",
+            lambda assignee: assignee == "vector-controller",
+        )
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(
+                conn, title="controller tui", assignee="vector-controller",
+            )
+            projection = kb.controller_status_projection(conn, tid)
+            kb.add_notify_sub(
+                conn, task_id=tid, platform="tui", chat_id=SESSION_KEY,
+            )
+            common = {
+                "correlation_id": projection["correlation_id"],
+                "ace_identity": projection["ace_identity"],
+            }
+            kb.record_controller_envelope(
+                conn, tid, event_type="OUTBOUND", idempotency_key="tui-outbound",
+                occurred_at="2026-08-13T12:00:01Z", **common,
+            )
+            kb.record_controller_envelope(
+                conn, tid, event_type="TRANSITION", idempotency_key="tui-transition",
+                occurred_at="2026-08-13T12:00:02Z",
+                ace_receipt={"run_id": "ace-1"}, **common,
+            )
+            kb.record_controller_envelope(
+                conn, tid, event_type="RETURN", idempotency_key="tui-return",
+                occurred_at="2026-08-13T12:00:03Z",
+                terminal_receipt={"state": "done"},
+                vector_ack={"delivered": True}, **common,
+            )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+        rendered = "\n".join(texts)
+        assert len(texts) == 3
+        for stage in ("SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED"):
+            assert stage in rendered
+        assert _collect_kanban_notifications(_session()) == []
+
 
 class TestFormatKanbanEventText:
     SUB = {"task_id": "t_abc123"}
@@ -221,6 +265,14 @@ class TestFormatKanbanEventText:
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
+
+    def test_controller_return_projects_both_terminal_statuses(self):
+        ev = SimpleNamespace(
+            kind="controller_envelope", payload={"event_type": "RETURN"},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert "RESPONSE RECEIVED" in text
+        assert "VECTOR ACKNOWLEDGED" in text
 
 
 class TestNotificationPollerLoopKanbanWiring:

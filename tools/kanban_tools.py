@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import asdict
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -560,7 +561,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            return json.dumps({
+            response = {
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
@@ -580,7 +581,11 @@ def _handle_show(args: dict, **kw) -> str:
                 # the same string build_worker_context returns to the
                 # dispatcher at spawn time.
                 "worker_context": kb.build_worker_context(conn, tid),
-            })
+            }
+            controller = kb.controller_status_projection(conn, tid)
+            if controller is not None:
+                response["controller"] = controller
+            return json.dumps(response)
         finally:
             conn.close()
     except ValueError as e:
@@ -589,6 +594,90 @@ def _handle_show(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_show failed")
         return tool_error(f"kanban_show: {e}")
+
+
+def _handle_controller_opt_in(args: dict, **kw) -> str:
+    """Bind the caller's task to controller v1 through the agent tool path."""
+    delegated_err = _reject_delegated_child_mutation("kanban_controller_opt_in")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    assignee = args.get("controller_assignee") or os.environ.get("HERMES_PROFILE")
+    if not assignee:
+        return tool_error("controller_assignee is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            projection = kb.opt_in_controller_task(
+                conn,
+                tid,
+                controller_assignee=str(assignee),
+                correlation_id=args.get("correlation_id"),
+                ace_identity=args.get("ace_identity"),
+                protocol=args.get("protocol") or kb.CONTROLLER_PROTOCOL_V1,
+            )
+            return _ok(task_id=tid, controller=projection)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_controller_opt_in: {e}")
+    except Exception as e:
+        logger.exception("kanban_controller_opt_in failed")
+        return tool_error(f"kanban_controller_opt_in: {e}")
+
+
+def _handle_controller_event(args: dict, **kw) -> str:
+    """Validate and persist one typed controller envelope for this task."""
+    delegated_err = _reject_delegated_child_mutation("kanban_controller_event")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            result = kb.record_controller_envelope(
+                conn,
+                tid,
+                protocol=args.get("protocol") or kb.CONTROLLER_PROTOCOL_V1,
+                event_type=args.get("event_type"),
+                idempotency_key=args.get("idempotency_key"),
+                occurred_at=args.get("occurred_at"),
+                correlation_id=args.get("correlation_id"),
+                ace_identity=args.get("ace_identity"),
+                payload=args.get("payload"),
+                ace_receipt=args.get("ace_receipt"),
+                terminal_receipt=args.get("terminal_receipt"),
+                vector_ack=args.get("vector_ack"),
+            )
+            return _ok(
+                task_id=tid,
+                envelope=asdict(result.envelope),
+                duplicate=result.duplicate,
+                controller=kb.controller_status_projection(conn, tid),
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_controller_event: {e}")
+    except Exception as e:
+        logger.exception("kanban_controller_event failed")
+        return tool_error(f"kanban_controller_event: {e}")
 
 
 def _handle_list(args: dict, **kw) -> str:
@@ -1461,6 +1550,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                metadata=args.get("metadata"),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1709,6 +1799,86 @@ KANBAN_SHOW_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+KANBAN_CONTROLLER_OPT_IN_SCHEMA = {
+    "name": "kanban_controller_opt_in",
+    "description": (
+        "Bind your assigned task to the authoritative ace.controller.v1 "
+        "envelope contract. The controller_assignee must be the task's "
+        "current authorized controller profile. Exact retries are idempotent."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "protocol": {
+                "type": "string",
+                "enum": ["ace.controller.v1"],
+                "description": "Protocol version; defaults to ace.controller.v1.",
+            },
+            "controller_assignee": {
+                "type": "string",
+                "description": "Authorized controller profile; defaults to HERMES_PROFILE.",
+            },
+            "correlation_id": {
+                "type": "string",
+                "description": "Stable route/correlation id for this card lifecycle.",
+            },
+            "ace_identity": {
+                "type": "string",
+                "description": "Stable Ace identity bound to every envelope.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["correlation_id", "ace_identity"],
+    },
+}
+
+KANBAN_CONTROLLER_EVENT_SCHEMA = {
+    "name": "kanban_controller_event",
+    "description": (
+        "Record one typed ace.controller.v1 envelope for your assigned task. "
+        "Order is OUTBOUND, TRANSITION, optional ESCALATE, RETURN. TRANSITION "
+        "requires ace_receipt; RETURN requires terminal_receipt and vector_ack."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "protocol": {
+                "type": "string",
+                "enum": ["ace.controller.v1"],
+                "description": "Protocol version; defaults to ace.controller.v1.",
+            },
+            "event_type": {
+                "type": "string",
+                "enum": ["OUTBOUND", "TRANSITION", "ESCALATE", "RETURN"],
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Globally unique retry key for this exact envelope.",
+            },
+            "occurred_at": {
+                "type": "string",
+                "description": "Producer RFC3339 timestamp with timezone.",
+            },
+            "correlation_id": {"type": "string"},
+            "ace_identity": {"type": "string"},
+            "payload": {"type": "object"},
+            "ace_receipt": {"type": "object"},
+            "terminal_receipt": {"type": "object"},
+            "vector_ack": {"type": "object"},
+            "board": _board_schema_prop(),
+        },
+        "required": [
+            "event_type",
+            "idempotency_key",
+            "occurred_at",
+            "correlation_id",
+            "ace_identity",
+        ],
     },
 }
 
@@ -2159,6 +2329,14 @@ KANBAN_CREATE_SCHEMA = {
                     "its context."
                 ),
             },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional task metadata. Controller v1 opt-in uses only "
+                    "metadata.controller with protocol, correlation_id, and "
+                    "ace_identity fields."
+                ),
+            },
             "parents": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -2365,6 +2543,24 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_controller_opt_in",
+    toolset="kanban",
+    schema=KANBAN_CONTROLLER_OPT_IN_SCHEMA,
+    handler=_handle_controller_opt_in,
+    check_fn=_check_kanban_mode,
+    emoji="🟦",
+)
+
+registry.register(
+    name="kanban_controller_event",
+    toolset="kanban",
+    schema=KANBAN_CONTROLLER_EVENT_SCHEMA,
+    handler=_handle_controller_event,
+    check_fn=_check_kanban_mode,
+    emoji="🔁",
 )
 
 registry.register(

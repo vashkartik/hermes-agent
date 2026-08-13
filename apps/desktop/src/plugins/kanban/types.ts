@@ -23,6 +23,34 @@ export interface KanbanTask {
   started_at?: null | number
   worker_pid?: null | number
   last_heartbeat_at?: null | number
+  /** Authoritative ace.controller.v1 projection; absent on legacy cards. */
+  controller?: ControllerProjection
+}
+
+export type ControllerExternalStage =
+  | 'ACE ACCEPTED'
+  | 'RESPONSE RECEIVED'
+  | 'SENT'
+  | 'VECTOR ACKNOWLEDGED'
+
+export interface ControllerStageProjection {
+  status: ControllerExternalStage
+  reached: boolean
+  occurred_at?: null | string
+  received_at?: null | string
+  event_id?: null | number
+  evidence?: null | Record<string, unknown>
+}
+
+export interface ControllerProjection {
+  protocol: string
+  controller_assignee: string
+  correlation_id: string
+  ace_identity: string
+  opted_in_at: string
+  opt_in_source?: string
+  terminal: boolean
+  status_projection: ControllerStageProjection[]
 }
 
 export interface KanbanColumn {

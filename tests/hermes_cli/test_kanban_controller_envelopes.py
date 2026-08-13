@@ -27,10 +27,35 @@ def conn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _task(conn, *, assignee="ace-controller") -> str:
+    if assignee == "ace-controller":
+        # Manual-opt-in fixtures deliberately predate controller-profile
+        # provisioning, matching an upgraded board. Avoid the automatic
+        # authorized-assignee path until _opt_in provisions the capability.
+        task_id = kb.create_task(conn, title="controller card")
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, task_id))
+        conn.commit()
+        return task_id
     return kb.create_task(conn, title="controller card", assignee=assignee)
 
 
+def _authorize_controller(profile: str = "ace-controller") -> Path:
+    skill = (
+        Path.home()
+        / ".hermes"
+        / "profiles"
+        / profile
+        / "skills"
+        / "orchestration"
+        / "vector-controller"
+        / "SKILL.md"
+    )
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text("---\nname: vector-controller\n---\n", encoding="utf-8")
+    return skill
+
+
 def _opt_in(conn, task_id: str, *, correlation="corr-1") -> dict:
+    _authorize_controller()
     return kb.opt_in_controller_task(
         conn,
         task_id,
@@ -113,8 +138,12 @@ def test_opt_in_is_explicit_exactly_idempotent_and_correlation_unique(conn) -> N
     with pytest.raises(kb.ControllerEnvelopeError, match="already bound"):
         _opt_in(conn, other)
 
-    terminal = _task(conn)
+    terminal = _task(conn, assignee="builder")
     assert kb.complete_task(conn, terminal, summary="already done") is True
+    conn.execute(
+        "UPDATE tasks SET assignee = 'ace-controller' WHERE id = ?", (terminal,)
+    )
+    conn.commit()
     with pytest.raises(kb.ControllerEnvelopeError, match="terminal task"):
         kb.opt_in_controller_task(
             conn,
@@ -370,6 +399,111 @@ def test_init_recreates_controller_schema_for_an_existing_board(conn) -> None:
     assert {"controller_bindings", "controller_envelopes"} <= tables
 
 
+@pytest.mark.parametrize("carrier", ["title", "body", "metadata", "assignee"])
+def test_documented_opt_in_carriers_bind_only_authorized_controller_profiles(
+    conn, carrier,
+) -> None:
+    _authorize_controller("vector-controller")
+    kwargs = {
+        "title": "ordinary controller task",
+        "assignee": "vector-controller",
+    }
+    if carrier == "title":
+        kwargs["title"] = "run ace.controller.v1 lifecycle"
+    elif carrier == "body":
+        kwargs["body"] = "Protocol: ace.controller.v1"
+    elif carrier == "metadata":
+        kwargs["metadata"] = {
+            "controller": {
+                "protocol": "ace.controller.v1",
+                "correlation_id": "corr-metadata",
+                "ace_identity": "ace:metadata",
+            },
+            "unrelated": "preserved",
+        }
+
+    task_id = kb.create_task(conn, **kwargs)
+    projection = kb.controller_status_projection(conn, task_id)
+    assert projection is not None
+    assert projection["opt_in_source"] == (
+        "authorized_assignee" if carrier == "assignee" else carrier
+    )
+    if carrier == "metadata":
+        assert projection["correlation_id"] == "corr-metadata"
+        assert projection["ace_identity"] == "ace:metadata"
+        assert kb.get_task(conn, task_id).metadata["unrelated"] == "preserved"
+
+
+def test_v1_migration_backfills_existing_qualified_rows_and_legacy_stays_legacy(
+    conn,
+) -> None:
+    legacy = kb.create_task(conn, title="ordinary", assignee="builder")
+    migrating = kb.create_task(conn, title="old card", assignee="builder")
+    malformed = kb.create_task(conn, title="old malformed", assignee="builder")
+    conn.execute(
+        "UPDATE tasks SET title = ?, assignee = ? WHERE id = ?",
+        ("old ace.controller.v1 card", "vector-controller", migrating),
+    )
+    conn.execute(
+        "UPDATE tasks SET metadata = ? WHERE id = ?",
+        (json.dumps({"controller": {"protocol": "wrong"}}), malformed),
+    )
+    conn.commit()
+    _authorize_controller("vector-controller")
+    conn.execute(
+        "DELETE FROM kanban_migrations WHERE name = 'controller_auto_opt_in_v1'"
+    )
+    conn.commit()
+
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db(db_path)
+
+    assert kb.controller_status_projection(conn, migrating)["opt_in_source"] == "title"
+    assert kb.controller_status_projection(conn, legacy) is None
+    assert kb.complete_task(conn, legacy, summary="legacy unchanged") is True
+    assert kb.complete_task(conn, malformed, summary="must fail closed") is False
+    assert kb.request_review(conn, malformed, summary="must fail closed") is False
+
+
+def test_first_envelope_lazily_binds_a_post_migration_content_opt_in(conn) -> None:
+    task_id = kb.create_task(conn, title="old card", assignee="builder")
+    conn.execute(
+        "UPDATE tasks SET title = ?, assignee = ? WHERE id = ?",
+        ("old ace.controller.v1 card", "vector-controller", task_id),
+    )
+    conn.commit()
+    _authorize_controller("vector-controller")
+    assert kb.controller_status_projection(conn, task_id) is None
+
+    result = kb.record_controller_envelope(
+        conn,
+        task_id,
+        event_type="OUTBOUND",
+        idempotency_key="lazy-outbound",
+        occurred_at="2026-08-13T12:00:01Z",
+        correlation_id=f"kanban:{task_id}",
+        ace_identity=f"ace:pending:{task_id}",
+    )
+
+    assert result.duplicate is False
+    projection = kb.controller_status_projection(conn, task_id)
+    assert projection["opt_in_source"] == "title"
+    assert projection["status_projection"][0]["status"] == "SENT"
+    assert projection["status_projection"][0]["reached"] is True
+
+
+def test_explicit_v1_marker_rejects_unauthorized_assignee_without_partial_task(conn) -> None:
+    before = {task.id for task in kb.list_tasks(conn, include_archived=True)}
+    with pytest.raises(kb.ControllerEnvelopeError, match="authorized controller"):
+        kb.create_task(
+            conn,
+            title="ace.controller.v1 control card",
+            assignee="ordinary-worker",
+        )
+    assert {task.id for task in kb.list_tasks(conn, include_archived=True)} == before
+
+
 def test_assignee_drift_fails_closed_but_legacy_cards_are_unchanged(conn) -> None:
     task_id = _task(conn)
     _opt_in(conn, task_id)
@@ -404,6 +538,28 @@ def test_assignee_drift_fails_closed_but_legacy_cards_are_unchanged(conn) -> Non
     assert kb.complete_task(conn, legacy_done, summary="legacy complete") is True
     legacy_review = _task(conn, assignee="builder")
     assert kb.request_review(conn, legacy_review, summary="legacy review") is True
+
+
+def test_controller_capability_removal_rejects_new_events_but_preserves_exact_retry(
+    conn,
+) -> None:
+    task_id = _task(conn)
+    _opt_in(conn, task_id)
+    outbound = _record(conn, task_id, "OUTBOUND", 1)
+    _authorize_controller().unlink()
+
+    assert _record(conn, task_id, "OUTBOUND", 1).duplicate is True
+    assert outbound.duplicate is False
+    with pytest.raises(kb.ControllerEnvelopeError, match="no longer an authorized"):
+        _record(
+            conn,
+            task_id,
+            "TRANSITION",
+            2,
+            ace_receipt={"receipt_id": "ace-r-1"},
+        )
+    assert kb.complete_task(conn, task_id, summary="not authorized") is False
+    assert kb.request_review(conn, task_id, summary="not authorized") is False
 
 
 def test_receipts_payload_and_projected_event_are_redacted(conn) -> None:
@@ -462,17 +618,18 @@ def test_non_finite_controller_json_rejects_without_durable_side_effects(
 
 def test_cli_ingestion_round_trip_uses_real_sqlite(conn) -> None:
     task_id = _task(conn)
+    _authorize_controller()
     opt = cli.run_slash(
         "controller-opt-in "
         f"{task_id} --controller-assignee ace-controller "
-        "--correlation-id corr-cli --ace-identity ace:cli"
+        f"--correlation-id kanban:{task_id} --ace-identity ace:pending:{task_id}"
     )
     assert "ace.controller.v1" in opt
     outbound = cli.run_slash(
         "controller-event "
         f"{task_id} OUTBOUND --idempotency-key cli-1 "
         "--occurred-at 2026-08-13T12:00:01Z "
-        "--correlation-id corr-cli --ace-identity ace:cli "
+        f"--correlation-id kanban:{task_id} --ace-identity ace:pending:{task_id} "
         f"--payload {shlex.quote(json.dumps({'source': 'cli'}))}"
     )
     assert "OUTBOUND recorded" in outbound
