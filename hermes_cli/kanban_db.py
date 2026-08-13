@@ -4193,13 +4193,37 @@ def _controller_object(value: Any, field_name: str) -> Optional[dict]:
         return None
     if not isinstance(value, dict) or not value:
         raise ControllerEnvelopeError(f"{field_name} must be a non-empty object")
-    redacted = redact_review_value(value)
     # JSON round-trip establishes the canonical persisted type and rejects
-    # non-wire values such as sets or arbitrary objects at the ingestion edge.
+    # non-wire values such as sets, arbitrary objects, and NaN/Infinity at the
+    # ingestion edge. Strict JSON here also keeps later API serialization from
+    # failing after the database transaction has already committed.
     try:
-        return json.loads(json.dumps(redacted, sort_keys=True, ensure_ascii=False))
+        canonical = json.loads(json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        ))
     except (TypeError, ValueError) as exc:
         raise ControllerEnvelopeError(f"{field_name} must be JSON serializable") from exc
+
+    from agent.redact import redact_sensitive_text
+
+    def _redact(item: Any) -> Any:
+        if isinstance(item, str):
+            return redact_sensitive_text(item, force=True)
+        if isinstance(item, list):
+            return [_redact(child) for child in item]
+        if isinstance(item, dict):
+            return {
+                redact_sensitive_text(key, force=True): _redact(child)
+                for key, child in item.items()
+            }
+        return item
+
+    # This controller-specific boundary covers JSON object keys as well as
+    # values. Keep the legacy review redactor unchanged for its existing users.
+    return _redact(canonical)
 
 
 def _controller_json(value: Optional[dict]) -> Optional[str]:

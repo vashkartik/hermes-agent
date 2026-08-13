@@ -265,6 +265,25 @@ def test_controller_envelopes_project_and_fail_closed_through_http(client):
     assert duplicate.status_code == 200
     assert duplicate.json()["duplicate"] is True
 
+    events_after_outbound = client.get(
+        f"/api/plugins/kanban/tasks/{task_id}"
+    ).json()["events"]
+    non_finite = dict(
+        outbound,
+        idempotency_key="http-nan",
+        occurred_at="2026-08-13T12:00:01.500Z",
+        payload={"nested": [float("nan")]},
+    )
+    rejected_json = client.post(
+        event_url,
+        content=json.dumps(non_finite),
+        headers={"content-type": "application/json"},
+    )
+    assert rejected_json.status_code == 400
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{task_id}"
+    ).json()["events"] == events_after_outbound
+
     before = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
     for status_name in ("review", "done"):
         rejected = client.patch(
@@ -1036,4 +1055,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-

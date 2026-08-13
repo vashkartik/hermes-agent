@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from dataclasses import asdict
 from itertools import permutations
 from pathlib import Path
 
@@ -409,14 +410,54 @@ def test_receipts_payload_and_projected_event_are_redacted(conn) -> None:
     task_id = _task(conn)
     _opt_in(conn, task_id)
     secret = "ghp_" + "A" * 40
-    _record(conn, task_id, "OUTBOUND", 1, payload={"token": secret})
-    envelope = kb.list_controller_envelopes(conn, task_id)[0]
-    assert secret not in json.dumps(envelope.payload)
-    projected = [
-        event for event in kb.list_events(conn, task_id)
+    secret_key = "ghp_" + "B" * 40
+    nested = {"items": [{secret_key: {"token": secret}}]}
+    _record(conn, task_id, "OUTBOUND", 1, payload=nested)
+    _record(conn, task_id, "TRANSITION", 2, ace_receipt=nested)
+    _record(
+        conn,
+        task_id,
+        "RETURN",
+        3,
+        terminal_receipt=nested,
+        vector_ack=nested,
+    )
+
+    durable = json.dumps(
+        [asdict(envelope) for envelope in kb.list_controller_envelopes(conn, task_id)]
+    )
+    projected = json.dumps([
+        asdict(event)
+        for event in kb.list_events(conn, task_id)
         if event.kind == "controller_envelope"
-    ][0]
-    assert secret not in json.dumps(projected.payload)
+    ])
+    projection = json.dumps(kb.controller_status_projection(conn, task_id))
+    for serialized in (durable, projected, projection):
+        assert secret not in serialized
+        assert secret_key not in serialized
+
+
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        {"nested": [float("nan")]},
+        {"nested": {"value": float("inf")}},
+        {float("-inf"): "non-finite key"},
+    ],
+    ids=("nan-value", "infinite-value", "infinite-key"),
+)
+def test_non_finite_controller_json_rejects_without_durable_side_effects(
+    conn, invalid_payload,
+) -> None:
+    task_id = _task(conn)
+    _opt_in(conn, task_id)
+    events_before = kb.list_events(conn, task_id)
+
+    with pytest.raises(kb.ControllerEnvelopeError, match="JSON serializable"):
+        _record(conn, task_id, "OUTBOUND", 1, payload=invalid_payload)
+
+    assert kb.list_controller_envelopes(conn, task_id) == []
+    assert kb.list_events(conn, task_id) == events_before
 
 
 def test_cli_ingestion_round_trip_uses_real_sqlite(conn) -> None:
