@@ -508,11 +508,23 @@ def parse_plugin_manifest(
     )
     requires_plugins = normalize_plugin_requires(data.get("requires_plugins"), ref, findings)
 
+    # ``python_dependencies`` (v2) is the current spelling; ``pip_dependencies``
+    # (v1) is a permanent compatibility alias. Declaring the v2 key — even as an
+    # empty list — is explicit and wins. Both are declare-only: Hermes surfaces
+    # them and never auto-installs.
+    raw_pydeps = data.get("python_dependencies")
+    if raw_pydeps is None:
+        raw_pydeps = data.get("pip_dependencies")
+    if raw_pydeps is not None and not isinstance(raw_pydeps, list):
+        findings.append(
+            Finding(WARNING, "invalid-dependency-declaration", ref,
+                    "python_dependencies/pip_dependencies must be a list of "
+                    "requirement strings; ignoring")
+        )
+        raw_pydeps = None
     python_deps = [
-        str(x).strip()
-        for x in (data.get("python_dependencies") or data.get("pip_dependencies") or [])
-        if str(x).strip()
-    ] if isinstance(data.get("python_dependencies") or data.get("pip_dependencies"), list) else []
+        str(x).strip() for x in (raw_pydeps or []) if str(x).strip()
+    ]
 
     capabilities = _str_list(data.get("capabilities"))
     known_caps = _known_capability_ids()

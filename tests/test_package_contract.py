@@ -192,6 +192,41 @@ class TestParsePluginManifest:
             {"id": "x", "version_range": ">=1"},
         ]
 
+    def test_pip_dependencies_is_a_compat_alias(self):
+        rec, findings = parse_plugin_manifest(
+            dict(PLUGIN_OK, pip_dependencies=["requests>=2,<3"]),
+            key="s",
+            path="plugins/s",
+        )
+        assert not _errors(findings)
+        assert rec.dependencies["python"] == ["requests>=2,<3"]
+
+    def test_python_dependencies_wins_over_the_alias(self):
+        rec, _ = parse_plugin_manifest(
+            dict(PLUGIN_OK, python_dependencies=["new>=1"], pip_dependencies=["old>=1"]),
+            key="s",
+            path="plugins/s",
+        )
+        assert rec.dependencies["python"] == ["new>=1"]
+
+    def test_explicit_empty_python_dependencies_does_not_fall_back(self):
+        # Declaring the v2 key at all is explicit: an empty list means "none",
+        # it must not silently resurrect the v1 alias.
+        rec, _ = parse_plugin_manifest(
+            dict(PLUGIN_OK, python_dependencies=[], pip_dependencies=["old>=1"]),
+            key="s",
+            path="plugins/s",
+        )
+        assert rec.dependencies["python"] == []
+
+    def test_non_list_dependencies_warns_and_ignores(self):
+        rec, findings = parse_plugin_manifest(
+            dict(PLUGIN_OK, python_dependencies="requests"), key="s", path="plugins/s"
+        )
+        assert "invalid-dependency-declaration" in _rules(findings)
+        assert not _errors(findings)
+        assert rec.dependencies["python"] == []
+
     def test_unknown_capability_warns(self):
         _, findings = parse_plugin_manifest(
             dict(PLUGIN_OK, capabilities=["not.a.capability"]),
