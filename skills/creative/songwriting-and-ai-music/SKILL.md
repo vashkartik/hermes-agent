@@ -6,20 +6,19 @@ author: Teknium (teknium1), Hermes Agent
 license: MIT
 tags: [songwriting, music, suno, parody, lyrics, creative]
 platforms: [linux, macos, windows]
-triggers:
-  - writing a song
-  - song lyrics
-  - music prompt
-  - suno prompt
-  - parody song
-  - adapting a song
-  - AI music generation
 ---
 
 # Songwriting & AI Music Generation
 
 Everything here is a GUIDELINE, not a rule. Art breaks rules on purpose.
 Use what serves the song. Ignore what doesn't.
+
+## When to Use
+
+- Writing a song or song lyrics
+- Crafting a Suno (or other AI music) prompt
+- Writing a parody or adapting an existing song
+- Any AI music generation workflow
 
 ---
 

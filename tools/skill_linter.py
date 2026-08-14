@@ -345,7 +345,9 @@ def _check_platform_list_valid(frontmatter: Dict[str, Any]) -> List[LintFinding]
     platforms = frontmatter.get("platforms")
     if not platforms:
         return []
-    valid = {"linux", "macos", "windows", "darwin"}
+    # Platform census owned by the package contract (single source of truth).
+    from agent.package_contract import KNOWN_PLATFORMS as valid
+
     items = platforms if isinstance(platforms, list) else [platforms]
     bad = [p for p in items if str(p).lower() not in valid]
     if bad:

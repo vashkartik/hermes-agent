@@ -7,3 +7,4 @@ description: >-
   at fire time over an authenticated webhook. Inert unless cron.provider=chronos.
 version: 1.0.0
 author: Nous Research
+kind: exclusive

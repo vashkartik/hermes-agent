@@ -1,6 +1,8 @@
 name: retaindb
 version: 1.0.0
 description: "RetainDB — cloud memory API with hybrid search and 7 memory types."
+author: NousResearch
+kind: exclusive
 pip_dependencies:
   - requests
 requires_env:

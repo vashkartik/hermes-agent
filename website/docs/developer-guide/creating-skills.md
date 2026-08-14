@@ -8,6 +8,10 @@ description: "How to create skills for Hermes Agent — SKILL.md format, guideli
 
 Skills are the preferred way to add new capabilities to Hermes Agent. They're easier to create than tools, require no code changes to the agent, and can be shared with the community.
 
+The SKILL.md frontmatter schema — required fields, platform tokens,
+`metadata.hermes.*` keys, and validation rules — is defined by the
+[package contract](/developer-guide/package-contract).
+
 ## Should it be a Skill or a Tool?
 
 Make it a **Skill** when:

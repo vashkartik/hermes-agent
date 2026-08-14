@@ -764,6 +764,7 @@ const sidebars: SidebarsConfig = {
           type: 'category',
           label: 'Extending',
           items: [
+            'developer-guide/package-contract',
             'developer-guide/adding-tools',
             'developer-guide/adding-providers',
             'developer-guide/adding-platform-adapters',
