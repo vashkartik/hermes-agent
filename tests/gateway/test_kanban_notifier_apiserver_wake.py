@@ -136,3 +136,118 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
     # once the wake succeeds.
     assert _unseen_terminal_events(tid, "api_server", "raw-sid-123") == []
 
+
+def test_apiserver_controller_return_is_consumed_and_acknowledged(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "controller.db"))
+    monkeypatch.setattr(
+        kb,
+        "_is_authorized_controller_assignee",
+        lambda assignee: assignee == "vector-controller",
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="controller API return",
+            assignee="vector-controller",
+            body="Deliver the controller return to the originating API session.",
+            session_id="raw-controller-session",
+        )
+        projection = kb.controller_status_projection(conn, tid)
+        assert projection is not None
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="api_server",
+            chat_id="raw-controller-session",
+            notifier_profile="default",
+        )
+        common = {
+            "task_id": tid,
+            "correlation_id": projection["correlation_id"],
+            "ace_identity": projection["ace_identity"],
+        }
+        kb.record_controller_envelope(
+            conn,
+            event_type="OUTBOUND",
+            idempotency_key="api-outbound",
+            occurred_at="2026-08-13T22:30:00Z",
+            payload={"brief": "full controller brief"},
+            **common,
+        )
+        kb.record_controller_envelope(
+            conn,
+            event_type="TRANSITION",
+            idempotency_key="api-transition",
+            occurred_at="2026-08-13T22:30:01Z",
+            payload={"state": "running"},
+            ace_receipt={"run_id": "api-run"},
+            **common,
+        )
+        kb.record_controller_envelope(
+            conn,
+            event_type="RETURN",
+            idempotency_key="api-return",
+            occurred_at="2026-08-13T22:30:02Z",
+            payload={"summary": "complete"},
+            terminal_receipt={"head": "exact-head", "status": "passed"},
+            **common,
+        )
+        before = kb.controller_status_projection(conn, tid)
+        assert before is not None
+        assert before["terminal"] is False
+    finally:
+        conn.close()
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append({"text": text, "session_id": session_id})
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+
+    adapter = ApiServerLikeAdapter()
+    asyncio.run(
+        _run_one_notifier_tick(
+            monkeypatch,
+            _make_runner({Platform.API_SERVER: adapter}),
+        )
+    )
+
+    assert adapter.send_calls == 0
+    assert len(posts) == 1
+    assert posts[0]["session_id"] == "raw-controller-session"
+    assert "SENT" in posts[0]["text"]
+    assert "ACE ACCEPTED" in posts[0]["text"]
+    assert "RESPONSE RECEIVED" in posts[0]["text"]
+    assert "VECTOR ACKNOWLEDGED" not in posts[0]["text"]
+
+    conn = kb.connect()
+    try:
+        after = kb.controller_status_projection(conn, tid)
+        assert after is not None
+        assert after["terminal"] is True
+    finally:
+        conn.close()
+
+    asyncio.run(
+        _run_one_notifier_tick(
+            monkeypatch,
+            _make_runner({Platform.API_SERVER: adapter}),
+        )
+    )
+    assert len(posts) == 2
+    assert "VECTOR ACKNOWLEDGED" in posts[1]["text"]
+
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, tid, summary="API return acknowledged") is True
+    finally:
+        conn.close()
+

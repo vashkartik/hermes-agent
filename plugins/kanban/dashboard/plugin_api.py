@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -159,8 +159,11 @@ def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
+    controller: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    if d.get("metadata") is None:
+        d.pop("metadata", None)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -172,6 +175,11 @@ def _task_dict(
     # ``task_runs.summary`` (the kanban-worker pattern) instead of
     # ``tasks.result``. ``None`` when no run has produced a summary yet.
     d["latest_summary"] = latest_summary
+    # Structured controller state is authoritative; comments remain a human
+    # projection and are never parsed to infer these stages.  Omit the field
+    # entirely for legacy cards so their established wire shape is unchanged.
+    if controller is not None:
+        d["controller"] = controller
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -460,13 +468,20 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        controller_map = kanban_db.controller_status_projections(
+            conn, [t.id for t in tasks]
+        )
 
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview)
+            d = _task_dict(
+                t,
+                latest_summary=preview,
+                controller=controller_map.get(t.id),
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -547,7 +562,11 @@ def get_task(
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
-        task_d = _task_dict(task, latest_summary=full_summary)
+        task_d = _task_dict(
+            task,
+            latest_summary=full_summary,
+            controller=kanban_db.controller_status_projection(conn, task_id),
+        )
         links = _links_for(conn, task_id)
         child_ids = links["children"]
         child_summaries = kanban_db.latest_summaries(conn, child_ids)
@@ -592,6 +611,112 @@ def get_task(
 
 
 # ---------------------------------------------------------------------------
+# ACE controller envelopes v1
+# ---------------------------------------------------------------------------
+
+class ControllerOptInBody(BaseModel):
+    protocol: str = kanban_db.CONTROLLER_PROTOCOL_V1
+    controller_assignee: str
+    correlation_id: str
+    ace_identity: str
+
+
+class ControllerEnvelopeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: str = kanban_db.CONTROLLER_PROTOCOL_V1
+    event_type: str
+    idempotency_key: str
+    occurred_at: str
+    correlation_id: str
+    ace_identity: str
+    payload: Optional[dict[str, Any]] = None
+    ace_receipt: Optional[dict[str, Any]] = None
+    terminal_receipt: Optional[dict[str, Any]] = None
+
+
+def _controller_http_error(exc: kanban_db.ControllerEnvelopeError) -> HTTPException:
+    """Map malformed producer input to 400 and state conflicts to 409."""
+    detail = str(exc)
+    bad_input_markers = (
+        "unsupported controller protocol",
+        "event_type must be one of",
+        " is required",
+        " must be ",
+        " must include ",
+        " contains sensitive data",
+        " is only valid on ",
+        "RETURN requires ",
+        "TRANSITION requires ",
+    )
+    code = 400 if any(marker in detail for marker in bad_input_markers) else 409
+    return HTTPException(status_code=code, detail=detail)
+
+
+@router.post("/tasks/{task_id}/controller/opt-in")
+def controller_opt_in(
+    task_id: str,
+    payload: ControllerOptInBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        try:
+            controller = kanban_db.opt_in_controller_task(
+                conn,
+                task_id,
+                protocol=payload.protocol,
+                controller_assignee=payload.controller_assignee,
+                correlation_id=payload.correlation_id,
+                ace_identity=payload.ace_identity,
+            )
+        except kanban_db.ControllerEnvelopeError as exc:
+            raise _controller_http_error(exc) from exc
+        return {"controller": controller}
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/controller/envelopes")
+def controller_envelope(
+    task_id: str,
+    payload: ControllerEnvelopeBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        try:
+            result = kanban_db.record_controller_envelope(
+                conn,
+                task_id,
+                protocol=payload.protocol,
+                event_type=payload.event_type,
+                idempotency_key=payload.idempotency_key,
+                occurred_at=payload.occurred_at,
+                correlation_id=payload.correlation_id,
+                ace_identity=payload.ace_identity,
+                payload=payload.payload,
+                ace_receipt=payload.ace_receipt,
+                terminal_receipt=payload.terminal_receipt,
+            )
+        except kanban_db.ControllerEnvelopeError as exc:
+            raise _controller_http_error(exc) from exc
+        return {
+            "envelope": asdict(result.envelope),
+            "duplicate": result.duplicate,
+            "controller": kanban_db.controller_status_projection(conn, task_id),
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # POST /tasks
 # ---------------------------------------------------------------------------
 
@@ -618,6 +743,7 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 @router.post("/tasks")
@@ -647,9 +773,18 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
             board=board,
+            metadata=payload.metadata,
         )
         task = kanban_db.get_task(conn, task_id)
-        body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        body: dict[str, Any] = {
+            "task": (
+                _task_dict(
+                    task,
+                    controller=kanban_db.controller_status_projection(conn, task_id),
+                )
+                if task else None
+            )
+        }
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit
@@ -851,6 +986,9 @@ class UpdateTaskBody(BaseModel):
     # override doesn't silently reset the depth the operator chose.
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # Task-owned metadata is separate from completion/review handoff metadata.
+    # Only task_metadata.controller can opt a card into controller v1.
+    task_metadata: Optional[dict] = None
 
 
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
@@ -1015,29 +1153,33 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
 
         # --- title / body -------------------------------------------------
-        if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+        if (
+            payload.title is not None
+            or payload.body is not None
+            or payload.task_metadata is not None
+        ):
+            try:
+                kanban_db.update_task_content(
+                    conn,
+                    task_id,
+                    title=payload.title,
+                    body=payload.body,
+                    metadata=payload.task_metadata,
+                    update_metadata=payload.task_metadata is not None,
                 )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+            except (ValueError, kanban_db.ControllerEnvelopeError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        return {
+            "task": (
+                _task_dict(
+                    updated,
+                    controller=kanban_db.controller_status_projection(conn, task_id),
+                )
+                if updated else None
+            )
+        }
     finally:
         conn.close()
 

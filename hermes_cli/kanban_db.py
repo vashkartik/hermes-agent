@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -133,6 +134,26 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+CONTROLLER_PROTOCOL_V1 = "ace.controller.v1"
+CONTROLLER_EVENT_TYPES = frozenset({"OUTBOUND", "TRANSITION", "ESCALATE", "RETURN"})
+CONTROLLER_EXTERNAL_STAGES = (
+    "SENT",
+    "ACE ACCEPTED",
+    "RESPONSE RECEIVED",
+    "VECTOR ACKNOWLEDGED",
+)
+_CONTROLLER_EVENT_STAGES = {
+    "OUTBOUND": ("SENT",),
+    "TRANSITION": ("ACE ACCEPTED",),
+    "ESCALATE": (),
+    "RETURN": ("RESPONSE RECEIVED",),
+}
+
+
+def controller_event_stages(event_type: Any) -> tuple[str, ...]:
+    """Return the public status labels projected by one typed v1 event."""
+    return _CONTROLLER_EVENT_STAGES.get(str(event_type or "").strip().upper(), ())
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -993,6 +1014,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Optional structured task metadata. Controller v1 reads only the
+    # ``metadata.controller`` object; unrelated metadata remains ordinary task
+    # context and does not opt a legacy card into enforcement.
+    metadata: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1087,6 +1112,10 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            metadata=(
+                _controller_json_from_row(row["metadata"])
+                if "metadata" in keys else None
+            ),
         )
 
 
@@ -1175,6 +1204,36 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ControllerEnvelope:
+    """One authoritative ACE controller event for an opted-in task."""
+
+    id: int
+    task_id: str
+    protocol: str
+    correlation_id: str
+    controller_assignee: str
+    ace_identity: str
+    event_type: str
+    idempotency_key: str
+    occurred_at: str
+    received_at: str
+    payload: Optional[dict]
+    ace_receipt: Optional[dict]
+    terminal_receipt: Optional[dict]
+    vector_ack: Optional[dict]
+
+
+@dataclass(frozen=True)
+class ControllerEnvelopeResult:
+    envelope: ControllerEnvelope
+    duplicate: bool = False
+
+
+class ControllerEnvelopeError(ValueError):
+    """Raised when a controller binding or envelope violates the v1 contract."""
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1333,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    metadata             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1298,6 +1358,44 @@ CREATE TABLE IF NOT EXISTS task_events (
     kind       TEXT NOT NULL,
     payload    TEXT,
     created_at INTEGER NOT NULL
+);
+
+-- Opt-in is explicit and task-scoped. The bound assignee must continue to
+-- match tasks.assignee; reassignment therefore fails controller transitions
+-- closed without changing legacy-card behavior.
+CREATE TABLE IF NOT EXISTS controller_bindings (
+    task_id              TEXT PRIMARY KEY,
+    protocol             TEXT NOT NULL,
+    controller_assignee  TEXT NOT NULL,
+    correlation_id       TEXT NOT NULL UNIQUE,
+    ace_identity         TEXT NOT NULL,
+    opted_in_at          TEXT NOT NULL,
+    opt_in_source        TEXT NOT NULL DEFAULT 'manual'
+);
+
+-- Authoritative controller history. task_comments/task_events are projections;
+-- replay/order/terminal decisions are made only from this table.
+CREATE TABLE IF NOT EXISTS controller_envelopes (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id              TEXT NOT NULL,
+    protocol             TEXT NOT NULL,
+    correlation_id       TEXT NOT NULL,
+    controller_assignee  TEXT NOT NULL,
+    ace_identity         TEXT NOT NULL,
+    event_type           TEXT NOT NULL,
+    idempotency_key      TEXT NOT NULL UNIQUE,
+    occurred_at          TEXT NOT NULL,
+    received_at          TEXT NOT NULL,
+    payload              TEXT,
+    ace_receipt          TEXT,
+    terminal_receipt     TEXT,
+    vector_ack           TEXT,
+    UNIQUE(task_id, event_type)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_migrations (
+    name        TEXT PRIMARY KEY,
+    applied_at  INTEGER NOT NULL
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -1370,6 +1468,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_controller_envelopes_task ON controller_envelopes(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2491,6 +2590,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "metadata" not in cols:
+        # Free-form task metadata is NULL for every legacy row. Controller v1
+        # inspects only metadata.controller, so adding this carrier does not
+        # change legacy-card behavior.
+        _add_column_if_missing(conn, "tasks", "metadata", "metadata TEXT")
+
+    binding_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(controller_bindings)")
+    }
+    # Some tests and third-party repair callers invoke this additive migrator
+    # against a pared-down legacy schema before SCHEMA_SQL has created newer
+    # tables. An empty PRAGMA result means the table is absent, not that it is
+    # an old controller table needing ALTER TABLE.
+    if binding_cols and "opt_in_source" not in binding_cols:
+        _add_column_if_missing(
+            conn,
+            "controller_bindings",
+            "opt_in_source",
+            "opt_in_source TEXT NOT NULL DEFAULT 'manual'",
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2612,6 +2731,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _migrate_controller_opt_ins(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2930,6 +3050,233 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _is_authorized_controller_assignee(assignee: Optional[str]) -> bool:
+    """Authorize controller profiles by provisioned capability, not by name.
+
+    A profile becomes a controller only when its own skill tree contains the
+    durable ``vector-controller`` capability. This avoids treating arbitrary
+    names such as ``controller`` or ``vectorctrl9`` as privileged identities.
+    """
+    canonical = _canonical_assignee(assignee)
+    if not canonical:
+        return False
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_dir = get_profile_dir(canonical)
+    except (ImportError, OSError, ValueError):
+        return False
+    return any(
+        path.is_file()
+        for path in (
+            profile_dir / "skills" / "orchestration" / "vector-controller" / "SKILL.md",
+            profile_dir / "skills" / "vector-controller" / "SKILL.md",
+        )
+    )
+
+
+def _controller_contract_from_task_values(
+    *,
+    title: Any,
+    body: Any,
+    metadata: Any,
+    assignee: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Resolve the documented v1 opt-in signal from task-owned fields.
+
+    The literal protocol token in title/body is an explicit content opt-in.
+    Metadata opts in only through ``metadata.controller.protocol``; unrelated
+    task metadata never activates the controller gate. An authorized
+    controller assignee is itself an opt-in signal.
+    """
+    title_has_protocol = CONTROLLER_PROTOCOL_V1 in str(title or "").casefold()
+    body_has_protocol = CONTROLLER_PROTOCOL_V1 in str(body or "").casefold()
+    controller_meta: Optional[dict[str, Any]] = None
+    if isinstance(metadata, dict) and "controller" in metadata:
+        raw = metadata.get("controller")
+        if not isinstance(raw, dict):
+            raise ControllerEnvelopeError("metadata.controller must be an object")
+        protocol = str(raw.get("protocol") or "").strip()
+        if protocol != CONTROLLER_PROTOCOL_V1:
+            raise ControllerEnvelopeError(
+                "metadata.controller.protocol must be 'ace.controller.v1'"
+            )
+        controller_meta = raw
+
+    source: Optional[str] = None
+    if controller_meta is not None:
+        source = "metadata"
+    elif title_has_protocol:
+        source = "title"
+    elif body_has_protocol:
+        source = "body"
+    elif _is_authorized_controller_assignee(assignee):
+        source = "authorized_assignee"
+    if source is None:
+        return None
+    return {
+        "source": source,
+        "correlation_id": (
+            str(controller_meta.get("correlation_id") or "").strip()
+            if controller_meta else ""
+        ),
+        "ace_identity": (
+            str(controller_meta.get("ace_identity") or "").strip()
+            if controller_meta else ""
+        ),
+    }
+
+
+def _controller_task_requires_enforcement(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT title, body, metadata, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    metadata = _controller_json_from_row(row["metadata"])
+    try:
+        return _controller_contract_from_task_values(
+            title=row["title"],
+            body=row["body"],
+            metadata=metadata,
+            assignee=row["assignee"],
+        ) is not None
+    except ControllerEnvelopeError:
+        # A malformed explicit marker is still an opt-in signal. It must fail
+        # terminal actions closed until corrected, never fall back to legacy.
+        return True
+
+
+def _insert_controller_binding(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    assignee: str,
+    correlation_id: str,
+    ace_identity: str,
+    source: str,
+) -> None:
+    opted_in_at = _controller_now()
+    conn.execute(
+        "INSERT INTO controller_bindings "
+        "(task_id, protocol, controller_assignee, correlation_id, ace_identity, "
+        " opted_in_at, opt_in_source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            task_id,
+            CONTROLLER_PROTOCOL_V1,
+            assignee,
+            correlation_id,
+            ace_identity,
+            opted_in_at,
+            source,
+        ),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "controller_opted_in",
+        {
+            "protocol": CONTROLLER_PROTOCOL_V1,
+            "controller_assignee": assignee,
+            "correlation_id": correlation_id,
+            "ace_identity": ace_identity,
+            "opted_in_at": opted_in_at,
+            "source": source,
+        },
+    )
+
+
+def _ensure_controller_binding_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    strict: bool,
+) -> bool:
+    """Backfill one qualifying task inside the caller's write transaction."""
+    existing = conn.execute(
+        "SELECT 1 FROM controller_bindings WHERE task_id = ?", (task_id,),
+    ).fetchone()
+    if existing is not None:
+        return True
+    task = conn.execute(
+        "SELECT title, body, metadata, assignee, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return False
+    metadata = _controller_json_from_row(task["metadata"])
+    contract = _controller_contract_from_task_values(
+        title=task["title"],
+        body=task["body"],
+        metadata=metadata,
+        assignee=task["assignee"],
+    )
+    if contract is None or task["status"] in {"done", "archived"}:
+        return False
+    assignee = _canonical_assignee(task["assignee"])
+    if not assignee or not _is_authorized_controller_assignee(assignee):
+        if strict:
+            raise ControllerEnvelopeError(
+                "controller v1 opt-in requires an authorized controller assignee"
+            )
+        return False
+    correlation = _controller_text(
+        contract["correlation_id"] or f"kanban:{task_id}", "correlation_id"
+    )
+    ace_identity = _controller_text(
+        contract["ace_identity"] or f"ace:pending:{task_id}", "ace_identity"
+    )
+    _insert_controller_binding(
+        conn,
+        task_id,
+        assignee=assignee,
+        correlation_id=correlation,
+        ace_identity=ace_identity,
+        source=contract["source"],
+    )
+    return True
+
+
+def _migrate_controller_opt_ins(conn: sqlite3.Connection) -> None:
+    """Backfill nonterminal pre-v1 cards that already declare the contract."""
+    required_tables = {"controller_bindings", "kanban_migrations"}
+    present_tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('controller_bindings', 'kanban_migrations')"
+        )
+    }
+    if present_tables != required_tables:
+        # ``_migrate_add_optional_columns`` is a public repair seam and may be
+        # run directly against an ancient subset of the schema. Normal
+        # ``connect`` calls create both tables before reaching this pass.
+        return
+    migration = "controller_auto_opt_in_v1"
+    if conn.execute(
+        "SELECT 1 FROM kanban_migrations WHERE name = ?", (migration,),
+    ).fetchone() is not None:
+        return
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'archived')"
+    ).fetchall()
+    with write_txn(conn, allow_nested=True):
+        for row in rows:
+            try:
+                _ensure_controller_binding_for_task(conn, row["id"], strict=False)
+            except ControllerEnvelopeError:
+                # Malformed historical opt-ins remain unbound and therefore
+                # fail terminal gates closed; board initialization stays usable.
+                continue
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_migrations (name, applied_at) VALUES (?, ?)",
+            (migration, int(time.time())),
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2958,6 +3305,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3004,6 +3352,11 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    metadata_obj = (
+        _controller_object(metadata, "metadata") if metadata else None
+    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3181,6 +3534,8 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            with write_txn(conn):
+                _ensure_controller_binding_for_task(conn, row["id"], strict=True)
             return row["id"]
 
     now = int(time.time())
@@ -3272,8 +3627,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3299,6 +3654,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        _controller_json(metadata_obj),
                     ),
                 )
                 for pid in parents:
@@ -3326,6 +3682,7 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                _ensure_controller_binding_for_task(conn, task_id, strict=True)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3490,6 +3847,49 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
+        _ensure_controller_binding_for_task(conn, task_id, strict=True)
+        return True
+
+
+def update_task_content(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    update_metadata: bool = False,
+) -> bool:
+    """Edit task-owned opt-in carriers and reconcile controller v1 atomically."""
+    if title is not None and not title.strip():
+        raise ValueError("title cannot be empty")
+    if update_metadata and metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    metadata_obj = (
+        _controller_object(metadata, "metadata")
+        if update_metadata and metadata else None
+    )
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+            return False
+        sets: list[str] = []
+        values: list[Any] = []
+        if title is not None:
+            sets.append("title = ?")
+            values.append(title.strip())
+        if body is not None:
+            sets.append("body = ?")
+            values.append(body)
+        if update_metadata:
+            sets.append("metadata = ?")
+            values.append(_controller_json(metadata_obj))
+        if sets:
+            conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
+                (*values, task_id),
+            )
+            _append_event(conn, task_id, "edited")
+            _ensure_controller_binding_for_task(conn, task_id, strict=True)
         return True
 
 
@@ -4072,6 +4472,621 @@ def _append_event(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ACE controller envelopes v1
+# ---------------------------------------------------------------------------
+
+def _controller_now() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _controller_timestamp(value: Any, field_name: str) -> str:
+    """Return one canonical UTC RFC3339 timestamp or reject the boundary."""
+    if not isinstance(value, str) or not value.strip():
+        raise ControllerEnvelopeError(f"{field_name} is required")
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError as exc:
+        raise ControllerEnvelopeError(
+            f"{field_name} must be an ISO-8601 timestamp"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ControllerEnvelopeError(f"{field_name} must include a timezone")
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _controller_text(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ControllerEnvelopeError(f"{field_name} is required")
+    from agent.redact import redact_sensitive_text
+
+    raw = value.strip()
+    redacted = redact_sensitive_text(raw, force=True)
+    if redacted != raw:
+        raise ControllerEnvelopeError(
+            f"{field_name} contains sensitive data and cannot be persisted"
+        )
+    return raw
+
+
+def _controller_object(value: Any, field_name: str) -> Optional[dict]:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not value:
+        raise ControllerEnvelopeError(f"{field_name} must be a non-empty object")
+    # JSON round-trip establishes the canonical persisted type and rejects
+    # non-wire values such as sets, arbitrary objects, and NaN/Infinity at the
+    # ingestion edge. Strict JSON here also keeps later API serialization from
+    # failing after the database transaction has already committed.
+    try:
+        canonical = json.loads(json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        ))
+    except (TypeError, ValueError) as exc:
+        raise ControllerEnvelopeError(f"{field_name} must be JSON serializable") from exc
+
+    from agent.redact import redact_sensitive_text
+
+    def _redact(item: Any) -> Any:
+        if isinstance(item, str):
+            return redact_sensitive_text(item, force=True)
+        if isinstance(item, list):
+            return [_redact(child) for child in item]
+        if isinstance(item, dict):
+            return {
+                redact_sensitive_text(key, force=True): _redact(child)
+                for key, child in item.items()
+            }
+        return item
+
+    # This controller-specific boundary covers JSON object keys as well as
+    # values. Keep the legacy review redactor unchanged for its existing users.
+    return _redact(canonical)
+
+
+def _controller_json(value: Optional[dict]) -> Optional[str]:
+    if value is None:
+        return None
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _controller_json_from_row(value: Any) -> Optional[dict]:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _controller_envelope_from_row(row: sqlite3.Row) -> ControllerEnvelope:
+    return ControllerEnvelope(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        protocol=row["protocol"],
+        correlation_id=row["correlation_id"],
+        controller_assignee=row["controller_assignee"],
+        ace_identity=row["ace_identity"],
+        event_type=row["event_type"],
+        idempotency_key=row["idempotency_key"],
+        occurred_at=row["occurred_at"],
+        received_at=row["received_at"],
+        payload=_controller_json_from_row(row["payload"]),
+        ace_receipt=_controller_json_from_row(row["ace_receipt"]),
+        terminal_receipt=_controller_json_from_row(row["terminal_receipt"]),
+        vector_ack=_controller_json_from_row(row["vector_ack"]),
+    )
+
+
+def opt_in_controller_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    controller_assignee: str,
+    correlation_id: str,
+    ace_identity: str,
+    protocol: str = CONTROLLER_PROTOCOL_V1,
+) -> dict[str, Any]:
+    """Atomically bind a task to the ACE controller v1 protocol.
+
+    This is the explicit/manual path alongside title, body, metadata, and
+    authorized-assignee auto opt-in. The named controller must equal the task's
+    current normalized authorized assignee. A later reassignment or capability
+    removal does not rewrite the binding and causes new envelopes and terminal
+    gates to fail closed.
+    """
+    if protocol != CONTROLLER_PROTOCOL_V1:
+        raise ControllerEnvelopeError(
+            f"unsupported controller protocol {protocol!r}; expected {CONTROLLER_PROTOCOL_V1!r}"
+        )
+    assignee = _canonical_assignee(controller_assignee)
+    if not assignee:
+        raise ControllerEnvelopeError("controller_assignee is required")
+    if not _is_authorized_controller_assignee(assignee):
+        raise ControllerEnvelopeError(
+            "controller_assignee is not an authorized controller profile"
+        )
+    correlation = _controller_text(correlation_id, "correlation_id")
+    ace = _controller_text(ace_identity, "ace_identity")
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT assignee, status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task is None:
+            raise ControllerEnvelopeError(f"unknown task {task_id}")
+        if task["status"] in {"done", "archived"}:
+            raise ControllerEnvelopeError(
+                "cannot opt a terminal task into controller envelopes"
+            )
+        current = _canonical_assignee(task["assignee"])
+        if current != assignee:
+            raise ControllerEnvelopeError(
+                "controller_assignee must equal the task's current assignee"
+            )
+        existing = conn.execute(
+            "SELECT * FROM controller_bindings WHERE task_id = ?", (task_id,),
+        ).fetchone()
+        expected = (protocol, assignee, correlation, ace)
+        if existing is not None:
+            actual = (
+                existing["protocol"], existing["controller_assignee"],
+                existing["correlation_id"], existing["ace_identity"],
+            )
+            if actual != expected:
+                raise ControllerEnvelopeError(
+                    "task is already opted into a different controller binding"
+                )
+            return controller_status_projection(conn, task_id) or {}
+        reused = conn.execute(
+            "SELECT task_id FROM controller_bindings WHERE correlation_id = ?",
+            (correlation,),
+        ).fetchone()
+        if reused is not None:
+            raise ControllerEnvelopeError(
+                f"correlation_id is already bound to task {reused['task_id']}"
+            )
+        _insert_controller_binding(
+            conn,
+            task_id,
+            assignee=assignee,
+            correlation_id=correlation,
+            ace_identity=ace,
+            source="manual",
+        )
+    return controller_status_projection(conn, task_id) or {}
+
+
+def _controller_binding(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT b.*, t.assignee AS current_assignee "
+        "FROM controller_bindings b JOIN tasks t ON t.id = b.task_id "
+        "WHERE b.task_id = ?",
+        (task_id,),
+    ).fetchone()
+
+
+def _controller_assert_binding(
+    binding: Optional[sqlite3.Row],
+    *,
+    protocol: str,
+    correlation_id: str,
+    ace_identity: str,
+    require_current_assignee: bool = True,
+) -> sqlite3.Row:
+    if binding is None:
+        raise ControllerEnvelopeError("task is not opted into controller envelopes")
+    if binding["protocol"] != protocol:
+        raise ControllerEnvelopeError("controller protocol mismatch")
+    if binding["correlation_id"] != correlation_id:
+        raise ControllerEnvelopeError("controller correlation mismatch")
+    if binding["ace_identity"] != ace_identity:
+        raise ControllerEnvelopeError("Ace identity mismatch")
+    current = _canonical_assignee(binding["current_assignee"])
+    if require_current_assignee and current != binding["controller_assignee"]:
+        raise ControllerEnvelopeError(
+            "task assignee no longer matches the bound controller assignee"
+        )
+    if require_current_assignee and not _is_authorized_controller_assignee(current):
+        raise ControllerEnvelopeError(
+            "task assignee is no longer an authorized controller profile"
+        )
+    return binding
+
+
+def record_controller_envelope(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    event_type: str,
+    idempotency_key: str,
+    occurred_at: str,
+    correlation_id: str,
+    ace_identity: str,
+    payload: Optional[dict] = None,
+    ace_receipt: Optional[dict] = None,
+    terminal_receipt: Optional[dict] = None,
+    vector_ack: Optional[dict] = None,
+    protocol: str = CONTROLLER_PROTOCOL_V1,
+) -> ControllerEnvelopeResult:
+    """Validate and append one controller envelope in the binding transaction."""
+    if protocol != CONTROLLER_PROTOCOL_V1:
+        raise ControllerEnvelopeError("unsupported controller protocol")
+    kind = str(event_type or "").strip().upper()
+    if kind not in CONTROLLER_EVENT_TYPES:
+        raise ControllerEnvelopeError(
+            f"event_type must be one of {sorted(CONTROLLER_EVENT_TYPES)}"
+        )
+    idem = _controller_text(idempotency_key, "idempotency_key")
+    correlation = _controller_text(correlation_id, "correlation_id")
+    ace = _controller_text(ace_identity, "ace_identity")
+    occurred = _controller_timestamp(occurred_at, "occurred_at")
+    payload_obj = _controller_object(payload, "payload")
+    ace_obj = _controller_object(ace_receipt, "ace_receipt")
+    terminal_obj = _controller_object(terminal_receipt, "terminal_receipt")
+    ack_obj = _controller_object(vector_ack, "vector_ack")
+
+    if kind == "TRANSITION" and ace_obj is None:
+        raise ControllerEnvelopeError("TRANSITION requires ace_receipt")
+    if kind == "RETURN" and terminal_obj is None:
+        raise ControllerEnvelopeError("RETURN requires terminal_receipt")
+    if ack_obj is not None:
+        raise ControllerEnvelopeError(
+            "vector_ack is receiver-owned and cannot be supplied by the sender"
+        )
+    if kind != "TRANSITION" and ace_obj is not None:
+        raise ControllerEnvelopeError("ace_receipt is only valid on TRANSITION")
+    if kind != "RETURN" and terminal_obj is not None:
+        raise ControllerEnvelopeError("terminal_receipt is only valid on RETURN")
+
+    canonical = {
+        "task_id": task_id,
+        "protocol": protocol,
+        "correlation_id": correlation,
+        "ace_identity": ace,
+        "event_type": kind,
+        "idempotency_key": idem,
+        "occurred_at": occurred,
+        "payload": _controller_json(payload_obj),
+        "ace_receipt": _controller_json(ace_obj),
+        "terminal_receipt": _controller_json(terminal_obj),
+    }
+    with write_txn(conn):
+        # Reconcile documented task-owned opt-in carriers at the durable write
+        # boundary as well as during creation/migration. This covers a profile
+        # capability provisioned after the one-shot board migration without
+        # requiring a separate manual opt-in command.
+        _ensure_controller_binding_for_task(conn, task_id, strict=True)
+        binding = _controller_assert_binding(
+            _controller_binding(conn, task_id),
+            protocol=protocol,
+            correlation_id=correlation,
+            ace_identity=ace,
+            # An exact replay is read-only and remains idempotent even if the
+            # card was subsequently reassigned. New events still fail closed
+            # on assignee drift immediately below.
+            require_current_assignee=False,
+        )
+        duplicate = conn.execute(
+            "SELECT * FROM controller_envelopes WHERE idempotency_key = ?",
+            (idem,),
+        ).fetchone()
+        if duplicate is not None:
+            actual = {
+                key: duplicate[key]
+                for key in canonical
+            }
+            if actual != canonical:
+                raise ControllerEnvelopeError(
+                    "idempotency_key was already used for a different envelope"
+                )
+            return ControllerEnvelopeResult(
+                _controller_envelope_from_row(duplicate), duplicate=True,
+            )
+
+        if (
+            _canonical_assignee(binding["current_assignee"])
+            != binding["controller_assignee"]
+        ):
+            raise ControllerEnvelopeError(
+                "task assignee no longer matches the bound controller assignee"
+            )
+        if not _is_authorized_controller_assignee(binding["current_assignee"]):
+            raise ControllerEnvelopeError(
+                "task assignee is no longer an authorized controller profile"
+            )
+
+        rows = conn.execute(
+            "SELECT * FROM controller_envelopes WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        seen = {row["event_type"] for row in rows}
+        if kind in seen:
+            raise ControllerEnvelopeError(
+                f"event_type {kind} was already recorded for this correlation"
+            )
+        last_kind = rows[-1]["event_type"] if rows else None
+        allowed_next = {
+            None: {"OUTBOUND"},
+            "OUTBOUND": {"TRANSITION"},
+            "TRANSITION": {"ESCALATE", "RETURN"},
+            "ESCALATE": {"RETURN"},
+            "RETURN": set(),
+        }[last_kind]
+        if kind not in allowed_next:
+            if last_kind == "RETURN":
+                raise ControllerEnvelopeError("controller correlation is terminal")
+            raise ControllerEnvelopeError(
+                f"{kind} is out of order after {last_kind or 'no event'}"
+            )
+        if rows and occurred <= rows[-1]["occurred_at"]:
+            raise ControllerEnvelopeError("occurred_at is stale or reused")
+
+        received = _controller_now()
+        cur = conn.execute(
+            "INSERT INTO controller_envelopes "
+            "(task_id, protocol, correlation_id, controller_assignee, ace_identity, "
+            " event_type, idempotency_key, occurred_at, received_at, payload, "
+            " ace_receipt, terminal_receipt, vector_ack) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, protocol, correlation, binding["controller_assignee"], ace,
+                kind, idem, occurred, received, canonical["payload"], canonical["ace_receipt"],
+                canonical["terminal_receipt"], None,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM controller_envelopes WHERE id = ?", (cur.lastrowid,),
+        ).fetchone()
+        envelope = _controller_envelope_from_row(row)
+        _append_event(
+            conn,
+            task_id,
+            "controller_envelope",
+            {
+                "protocol": protocol,
+                "event_type": kind,
+                "correlation_id": correlation,
+                "ace_identity": ace,
+                "idempotency_key": idem,
+                "occurred_at": occurred,
+                "received_at": received,
+                "payload": payload_obj,
+                "ace_receipt": ace_obj,
+                "terminal_receipt": terminal_obj,
+                "vector_ack": None,
+            },
+        )
+        return ControllerEnvelopeResult(envelope)
+
+
+def acknowledge_controller_return(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    return_event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> ControllerEnvelopeResult:
+    """Mint the receiver-owned acknowledgment after subscription delivery.
+
+    This is deliberately not exposed through the CLI, dashboard API, or agent
+    tools. The notifier/TUI receiver must prove that its exact subscription
+    claimed the structured RETURN event before the kernel writes the ack.
+    """
+    receiver_platform = _controller_text(platform, "platform").lower()
+    receiver_chat = _controller_text(chat_id, "chat_id")
+    receiver_thread = str(thread_id or "")
+    try:
+        event_id = int(return_event_id)
+    except (TypeError, ValueError) as exc:
+        raise ControllerEnvelopeError("return_event_id must be an integer") from exc
+    if event_id <= 0:
+        raise ControllerEnvelopeError("return_event_id must be positive")
+
+    with write_txn(conn):
+        sub = conn.execute(
+            "SELECT last_event_id, notifier_profile FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, receiver_platform, receiver_chat, receiver_thread),
+        ).fetchone()
+        if sub is None:
+            raise ControllerEnvelopeError(
+                "controller acknowledgment requires the exact subscribed receiver"
+            )
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE id = ? AND task_id = ?",
+            (event_id, task_id),
+        ).fetchone()
+        if event is None or event["kind"] != "controller_envelope":
+            raise ControllerEnvelopeError(
+                "return_event_id does not identify a controller RETURN"
+            )
+        event_payload = _controller_json_from_row(event["payload"])
+        if not isinstance(event_payload, dict) or str(
+            event_payload.get("event_type") or ""
+        ).upper() != "RETURN":
+            raise ControllerEnvelopeError(
+                "return_event_id does not identify a controller RETURN"
+            )
+        if int(sub["last_event_id"]) < event_id:
+            raise ControllerEnvelopeError(
+                "subscribed receiver has not claimed the controller RETURN"
+            )
+
+        row = conn.execute(
+            "SELECT * FROM controller_envelopes "
+            "WHERE task_id = ? AND event_type = 'RETURN'",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ControllerEnvelopeError("controller RETURN is missing")
+        if row["vector_ack"]:
+            return ControllerEnvelopeResult(
+                _controller_envelope_from_row(row), duplicate=True,
+            )
+
+        acknowledged_at = _controller_now()
+        ack = {
+            "acknowledged_at": acknowledged_at,
+            "return_event_id": event_id,
+            "receiver": {
+                "platform": receiver_platform,
+                "notifier_profile": str(sub["notifier_profile"] or ""),
+            },
+        }
+        conn.execute(
+            "UPDATE controller_envelopes SET vector_ack = ? "
+            "WHERE id = ? AND vector_ack IS NULL",
+            (_controller_json(ack), row["id"]),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "controller_acknowledged",
+            {
+                "protocol": row["protocol"],
+                "correlation_id": row["correlation_id"],
+                "ace_identity": row["ace_identity"],
+                "return_event_id": event_id,
+                "acknowledged_at": acknowledged_at,
+                "receiver": ack["receiver"],
+            },
+        )
+        updated = conn.execute(
+            "SELECT * FROM controller_envelopes WHERE id = ?", (row["id"],)
+        ).fetchone()
+        return ControllerEnvelopeResult(_controller_envelope_from_row(updated))
+
+
+def list_controller_envelopes(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[ControllerEnvelope]:
+    rows = conn.execute(
+        "SELECT * FROM controller_envelopes WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    return [_controller_envelope_from_row(row) for row in rows]
+
+
+def controller_status_projections(
+    conn: sqlite3.Connection, task_ids: Iterable[str],
+) -> dict[str, dict[str, Any]]:
+    ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    bindings = conn.execute(
+        f"SELECT * FROM controller_bindings WHERE task_id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    if not bindings:
+        return {}
+    by_task: dict[str, list[ControllerEnvelope]] = {
+        row["task_id"]: [] for row in bindings
+    }
+    rows = conn.execute(
+        f"SELECT * FROM controller_envelopes WHERE task_id IN ({placeholders}) ORDER BY id",
+        ids,
+    ).fetchall()
+    for row in rows:
+        by_task.setdefault(row["task_id"], []).append(
+            _controller_envelope_from_row(row)
+        )
+    result: dict[str, dict[str, Any]] = {}
+    for binding in bindings:
+        events = {event.event_type: event for event in by_task[binding["task_id"]]}
+        outbound = events.get("OUTBOUND")
+        transition = events.get("TRANSITION")
+        returned = events.get("RETURN")
+        acknowledged = returned if returned and returned.vector_ack else None
+
+        def _stage(label: str, envelope: Optional[ControllerEnvelope], evidence=None):
+            return {
+                "status": label,
+                "reached": envelope is not None,
+                "occurred_at": envelope.occurred_at if envelope else None,
+                "received_at": envelope.received_at if envelope else None,
+                "event_id": envelope.id if envelope else None,
+                "evidence": evidence if envelope else None,
+            }
+
+        result[binding["task_id"]] = {
+            "protocol": binding["protocol"],
+            "controller_assignee": binding["controller_assignee"],
+            "correlation_id": binding["correlation_id"],
+            "ace_identity": binding["ace_identity"],
+            "opted_in_at": binding["opted_in_at"],
+            "opt_in_source": binding["opt_in_source"],
+            "terminal": acknowledged is not None,
+            "status_projection": [
+                _stage("SENT", outbound),
+                _stage(
+                    "ACE ACCEPTED", transition,
+                    transition.ace_receipt if transition else None,
+                ),
+                _stage(
+                    "RESPONSE RECEIVED", returned,
+                    returned.terminal_receipt if returned else None,
+                ),
+                _stage(
+                    "VECTOR ACKNOWLEDGED", acknowledged,
+                    acknowledged.vector_ack if acknowledged else None,
+                ),
+            ],
+        }
+    return result
+
+
+def controller_status_projection(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    return controller_status_projections(conn, [task_id]).get(task_id)
+
+
+def _controller_terminal_gate_satisfied(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Legacy cards pass; opted cards require a matching terminal RETURN."""
+    binding = _controller_binding(conn, task_id)
+    if binding is None:
+        return not _controller_task_requires_enforcement(conn, task_id)
+    if binding["protocol"] != CONTROLLER_PROTOCOL_V1:
+        return False
+    if _canonical_assignee(binding["current_assignee"]) != binding["controller_assignee"]:
+        return False
+    if not _is_authorized_controller_assignee(binding["current_assignee"]):
+        return False
+    row = conn.execute(
+        "SELECT terminal_receipt, vector_ack FROM controller_envelopes "
+        "WHERE task_id = ? AND protocol = ? AND correlation_id = ? "
+        "AND ace_identity = ? AND controller_assignee = ? "
+        "AND event_type = 'RETURN'",
+        (
+            task_id, binding["protocol"], binding["correlation_id"],
+            binding["ace_identity"], binding["controller_assignee"],
+        ),
+    ).fetchone()
+    return bool(
+        row
+        and _controller_json_from_row(row["terminal_receipt"])
+        and _controller_json_from_row(row["vector_ack"])
     )
 
 
@@ -5128,6 +6143,10 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    # Controller-opted cards fail closed before artifact staging, run closure,
+    # cleanup, hooks, or any other side effect. Legacy cards pass this gate.
+    if not _controller_terminal_gate_satisfied(conn, task_id):
+        return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5164,6 +6183,10 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # Re-check under the writer lock so reassignment / envelope updates
+        # cannot race the terminal decision made above.
+        if not _controller_terminal_gate_satisfied(conn, task_id):
+            return False
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -6175,9 +7198,17 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    # Fast fail before doing any handoff preparation. The same authoritative
+    # check runs again under the writer transaction below to close races.
+    if not _controller_terminal_gate_satisfied(conn, task_id):
+        return _ret(False, "controller RETURN receipt and Vector ack are required")
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
+        # Review is also a terminal controller handoff in v1. ESCALATE never
+        # satisfies this gate; only RETURN with both structured proofs does.
+        if not _controller_terminal_gate_satisfied(conn, task_id):
+            return _ret(False, "controller RETURN receipt and Vector ack are required")
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -6240,6 +7271,17 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        controller_binding = _controller_binding(conn, task_id)
+        if (
+            controller_binding is not None
+            and reviewer is not None
+            and reviewer != controller_binding["controller_assignee"]
+        ):
+            return _ret(
+                False,
+                "controller-opted tasks cannot be reassigned to a different "
+                "reviewer",
+            )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -7212,6 +8254,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM controller_envelopes WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM controller_bindings WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -7235,6 +8279,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM controller_envelopes WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM controller_bindings WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 

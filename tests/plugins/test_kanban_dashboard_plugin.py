@@ -220,6 +220,162 @@ def test_task_detail_includes_links_and_events(client):
     assert len(data["events"]) >= 1
 
 
+def test_controller_envelopes_project_and_fail_closed_through_http(client):
+    legacy = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "legacy", "assignee": "builder"},
+    ).json()["task"]
+    assert "controller" not in legacy
+
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "controlled", "assignee": "ace-controller"},
+    ).json()["task"]
+    task_id = task["id"]
+    skill = (
+        Path.home()
+        / ".hermes"
+        / "profiles"
+        / "ace-controller"
+        / "skills"
+        / "orchestration"
+        / "vector-controller"
+        / "SKILL.md"
+    )
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text("---\nname: vector-controller\n---\n", encoding="utf-8")
+    binding = {
+        "protocol": "ace.controller.v1",
+        "controller_assignee": "ace-controller",
+        "correlation_id": f"kanban:{task_id}",
+        "ace_identity": f"ace:pending:{task_id}",
+    }
+    opt_in = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/controller/opt-in",
+        json=binding,
+    )
+    assert opt_in.status_code == 200, opt_in.text
+    assert client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/controller/opt-in",
+        json=binding,
+    ).json() == opt_in.json()
+    with kb.connect() as conn:
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="tui",
+            chat_id="dashboard-receiver",
+            notifier_profile="vector",
+        )
+
+    event_url = f"/api/plugins/kanban/tasks/{task_id}/controller/envelopes"
+    outbound = {
+        "protocol": "ace.controller.v1",
+        "event_type": "OUTBOUND",
+        "idempotency_key": "http-outbound",
+        "occurred_at": "2026-08-13T12:00:01Z",
+        "correlation_id": f"kanban:{task_id}",
+        "ace_identity": f"ace:pending:{task_id}",
+        "payload": {"route": "Vector"},
+    }
+    recorded = client.post(event_url, json=outbound)
+    assert recorded.status_code == 200, recorded.text
+    assert recorded.json()["duplicate"] is False
+    duplicate = client.post(event_url, json=outbound)
+    assert duplicate.status_code == 200
+    assert duplicate.json()["duplicate"] is True
+
+    events_after_outbound = client.get(
+        f"/api/plugins/kanban/tasks/{task_id}"
+    ).json()["events"]
+    non_finite = dict(
+        outbound,
+        idempotency_key="http-nan",
+        occurred_at="2026-08-13T12:00:01.500Z",
+        payload={"nested": [float("nan")]},
+    )
+    rejected_json = client.post(
+        event_url,
+        content=json.dumps(non_finite),
+        headers={"content-type": "application/json"},
+    )
+    assert rejected_json.status_code == 400
+    assert client.get(
+        f"/api/plugins/kanban/tasks/{task_id}"
+    ).json()["events"] == events_after_outbound
+
+    before = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    for status_name in ("review", "done"):
+        rejected = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json={"status": status_name, "summary": "too early"},
+        )
+        assert rejected.status_code == 409
+    after = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    assert after["task"]["status"] == before["task"]["status"]
+    assert after["events"] == before["events"]
+
+    bad = dict(outbound, event_type="TRANSITION", idempotency_key="bad-transition")
+    assert client.post(event_url, json=bad).status_code == 400
+    transition = dict(
+        bad,
+        occurred_at="2026-08-13T12:00:02Z",
+        idempotency_key="http-transition",
+        ace_receipt={"receipt_id": "ace-http-receipt"},
+    )
+    assert client.post(event_url, json=transition).status_code == 200
+    returned = dict(
+        outbound,
+        event_type="RETURN",
+        occurred_at="2026-08-13T12:00:03Z",
+        idempotency_key="http-return",
+        terminal_receipt={"receipt_id": "terminal-http-receipt"},
+    )
+    returned.pop("payload")
+    forged_return = dict(returned, vector_ack={"ack_id": "forged"})
+    assert client.post(event_url, json=forged_return).status_code == 422
+    assert client.post(event_url, json=returned).status_code == 200
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
+    assert [s["status"] for s in detail["controller"]["status_projection"]] == [
+        "SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED",
+    ]
+    assert detail["controller"]["terminal"] is False
+    with kb.connect() as conn:
+        _, _, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="tui",
+            chat_id="dashboard-receiver",
+            kinds=["controller_envelope"],
+        )
+        return_event = next(
+            event for event in events
+            if (event.payload or {}).get("event_type") == "RETURN"
+        )
+        kb.acknowledge_controller_return(
+            conn,
+            task_id,
+            return_event_id=return_event.id,
+            platform="tui",
+            chat_id="dashboard-receiver",
+        )
+    completed = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "terminal proofs present"},
+    )
+    assert completed.status_code == 200, completed.text
+
+    board = client.get("/api/plugins/kanban/board").json()
+    cards = {
+        card["id"]: card
+        for column in board["columns"]
+        for card in column["tasks"]
+    }
+    assert "controller" not in cards[legacy["id"]]
+    assert cards[task_id]["controller"]["terminal"] is True
+
+
 # ---------------------------------------------------------------------------
 # PATCH /tasks/:id — status transitions
 # ---------------------------------------------------------------------------
@@ -940,5 +1096,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

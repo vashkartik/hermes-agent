@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
+    _ack_kanban_controller_receipts,
     _collect_kanban_notifications,
     _format_kanban_event_text,
 )
@@ -191,6 +192,64 @@ class TestCollectKanbanNotifications:
         assert "cross-profile delivery" in texts[0]
         assert _sub_rows(tid) == []
 
+    def test_delivers_structured_controller_stages_once(self, monkeypatch):
+        monkeypatch.setattr(
+            kb,
+            "_is_authorized_controller_assignee",
+            lambda assignee: assignee == "vector-controller",
+        )
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(
+                conn, title="controller tui", assignee="vector-controller",
+            )
+            projection = kb.controller_status_projection(conn, tid)
+            kb.add_notify_sub(
+                conn, task_id=tid, platform="tui", chat_id=SESSION_KEY,
+            )
+            common = {
+                "correlation_id": projection["correlation_id"],
+                "ace_identity": projection["ace_identity"],
+            }
+            kb.record_controller_envelope(
+                conn, tid, event_type="OUTBOUND", idempotency_key="tui-outbound",
+                occurred_at="2026-08-13T12:00:01Z", **common,
+            )
+            kb.record_controller_envelope(
+                conn, tid, event_type="TRANSITION", idempotency_key="tui-transition",
+                occurred_at="2026-08-13T12:00:02Z",
+                ace_receipt={"run_id": "ace-1"}, **common,
+            )
+            kb.record_controller_envelope(
+                conn, tid, event_type="RETURN", idempotency_key="tui-return",
+                occurred_at="2026-08-13T12:00:03Z",
+                terminal_receipt={"state": "done"}, **common,
+            )
+        finally:
+            conn.close()
+
+        session = _session()
+        texts = _collect_kanban_notifications(session)
+        rendered = "\n".join(texts)
+        assert len(texts) == 3
+        for stage in ("SENT", "ACE ACCEPTED", "RESPONSE RECEIVED"):
+            assert stage in rendered
+        assert "VECTOR ACKNOWLEDGED" not in rendered
+        with kb.connect() as conn:
+            projection = kb.controller_status_projection(conn, tid)
+            assert projection is not None and projection["terminal"] is False
+
+        receipts = session.pop("_kanban_controller_receipts")
+        assert len(receipts) == 1
+        assert _ack_kanban_controller_receipts(receipts) == []
+        acknowledged = _collect_kanban_notifications(session)
+        assert len(acknowledged) == 1
+        assert "VECTOR ACKNOWLEDGED" in acknowledged[0]
+        with kb.connect() as conn:
+            projection = kb.controller_status_projection(conn, tid)
+            assert projection is not None and projection["terminal"] is True
+        assert _collect_kanban_notifications(session) == []
+
 
 class TestFormatKanbanEventText:
     SUB = {"task_id": "t_abc123"}
@@ -222,6 +281,20 @@ class TestFormatKanbanEventText:
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 
+    def test_controller_return_projects_response_before_acknowledgment(self):
+        ev = SimpleNamespace(
+            kind="controller_envelope", payload={"event_type": "RETURN"},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert text is not None
+        assert "RESPONSE RECEIVED" in text
+        assert "VECTOR ACKNOWLEDGED" not in text
+
+        ack = SimpleNamespace(kind="controller_acknowledged", payload={})
+        ack_text = _format_kanban_event_text(self.SUB, self.TASK, ack, "main")
+        assert ack_text is not None
+        assert "VECTOR ACKNOWLEDGED" in ack_text
+
 
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.
@@ -244,7 +317,7 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
+            lambda rid, sid, sess, text, **kwargs: submits.append(text),
         )
         stop = threading.Event()
         thread = threading.Thread(

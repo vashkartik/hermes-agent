@@ -77,6 +77,7 @@ import {
   PROFILES_KEY
 } from './api'
 import { BoardSwitcher } from './board-switcher'
+import { ControllerStatus } from './controller-status'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
@@ -299,6 +300,7 @@ function Card({
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
+          {task.controller && <ControllerStatus compact controller={task.controller} label={k.controller} />}
           <CardFooter arc={arc} task={task} />
         </div>
       </ContextMenuTrigger>

@@ -66,6 +66,70 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
+def test_notifier_delivers_structured_controller_stage_projection(tmp_path, monkeypatch):
+    db_path = tmp_path / "controller-notifier.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(
+        kb,
+        "_is_authorized_controller_assignee",
+        lambda assignee: assignee == "vector-controller",
+    )
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="controller notification", assignee="vector-controller",
+        )
+        projection = kb.controller_status_projection(conn, tid)
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-controller",
+        )
+        common = {
+            "correlation_id": projection["correlation_id"],
+            "ace_identity": projection["ace_identity"],
+        }
+        kb.record_controller_envelope(
+            conn, tid, event_type="OUTBOUND", idempotency_key="notify-outbound",
+            occurred_at="2026-08-13T12:00:01Z", **common,
+        )
+        kb.record_controller_envelope(
+            conn, tid, event_type="TRANSITION", idempotency_key="notify-transition",
+            occurred_at="2026-08-13T12:00:02Z",
+            ace_receipt={"run_id": "ace-1"}, **common,
+        )
+        kb.record_controller_envelope(
+            conn, tid, event_type="RETURN", idempotency_key="notify-return",
+            occurred_at="2026-08-13T12:00:03Z",
+            terminal_receipt={"state": "done"}, **common,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    rendered = "\n".join(item["text"] for item in adapter.sent)
+    assert [item["chat_id"] for item in adapter.sent] == [
+        "chat-controller", "chat-controller", "chat-controller", "chat-controller",
+    ]
+    for stage in ("SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED"):
+        assert stage in rendered
+
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-controller",
+            kinds=["controller_envelope"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:

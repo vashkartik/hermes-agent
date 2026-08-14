@@ -178,7 +178,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # done/archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "controller_envelope", "controller_acknowledged")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -426,6 +426,7 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
+                    non_push_messages: list[tuple[str, str]] = []
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -433,7 +434,30 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "controller_envelope":
+                            event_type = (
+                                str(ev.payload.get("event_type") or "").upper()
+                                if ev.payload else ""
+                            )
+                            stages = _kb.controller_event_stages(event_type)
+                            if stages:
+                                msg = (
+                                    f"🔁 {board_tag}{tag}Kanban {sub['task_id']} "
+                                    f"controller — {' · '.join(stages)}"
+                                )
+                            elif event_type == "ESCALATE":
+                                msg = (
+                                    f"🟥 {board_tag}{tag}Kanban {sub['task_id']} "
+                                    "controller ESCALATE"
+                                )
+                            else:
+                                continue
+                        elif kind == "controller_acknowledged":
+                            msg = (
+                                f"🔁 {board_tag}{tag}Kanban {sub['task_id']} "
+                                "controller — VECTOR ACKNOWLEDGED"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -548,6 +572,7 @@ class GatewayKanbanWatchersMixin:
                         from gateway.wake import adapter_supports_push
 
                         if not adapter_supports_push(adapter):
+                            non_push_messages.append((kind, msg))
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
                                 "channel; skipping text ping for %s, relying "
@@ -574,6 +599,17 @@ class GatewayKanbanWatchersMixin:
                                 raise RuntimeError(
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                )
+                            if (
+                                kind == "controller_envelope"
+                                and str((ev.payload or {}).get("event_type") or "").upper()
+                                == "RETURN"
+                            ):
+                                await asyncio.to_thread(
+                                    self._kanban_ack_controller_return,
+                                    sub,
+                                    ev.id,
+                                    board_slug,
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
@@ -651,7 +687,15 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed",
+                            "gave_up",
+                            "crashed",
+                            "timed_out",
+                            "blocked",
+                            "controller_envelope",
+                            "controller_acknowledged",
+                        )
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
@@ -663,21 +707,29 @@ class GatewayKanbanWatchersMixin:
                         if _wake_kinds and _session_key:
                             _title = (task.title if task else sub["task_id"])[:120]
                             _assignee = task.assignee if task else ""
+                            _wake_messages = [
+                                message
+                                for event_kind, message in non_push_messages
+                                if event_kind in _WAKE_KINDS
+                            ]
                             _parts = []
                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                            _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                            _synth = t(
-                                "gateway.kanban.wake.message",
-                                task_id=sub["task_id"],
-                                status=_status,
-                                title=_title,
-                                assignee=_assignee,
-                                board=board_slug,
-                            )
+                            if _wake_messages:
+                                _synth = "\n\n".join(_wake_messages)
+                            else:
+                                _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
+                                _synth = t(
+                                    "gateway.kanban.wake.message",
+                                    task_id=sub["task_id"],
+                                    status=_status,
+                                    title=_title,
+                                    assignee=_assignee,
+                                    board=board_slug,
+                                )
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
@@ -690,6 +742,21 @@ class GatewayKanbanWatchersMixin:
                                     text=_synth,
                                     session_id=_session_key,
                                 )
+                                for controller_event in d["events"]:
+                                    if (
+                                        controller_event.kind == "controller_envelope"
+                                        and str(
+                                            (controller_event.payload or {}).get("event_type")
+                                            or ""
+                                        ).upper()
+                                        == "RETURN"
+                                    ):
+                                        await asyncio.to_thread(
+                                            self._kanban_ack_controller_return,
+                                            sub,
+                                            controller_event.id,
+                                            board_slug,
+                                        )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
@@ -844,6 +911,28 @@ class GatewayKanbanWatchersMixin:
             _kb.remove_notify_sub(
                 conn,
                 task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_ack_controller_return(
+        self,
+        sub: dict,
+        return_event_id: int,
+        board: Optional[str] = None,
+    ) -> None:
+        """Mint the receiver receipt only after this subscription delivered."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.acknowledge_controller_return(
+                conn,
+                sub["task_id"],
+                return_event_id=return_event_id,
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
