@@ -47,10 +47,7 @@ from hermes_cli.config import (
 )
 from hermes_cli.cli_output import prompt as _prompt_input
 
-# Manifest schema version — owned by the package contract
-# (agent/package_contract.py), the single source of truth for every
-# source-owned package family.
-from agent.package_contract import MCP_MANIFEST_SUPPORTED as _MANIFEST_VERSION
+_MANIFEST_VERSION = 1
 
 # Substituted at install time inside `transport.command` / `transport.args`.
 _INSTALL_DIR_VAR = "${INSTALL_DIR}"

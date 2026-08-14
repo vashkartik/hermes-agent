@@ -182,7 +182,7 @@ two-minor-release window. Contract-specific commitments:
 | `hermes_cli/plugins.py` (PluginManager) | canonical — imports `KNOWN_PLUGIN_MANIFEST_FIELDS`, `SUPPORTED_MANIFEST_VERSION`, `VALID_PLUGIN_KINDS` from the contract |
 | `agent/skill_utils.py` (`parse_frontmatter`, platform matching, 60-char budget) | canonical primitives the contract builds on |
 | `tools/skills_tool.py`, `tools/skills_hub.py`, `agent/skill_commands.py` | delegate frontmatter parsing to `agent.skill_utils` |
-| `hermes_cli/mcp_catalog.py` | canonical schema version; fail-closed reader is the install boundary |
+| `hermes_cli/mcp_catalog.py` | documented adapter — the fail-closed install boundary keeps its own `_MANIFEST_VERSION` literal so the supply-chain reader carries no extra import chain; equality with the contract is enforced by test |
 | `hermes_cli/plugin_dev.py` (`hermes plugins doctor`) | runs contract findings as warnings on top of runtime validation |
 | `tools/skill_linter.py` | advisory linter over contract primitives (platform census, description budget) |
 | `tools/skill_manager_tool.py` (`_validate_frontmatter`) | documented adapter — fail-closed create/edit boundary with verbatim YAML errors |

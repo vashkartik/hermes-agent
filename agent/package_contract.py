@@ -68,7 +68,11 @@ PLUGIN_MANIFEST_SUPPORTED = 2
 #: skills do not declare it in frontmatter.
 SKILL_SCHEMA_SUPPORTED = 1
 
-#: optional-mcps manifest.yaml schema version (mirrors hermes_cli.mcp_catalog).
+#: optional-mcps manifest.yaml schema version. The contract owns this
+#: value; ``hermes_cli.mcp_catalog`` mirrors it as its own literal (that
+#: reader is the fail-closed supply-chain install boundary and stays free
+#: of extra import chains). Equality is enforced by
+#: tests/test_package_contract.py.
 MCP_MANIFEST_SUPPORTED = 1
 
 #: Platform tokens accepted in ``platforms:`` lists across families.

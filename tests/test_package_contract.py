@@ -322,6 +322,19 @@ class TestParseMcpManifest:
         assert rec.id == "sample-mcp"
         assert rec.schema_version == 1
 
+    def test_schema_version_agrees_with_the_catalog_reader(self):
+        """The contract owns the value; the catalog reader mirrors it.
+
+        ``hermes_cli/mcp_catalog.py`` is a documented adapter, not a
+        contract importer: it is the fail-closed supply-chain boundary for
+        installing MCP servers, so it deliberately keeps its own literal
+        rather than pulling the skills/plugin import chain into that file.
+        Drift is impossible because this test fails.
+        """
+        from hermes_cli.mcp_catalog import _MANIFEST_VERSION
+
+        assert _MANIFEST_VERSION == MCP_MANIFEST_SUPPORTED
+
     def test_unsupported_manifest_version_is_error(self):
         _, findings = parse_mcp_manifest(
             dict(MCP_OK, manifest_version=MCP_MANIFEST_SUPPORTED + 1),
