@@ -100,18 +100,18 @@ def test_notifier_delivers_structured_controller_stage_projection(tmp_path, monk
         kb.record_controller_envelope(
             conn, tid, event_type="RETURN", idempotency_key="notify-return",
             occurred_at="2026-08-13T12:00:03Z",
-            terminal_receipt={"state": "done"},
-            vector_ack={"delivered": True}, **common,
+            terminal_receipt={"state": "done"}, **common,
         )
     finally:
         conn.close()
 
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
     rendered = "\n".join(item["text"] for item in adapter.sent)
     assert [item["chat_id"] for item in adapter.sent] == [
-        "chat-controller", "chat-controller", "chat-controller",
+        "chat-controller", "chat-controller", "chat-controller", "chat-controller",
     ]
     for stage in ("SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED"):
         assert stage in rendered

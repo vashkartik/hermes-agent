@@ -147,7 +147,7 @@ _CONTROLLER_EVENT_STAGES = {
     "OUTBOUND": ("SENT",),
     "TRANSITION": ("ACE ACCEPTED",),
     "ESCALATE": (),
-    "RETURN": ("RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED"),
+    "RETURN": ("RESPONSE RECEIVED",),
 }
 
 
@@ -4743,16 +4743,16 @@ def record_controller_envelope(
 
     if kind == "TRANSITION" and ace_obj is None:
         raise ControllerEnvelopeError("TRANSITION requires ace_receipt")
-    if kind == "RETURN" and (terminal_obj is None or ack_obj is None):
+    if kind == "RETURN" and terminal_obj is None:
+        raise ControllerEnvelopeError("RETURN requires terminal_receipt")
+    if ack_obj is not None:
         raise ControllerEnvelopeError(
-            "RETURN requires terminal_receipt and vector_ack"
+            "vector_ack is receiver-owned and cannot be supplied by the sender"
         )
     if kind != "TRANSITION" and ace_obj is not None:
         raise ControllerEnvelopeError("ace_receipt is only valid on TRANSITION")
-    if kind != "RETURN" and (terminal_obj is not None or ack_obj is not None):
-        raise ControllerEnvelopeError(
-            "terminal_receipt and vector_ack are only valid on RETURN"
-        )
+    if kind != "RETURN" and terminal_obj is not None:
+        raise ControllerEnvelopeError("terminal_receipt is only valid on RETURN")
 
     canonical = {
         "task_id": task_id,
@@ -4765,7 +4765,6 @@ def record_controller_envelope(
         "payload": _controller_json(payload_obj),
         "ace_receipt": _controller_json(ace_obj),
         "terminal_receipt": _controller_json(terminal_obj),
-        "vector_ack": _controller_json(ack_obj),
     }
     with write_txn(conn):
         # Reconcile documented task-owned opt-in carriers at the durable write
@@ -4848,7 +4847,7 @@ def record_controller_envelope(
             (
                 task_id, protocol, correlation, binding["controller_assignee"], ace,
                 kind, idem, occurred, received, canonical["payload"], canonical["ace_receipt"],
-                canonical["terminal_receipt"], canonical["vector_ack"],
+                canonical["terminal_receipt"], None,
             ),
         )
         row = conn.execute(
@@ -4870,10 +4869,110 @@ def record_controller_envelope(
                 "payload": payload_obj,
                 "ace_receipt": ace_obj,
                 "terminal_receipt": terminal_obj,
-                "vector_ack": ack_obj,
+                "vector_ack": None,
             },
         )
         return ControllerEnvelopeResult(envelope)
+
+
+def acknowledge_controller_return(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    return_event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> ControllerEnvelopeResult:
+    """Mint the receiver-owned acknowledgment after subscription delivery.
+
+    This is deliberately not exposed through the CLI, dashboard API, or agent
+    tools. The notifier/TUI receiver must prove that its exact subscription
+    claimed the structured RETURN event before the kernel writes the ack.
+    """
+    receiver_platform = _controller_text(platform, "platform").lower()
+    receiver_chat = _controller_text(chat_id, "chat_id")
+    receiver_thread = str(thread_id or "")
+    try:
+        event_id = int(return_event_id)
+    except (TypeError, ValueError) as exc:
+        raise ControllerEnvelopeError("return_event_id must be an integer") from exc
+    if event_id <= 0:
+        raise ControllerEnvelopeError("return_event_id must be positive")
+
+    with write_txn(conn):
+        sub = conn.execute(
+            "SELECT last_event_id, notifier_profile FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, receiver_platform, receiver_chat, receiver_thread),
+        ).fetchone()
+        if sub is None:
+            raise ControllerEnvelopeError(
+                "controller acknowledgment requires the exact subscribed receiver"
+            )
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE id = ? AND task_id = ?",
+            (event_id, task_id),
+        ).fetchone()
+        if event is None or event["kind"] != "controller_envelope":
+            raise ControllerEnvelopeError(
+                "return_event_id does not identify a controller RETURN"
+            )
+        event_payload = _controller_json_from_row(event["payload"])
+        if not isinstance(event_payload, dict) or str(
+            event_payload.get("event_type") or ""
+        ).upper() != "RETURN":
+            raise ControllerEnvelopeError(
+                "return_event_id does not identify a controller RETURN"
+            )
+        if int(sub["last_event_id"]) < event_id:
+            raise ControllerEnvelopeError(
+                "subscribed receiver has not claimed the controller RETURN"
+            )
+
+        row = conn.execute(
+            "SELECT * FROM controller_envelopes "
+            "WHERE task_id = ? AND event_type = 'RETURN'",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ControllerEnvelopeError("controller RETURN is missing")
+        if row["vector_ack"]:
+            return ControllerEnvelopeResult(
+                _controller_envelope_from_row(row), duplicate=True,
+            )
+
+        acknowledged_at = _controller_now()
+        ack = {
+            "acknowledged_at": acknowledged_at,
+            "return_event_id": event_id,
+            "receiver": {
+                "platform": receiver_platform,
+                "notifier_profile": str(sub["notifier_profile"] or ""),
+            },
+        }
+        conn.execute(
+            "UPDATE controller_envelopes SET vector_ack = ? "
+            "WHERE id = ? AND vector_ack IS NULL",
+            (_controller_json(ack), row["id"]),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "controller_acknowledged",
+            {
+                "protocol": row["protocol"],
+                "correlation_id": row["correlation_id"],
+                "ace_identity": row["ace_identity"],
+                "return_event_id": event_id,
+                "acknowledged_at": acknowledged_at,
+                "receiver": ack["receiver"],
+            },
+        )
+        updated = conn.execute(
+            "SELECT * FROM controller_envelopes WHERE id = ?", (row["id"],)
+        ).fetchone()
+        return ControllerEnvelopeResult(_controller_envelope_from_row(updated))
 
 
 def list_controller_envelopes(
@@ -4916,6 +5015,7 @@ def controller_status_projections(
         outbound = events.get("OUTBOUND")
         transition = events.get("TRANSITION")
         returned = events.get("RETURN")
+        acknowledged = returned if returned and returned.vector_ack else None
 
         def _stage(label: str, envelope: Optional[ControllerEnvelope], evidence=None):
             return {
@@ -4934,7 +5034,7 @@ def controller_status_projections(
             "ace_identity": binding["ace_identity"],
             "opted_in_at": binding["opted_in_at"],
             "opt_in_source": binding["opt_in_source"],
-            "terminal": returned is not None,
+            "terminal": acknowledged is not None,
             "status_projection": [
                 _stage("SENT", outbound),
                 _stage(
@@ -4946,8 +5046,8 @@ def controller_status_projections(
                     returned.terminal_receipt if returned else None,
                 ),
                 _stage(
-                    "VECTOR ACKNOWLEDGED", returned,
-                    returned.vector_ack if returned else None,
+                    "VECTOR ACKNOWLEDGED", acknowledged,
+                    acknowledged.vector_ack if acknowledged else None,
                 ),
             ],
         }

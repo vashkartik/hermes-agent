@@ -87,7 +87,41 @@ def _record(
     )
 
 
+def _subscribe_receiver(conn, task_id: str) -> None:
+    kb.add_notify_sub(
+        conn,
+        task_id=task_id,
+        platform="tui",
+        chat_id="vector-session",
+        notifier_profile="vector",
+    )
+
+
+def _ack_return(conn, task_id: str) -> kb.ControllerEnvelopeResult:
+    kb.claim_unseen_events_for_sub(
+        conn,
+        task_id=task_id,
+        platform="tui",
+        chat_id="vector-session",
+        kinds=["controller_envelope"],
+    )
+    return_event = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind = 'controller_envelope' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert return_event is not None
+    return kb.acknowledge_controller_return(
+        conn,
+        task_id,
+        return_event_id=return_event["id"],
+        platform="tui",
+        chat_id="vector-session",
+    )
+
+
 def _terminal_flow(conn, task_id: str, *, correlation="corr-1") -> None:
+    _subscribe_receiver(conn, task_id)
     _record(conn, task_id, "OUTBOUND", 1, correlation=correlation)
     _record(
         conn,
@@ -104,8 +138,8 @@ def _terminal_flow(conn, task_id: str, *, correlation="corr-1") -> None:
         3,
         correlation=correlation,
         terminal_receipt={"receipt_id": "terminal-r-1"},
-        vector_ack={"ack_id": "vector-a-1"},
     )
+    _ack_return(conn, task_id)
 
 
 def test_opt_in_is_explicit_exactly_idempotent_and_correlation_unique(conn) -> None:
@@ -157,6 +191,7 @@ def test_opt_in_is_explicit_exactly_idempotent_and_correlation_unique(conn) -> N
 def test_valid_flow_projects_structured_milestones_and_gates_terminal_actions(conn) -> None:
     task_id = _task(conn)
     _opt_in(conn, task_id)
+    _subscribe_receiver(conn, task_id)
     assert kb.complete_task(conn, task_id, summary="too early") is False
     assert kb.request_review(conn, task_id, summary="too early") is False
 
@@ -195,35 +230,56 @@ def test_valid_flow_projects_structured_milestones_and_gates_terminal_actions(co
         "RETURN",
         4,
         terminal_receipt={"receipt_id": "terminal-r-1"},
-        vector_ack={"ack_id": "vector-a-1"},
     )
     projection = kb.controller_status_projection(conn, task_id)
-    assert projection is not None and projection["terminal"] is True
+    assert projection is not None and projection["terminal"] is False
     assert [stage["status"] for stage in projection["status_projection"]] == [
         "SENT",
         "ACE ACCEPTED",
         "RESPONSE RECEIVED",
         "VECTOR ACKNOWLEDGED",
     ]
-    assert all(stage["reached"] for stage in projection["status_projection"])
+    assert [stage["reached"] for stage in projection["status_projection"]] == [
+        True, True, True, False,
+    ]
     assert projection["status_projection"][1]["evidence"] == {
         "receipt_id": "ace-r-1"
     }
     assert projection["status_projection"][2]["evidence"] == {
         "receipt_id": "terminal-r-1"
     }
-    assert projection["status_projection"][3]["evidence"] == {
-        "ack_id": "vector-a-1"
-    }
+    assert projection["status_projection"][3]["evidence"] is None
+    assert kb.complete_task(conn, task_id, summary="delivery not acknowledged") is False
+    with pytest.raises(kb.ControllerEnvelopeError, match="receiver-owned"):
+        kb.record_controller_envelope(
+            conn,
+            task_id,
+            event_type="RETURN",
+            idempotency_key="sender-self-ack",
+            occurred_at="2026-08-13T12:00:04Z",
+            correlation_id="corr-1",
+            ace_identity="ace:operator-1",
+            terminal_receipt={"receipt_id": "terminal-r-1"},
+            vector_ack={"ack_id": "forged"},
+        )
     retry = _record(
         conn,
         task_id,
         "RETURN",
         4,
         terminal_receipt={"receipt_id": "terminal-r-1"},
-        vector_ack={"ack_id": "vector-a-1"},
     )
     assert retry.duplicate is True
+    ack = _ack_return(conn, task_id)
+    assert ack.duplicate is False
+    assert ack.envelope.vector_ack["receiver"] == {
+        "platform": "tui",
+        "notifier_profile": "vector",
+    }
+    assert _ack_return(conn, task_id).duplicate is True
+    projection = kb.controller_status_projection(conn, task_id)
+    assert projection is not None and projection["terminal"] is True
+    assert all(stage["reached"] for stage in projection["status_projection"])
     assert kb.complete_task(conn, task_id, summary="terminal evidence present") is True
 
     review_id = _task(conn)
@@ -238,6 +294,72 @@ def test_valid_flow_projects_structured_milestones_and_gates_terminal_actions(co
     assert kb.get_task(conn, review_id).status == "ready"
     assert kb.request_review(conn, review_id, summary="ready for review") is True
     assert kb.complete_task(conn, review_id, summary="review approved") is True
+
+
+def test_acknowledgment_requires_exact_subscription_and_claimed_return(conn) -> None:
+    task_id = _task(conn)
+    _opt_in(conn, task_id)
+    kb.add_notify_sub(
+        conn,
+        task_id=task_id,
+        platform="tui",
+        chat_id="unclaimed-receiver",
+        notifier_profile="vector",
+    )
+    _record(conn, task_id, "OUTBOUND", 1)
+    _record(
+        conn,
+        task_id,
+        "TRANSITION",
+        2,
+        ace_receipt={"receipt_id": "ace-r-1"},
+    )
+    _record(
+        conn,
+        task_id,
+        "RETURN",
+        3,
+        terminal_receipt={"receipt_id": "terminal-r-1"},
+    )
+    return_event = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? "
+        "AND kind = 'controller_envelope' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert return_event is not None
+
+    with pytest.raises(kb.ControllerEnvelopeError, match="exact subscribed receiver"):
+        kb.acknowledge_controller_return(
+            conn,
+            task_id,
+            return_event_id=return_event["id"],
+            platform="tui",
+            chat_id="not-subscribed",
+        )
+    with pytest.raises(kb.ControllerEnvelopeError, match="has not claimed"):
+        kb.acknowledge_controller_return(
+            conn,
+            task_id,
+            return_event_id=return_event["id"],
+            platform="tui",
+            chat_id="unclaimed-receiver",
+        )
+
+    kb.claim_unseen_events_for_sub(
+        conn,
+        task_id=task_id,
+        platform="tui",
+        chat_id="unclaimed-receiver",
+        kinds=["controller_envelope"],
+    )
+    acknowledged = kb.acknowledge_controller_return(
+        conn,
+        task_id,
+        return_event_id=return_event["id"],
+        platform="tui",
+        chat_id="unclaimed-receiver",
+    )
+    assert acknowledged.envelope.vector_ack is not None
 
 
 def test_exact_duplicate_is_idempotent_and_changed_reuse_rejects(conn) -> None:
@@ -346,7 +468,6 @@ def test_order_receipt_staleness_mismatch_reuse_and_post_terminal_fail_closed(co
         "RETURN",
         3,
         terminal_receipt={"receipt_id": "terminal"},
-        vector_ack={"ack_id": "vector"},
     )
     with pytest.raises(kb.ControllerEnvelopeError, match="terminal"):
         _record(conn, task_id, "ESCALATE", 4, payload={"late": True})
@@ -366,7 +487,6 @@ def test_only_the_v1_event_permutation_is_accepted(conn) -> None:
                 kwargs["ace_receipt"] = {"receipt_id": f"receipt-{index}"}
             elif kind == "RETURN":
                 kwargs["terminal_receipt"] = {"receipt_id": f"terminal-{index}"}
-                kwargs["vector_ack"] = {"ack_id": f"ack-{index}"}
             try:
                 _record(
                     conn,
@@ -518,7 +638,6 @@ def test_assignee_drift_fails_closed_but_legacy_cards_are_unchanged(conn) -> Non
         "RETURN",
         3,
         terminal_receipt={"receipt_id": "terminal-r-1"},
-        vector_ack={"ack_id": "vector-a-1"},
     )
     assert exact_retry.duplicate is True
     with pytest.raises(kb.ControllerEnvelopeError, match="no longer matches"):
@@ -531,7 +650,6 @@ def test_assignee_drift_fails_closed_but_legacy_cards_are_unchanged(conn) -> Non
             correlation_id="corr-1",
             ace_identity="ace:operator-1",
             terminal_receipt={"receipt_id": "terminal-r-1"},
-            vector_ack={"ack_id": "vector-a-1"},
         )
 
     legacy_done = _task(conn, assignee="builder")
@@ -576,7 +694,6 @@ def test_receipts_payload_and_projected_event_are_redacted(conn) -> None:
         "RETURN",
         3,
         terminal_receipt=nested,
-        vector_ack=nested,
     )
 
     durable = json.dumps(

@@ -639,6 +639,11 @@ def _handle_controller_event(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_controller_event")
     if delegated_err:
         return delegated_err
+    if args.get("vector_ack") is not None:
+        return tool_error(
+            "kanban_controller_event: vector_ack is receiver-owned and cannot "
+            "be supplied by the sender"
+        )
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -663,7 +668,6 @@ def _handle_controller_event(args: dict, **kw) -> str:
                 payload=args.get("payload"),
                 ace_receipt=args.get("ace_receipt"),
                 terminal_receipt=args.get("terminal_receipt"),
-                vector_ack=args.get("vector_ack"),
             )
             return _ok(
                 task_id=tid,
@@ -1841,7 +1845,8 @@ KANBAN_CONTROLLER_EVENT_SCHEMA = {
     "description": (
         "Record one typed ace.controller.v1 envelope for your assigned task. "
         "Order is OUTBOUND, TRANSITION, optional ESCALATE, RETURN. TRANSITION "
-        "requires ace_receipt; RETURN requires terminal_receipt and vector_ack."
+        "requires ace_receipt; RETURN requires terminal_receipt. The subscribed "
+        "receiver mints VECTOR ACKNOWLEDGED after delivery."
     ),
     "parameters": {
         "type": "object",
@@ -1869,7 +1874,6 @@ KANBAN_CONTROLLER_EVENT_SCHEMA = {
             "payload": {"type": "object"},
             "ace_receipt": {"type": "object"},
             "terminal_receipt": {"type": "object"},
-            "vector_ack": {"type": "object"},
             "board": _board_schema_prop(),
         },
         "required": [

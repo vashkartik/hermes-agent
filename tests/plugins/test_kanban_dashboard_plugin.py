@@ -259,6 +259,14 @@ def test_controller_envelopes_project_and_fail_closed_through_http(client):
         f"/api/plugins/kanban/tasks/{task_id}/controller/opt-in",
         json=binding,
     ).json() == opt_in.json()
+    with kb.connect() as conn:
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="tui",
+            chat_id="dashboard-receiver",
+            notifier_profile="vector",
+        )
 
     event_url = f"/api/plugins/kanban/tasks/{task_id}/controller/envelopes"
     outbound = {
@@ -322,15 +330,36 @@ def test_controller_envelopes_project_and_fail_closed_through_http(client):
         occurred_at="2026-08-13T12:00:03Z",
         idempotency_key="http-return",
         terminal_receipt={"receipt_id": "terminal-http-receipt"},
-        vector_ack={"ack_id": "vector-http-ack"},
     )
     returned.pop("payload")
+    forged_return = dict(returned, vector_ack={"ack_id": "forged"})
+    assert client.post(event_url, json=forged_return).status_code == 422
     assert client.post(event_url, json=returned).status_code == 200
 
     detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
     assert [s["status"] for s in detail["controller"]["status_projection"]] == [
         "SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED",
     ]
+    assert detail["controller"]["terminal"] is False
+    with kb.connect() as conn:
+        _, _, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="tui",
+            chat_id="dashboard-receiver",
+            kinds=["controller_envelope"],
+        )
+        return_event = next(
+            event for event in events
+            if (event.payload or {}).get("event_type") == "RETURN"
+        )
+        kb.acknowledge_controller_return(
+            conn,
+            task_id,
+            return_event_id=return_event.id,
+            platform="tui",
+            chat_id="dashboard-receiver",
+        )
     completed = client.patch(
         f"/api/plugins/kanban/tasks/{task_id}",
         json={"status": "done", "summary": "terminal proofs present"},

@@ -9832,6 +9832,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked", "controller_envelope",
+    "controller_acknowledged",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -9863,6 +9864,8 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         if event_type == "ESCALATE":
             return f"🟥 {board_tag}{tag}Kanban {task_id} controller ESCALATE"
         return None
+    if kind == "controller_acknowledged":
+        return f"🔁 {board_tag}{tag}Kanban {task_id} controller — VECTOR ACKNOWLEDGED"
     if kind == "completed":
         handoff = ""
         summary = payload.get("summary")
@@ -9891,6 +9894,64 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None
+
+
+def _ack_kanban_controller_receipts(receipts: list[dict]) -> list[dict]:
+    """Acknowledge returns consumed by a successful Vector agent turn.
+
+    Returns receipts that could not be persisted so the poller can retry the
+    receiver-side write without replaying the already-consumed prompt.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    failed: list[dict] = []
+    for receipt in receipts:
+        conn = None
+        try:
+            conn = _kb.connect(board=receipt.get("board") or None)
+            _kb.acknowledge_controller_return(
+                conn,
+                receipt["task_id"],
+                return_event_id=receipt["return_event_id"],
+                platform=receipt["platform"],
+                chat_id=receipt["chat_id"],
+                thread_id=receipt.get("thread_id") or "",
+            )
+        except Exception:
+            logger.exception(
+                "failed to persist controller receiver acknowledgment for %s",
+                receipt.get("task_id"),
+            )
+            failed.append(receipt)
+        finally:
+            if conn is not None:
+                conn.close()
+    return failed
+
+
+def _queue_kanban_controller_receipt(session: dict, receipt: dict) -> None:
+    pending = session.setdefault("_kanban_controller_receipts", [])
+    identity = (
+        receipt.get("board"),
+        receipt.get("task_id"),
+        receipt.get("return_event_id"),
+        receipt.get("platform"),
+        receipt.get("chat_id"),
+        receipt.get("thread_id"),
+    )
+    if any(
+        (
+            item.get("board"),
+            item.get("task_id"),
+            item.get("return_event_id"),
+            item.get("platform"),
+            item.get("chat_id"),
+            item.get("thread_id"),
+        ) == identity
+        for item in pending
+    ):
+        return
+    pending.append(receipt)
 
 
 def _collect_kanban_notifications(session: dict) -> list:
@@ -9967,7 +10028,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
+                _, _, events = _kb.claim_unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -9978,10 +10039,31 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
+                sub_texts: list[str] = []
+                return_events: list[int] = []
                 for ev in events:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
-                        texts.append(text)
+                        sub_texts.append(text)
+                    if (
+                        ev.kind == "controller_envelope"
+                        and str((ev.payload or {}).get("event_type") or "").upper()
+                        == "RETURN"
+                    ):
+                        return_events.append(ev.id)
+                for return_event_id in return_events:
+                    _queue_kanban_controller_receipt(
+                        session,
+                        {
+                            "board": slug,
+                            "task_id": sub["task_id"],
+                            "return_event_id": return_event_id,
+                            "platform": sub["platform"],
+                            "chat_id": sub["chat_id"],
+                            "thread_id": sub.get("thread_id") or "",
+                        },
+                    )
+                texts.extend(sub_texts)
                 # Unsubscribe only at a truly final status (done/archived);
                 # blocked/crashed subs stay live so a respawned task's next
                 # terminal event still reaches the user (same rule as the
@@ -10028,6 +10110,15 @@ def _notification_poller_loop(
         _now = time.monotonic()
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
+            with session["history_lock"]:
+                _ack_retries = list(session.pop("_kanban_ack_retry", []))
+            if _ack_retries:
+                _failed_retries = _ack_kanban_controller_receipts(_ack_retries)
+                if _failed_retries:
+                    with session["history_lock"]:
+                        session.setdefault("_kanban_ack_retry", []).extend(
+                            _failed_retries
+                        )
             try:
                 _kanban_texts = _collect_kanban_notifications(session)
             except Exception as _kb_exc:
@@ -10046,16 +10137,26 @@ def _notification_poller_loop(
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
+                _receipt_batch: list[dict] = []
                 with session["history_lock"]:
                     if not session.get("running"):
                         session["running"] = True
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
+                        _receipt_batch = list(
+                            session.pop("_kanban_controller_receipts", [])
+                        )
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            "\n".join(_batch),
+                            controller_receipts=_receipt_batch,
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -10064,6 +10165,10 @@ def _notification_poller_loop(
                         )
                         with session["history_lock"]:
                             session["running"] = False
+                            session.setdefault("_kanban_pending", []).extend(_batch)
+                            session.setdefault(
+                                "_kanban_controller_receipts", []
+                            ).extend(_receipt_batch)
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -10500,7 +10605,9 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    controller_receipts: list[dict] | None = None,
 ) -> None:
+    controller_receipts = list(controller_receipts or [])
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
@@ -11029,6 +11136,23 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            if controller_receipts:
+                if status == "complete":
+                    failed_receipts = _ack_kanban_controller_receipts(
+                        controller_receipts
+                    )
+                    if failed_receipts:
+                        with session["history_lock"]:
+                            session.setdefault("_kanban_ack_retry", []).extend(
+                                failed_receipts
+                            )
+                else:
+                    with session["history_lock"]:
+                        session.setdefault("_kanban_pending", []).append(str(text))
+                        session.setdefault(
+                            "_kanban_controller_receipts", []
+                        ).extend(controller_receipts)
+                controller_receipts.clear()
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -11192,6 +11316,16 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            # A return is acknowledged only after a successful terminal agent
+            # frame. Early returns, interrupts, and exceptions preserve both
+            # the prompt and its receipt for a later receiver turn.
+            if controller_receipts:
+                with session["history_lock"]:
+                    session.setdefault("_kanban_pending", []).append(str(text))
+                    session.setdefault("_kanban_controller_receipts", []).extend(
+                        controller_receipts
+                    )
+                controller_receipts.clear()
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.
@@ -11385,6 +11519,11 @@ def _run_prompt_submit(
         with session["history_lock"]:
             session["running"] = False
             _clear_inflight_turn(session)
+            if controller_receipts:
+                session.setdefault("_kanban_pending", []).append(str(text))
+                session.setdefault("_kanban_controller_receipts", []).extend(
+                    controller_receipts
+                )
         _release_update_turn_if_idle(session)
         _emit("error", sid, {"message": f"turn start failed: {exc}"})
 

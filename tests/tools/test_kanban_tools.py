@@ -104,6 +104,12 @@ def test_typed_controller_tools_register_and_ingest_full_flow(worker_env):
     schemas = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
     names = {schema["function"]["name"] for schema in schemas}
     assert {"kanban_controller_opt_in", "kanban_controller_event"} <= names
+    controller_schema = next(
+        schema["function"]
+        for schema in schemas
+        if schema["function"]["name"] == "kanban_controller_event"
+    )
+    assert "vector_ack" not in controller_schema["parameters"]["properties"]
 
     opted = json.loads(kt._handle_controller_opt_in({
         "correlation_id": "tool-correlation",
@@ -111,6 +117,18 @@ def test_typed_controller_tools_register_and_ingest_full_flow(worker_env):
     }))
     assert opted["ok"] is True
     assert opted["controller"]["protocol"] == "ace.controller.v1"
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="tui",
+            chat_id="tool-receiver",
+            notifier_profile="vector",
+        )
+    finally:
+        conn.close()
 
     common = {
         "correlation_id": "tool-correlation",
@@ -147,13 +165,46 @@ def test_typed_controller_tools_register_and_ingest_full_flow(worker_env):
         "idempotency_key": "tool-return",
         "occurred_at": "2026-08-13T12:00:03Z",
         "terminal_receipt": {"state": "done"},
-        "vector_ack": {"delivered": True},
     }))
     assert returned["ok"] is True
     assert [
         stage["status"] for stage in returned["controller"]["status_projection"]
     ] == ["SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED"]
-    assert all(stage["reached"] for stage in returned["controller"]["status_projection"])
+    assert [
+        stage["reached"] for stage in returned["controller"]["status_projection"]
+    ] == [True, True, True, False]
+    forged = json.loads(kt._handle_controller_event({
+        **common,
+        "event_type": "RETURN",
+        "idempotency_key": "tool-forged-ack",
+        "occurred_at": "2026-08-13T12:00:04Z",
+        "terminal_receipt": {"state": "done"},
+        "vector_ack": {"delivered": True},
+    }))
+    assert "receiver-owned" in forged["error"]
+
+    conn = kb.connect()
+    try:
+        _, _, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=worker_env,
+            platform="tui",
+            chat_id="tool-receiver",
+            kinds=["controller_envelope"],
+        )
+        return_event = next(
+            event for event in events
+            if (event.payload or {}).get("event_type") == "RETURN"
+        )
+        kb.acknowledge_controller_return(
+            conn,
+            worker_env,
+            return_event_id=return_event.id,
+            platform="tui",
+            chat_id="tool-receiver",
+        )
+    finally:
+        conn.close()
 
     shown = json.loads(kt._handle_show({}))
     assert shown["controller"]["terminal"] is True

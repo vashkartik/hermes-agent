@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -622,6 +622,8 @@ class ControllerOptInBody(BaseModel):
 
 
 class ControllerEnvelopeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     protocol: str = kanban_db.CONTROLLER_PROTOCOL_V1
     event_type: str
     idempotency_key: str
@@ -631,7 +633,6 @@ class ControllerEnvelopeBody(BaseModel):
     payload: Optional[dict[str, Any]] = None
     ace_receipt: Optional[dict[str, Any]] = None
     terminal_receipt: Optional[dict[str, Any]] = None
-    vector_ack: Optional[dict[str, Any]] = None
 
 
 def _controller_http_error(exc: kanban_db.ControllerEnvelopeError) -> HTTPException:
@@ -703,7 +704,6 @@ def controller_envelope(
                 payload=payload.payload,
                 ace_receipt=payload.ace_receipt,
                 terminal_receipt=payload.terminal_receipt,
-                vector_ack=payload.vector_ack,
             )
         except kanban_db.ControllerEnvelopeError as exc:
             raise _controller_http_error(exc) from exc

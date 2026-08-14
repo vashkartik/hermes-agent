@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
+    _ack_kanban_controller_receipts,
     _collect_kanban_notifications,
     _format_kanban_event_text,
 )
@@ -222,18 +223,32 @@ class TestCollectKanbanNotifications:
             kb.record_controller_envelope(
                 conn, tid, event_type="RETURN", idempotency_key="tui-return",
                 occurred_at="2026-08-13T12:00:03Z",
-                terminal_receipt={"state": "done"},
-                vector_ack={"delivered": True}, **common,
+                terminal_receipt={"state": "done"}, **common,
             )
         finally:
             conn.close()
 
-        texts = _collect_kanban_notifications(_session())
+        session = _session()
+        texts = _collect_kanban_notifications(session)
         rendered = "\n".join(texts)
         assert len(texts) == 3
-        for stage in ("SENT", "ACE ACCEPTED", "RESPONSE RECEIVED", "VECTOR ACKNOWLEDGED"):
+        for stage in ("SENT", "ACE ACCEPTED", "RESPONSE RECEIVED"):
             assert stage in rendered
-        assert _collect_kanban_notifications(_session()) == []
+        assert "VECTOR ACKNOWLEDGED" not in rendered
+        with kb.connect() as conn:
+            projection = kb.controller_status_projection(conn, tid)
+            assert projection is not None and projection["terminal"] is False
+
+        receipts = session.pop("_kanban_controller_receipts")
+        assert len(receipts) == 1
+        assert _ack_kanban_controller_receipts(receipts) == []
+        acknowledged = _collect_kanban_notifications(session)
+        assert len(acknowledged) == 1
+        assert "VECTOR ACKNOWLEDGED" in acknowledged[0]
+        with kb.connect() as conn:
+            projection = kb.controller_status_projection(conn, tid)
+            assert projection is not None and projection["terminal"] is True
+        assert _collect_kanban_notifications(session) == []
 
 
 class TestFormatKanbanEventText:
@@ -266,13 +281,19 @@ class TestFormatKanbanEventText:
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 
-    def test_controller_return_projects_both_terminal_statuses(self):
+    def test_controller_return_projects_response_before_acknowledgment(self):
         ev = SimpleNamespace(
             kind="controller_envelope", payload={"event_type": "RETURN"},
         )
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert text is not None
         assert "RESPONSE RECEIVED" in text
-        assert "VECTOR ACKNOWLEDGED" in text
+        assert "VECTOR ACKNOWLEDGED" not in text
+
+        ack = SimpleNamespace(kind="controller_acknowledged", payload={})
+        ack_text = _format_kanban_event_text(self.SUB, self.TASK, ack, "main")
+        assert ack_text is not None
+        assert "VECTOR ACKNOWLEDGED" in ack_text
 
 
 class TestNotificationPollerLoopKanbanWiring:
@@ -296,7 +317,7 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
+            lambda rid, sid, sess, text, **kwargs: submits.append(text),
         )
         stop = threading.Event()
         thread = threading.Thread(

@@ -619,8 +619,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                     help="JSON object; required for TRANSITION")
     p_controller_event.add_argument("--terminal-receipt", default=None,
                                     help="JSON object; required for RETURN")
-    p_controller_event.add_argument("--vector-ack", default=None,
-                                    help="JSON object; required for RETURN")
 
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
@@ -2200,7 +2198,6 @@ def _cmd_controller_event(args: argparse.Namespace) -> int:
     terminal_receipt = _controller_cli_object(
         args.terminal_receipt, "terminal_receipt"
     )
-    vector_ack = _controller_cli_object(args.vector_ack, "vector_ack")
     with kb.connect_closing() as conn:
         result = kb.record_controller_envelope(
             conn,
@@ -2213,7 +2210,6 @@ def _cmd_controller_event(args: argparse.Namespace) -> int:
             payload=payload,
             ace_receipt=ace_receipt,
             terminal_receipt=terminal_receipt,
-            vector_ack=vector_ack,
         )
         projection = kb.controller_status_projection(conn, args.task_id) or {}
     print(

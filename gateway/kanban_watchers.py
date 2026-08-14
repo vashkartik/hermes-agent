@@ -178,7 +178,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # done/archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "controller_envelope")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "controller_envelope", "controller_acknowledged")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -451,6 +451,11 @@ class GatewayKanbanWatchersMixin:
                                 )
                             else:
                                 continue
+                        elif kind == "controller_acknowledged":
+                            msg = (
+                                f"🔁 {board_tag}{tag}Kanban {sub['task_id']} "
+                                "controller — VECTOR ACKNOWLEDGED"
+                            )
                         elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -592,6 +597,17 @@ class GatewayKanbanWatchersMixin:
                                 raise RuntimeError(
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                )
+                            if (
+                                kind == "controller_envelope"
+                                and str((ev.payload or {}).get("event_type") or "").upper()
+                                == "RETURN"
+                            ):
+                                await asyncio.to_thread(
+                                    self._kanban_ack_controller_return,
+                                    sub,
+                                    ev.id,
+                                    board_slug,
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
@@ -862,6 +878,28 @@ class GatewayKanbanWatchersMixin:
             _kb.remove_notify_sub(
                 conn,
                 task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_ack_controller_return(
+        self,
+        sub: dict,
+        return_event_id: int,
+        board: Optional[str] = None,
+    ) -> None:
+        """Mint the receiver receipt only after this subscription delivered."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.acknowledge_controller_return(
+                conn,
+                sub["task_id"],
+                return_event_id=return_event_id,
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
