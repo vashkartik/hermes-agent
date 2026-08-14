@@ -426,6 +426,7 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
+                    non_push_messages: list[tuple[str, str]] = []
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -571,6 +572,7 @@ class GatewayKanbanWatchersMixin:
                         from gateway.wake import adapter_supports_push
 
                         if not adapter_supports_push(adapter):
+                            non_push_messages.append((kind, msg))
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
                                 "channel; skipping text ping for %s, relying "
@@ -685,7 +687,15 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed",
+                            "gave_up",
+                            "crashed",
+                            "timed_out",
+                            "blocked",
+                            "controller_envelope",
+                            "controller_acknowledged",
+                        )
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
@@ -697,21 +707,29 @@ class GatewayKanbanWatchersMixin:
                         if _wake_kinds and _session_key:
                             _title = (task.title if task else sub["task_id"])[:120]
                             _assignee = task.assignee if task else ""
+                            _wake_messages = [
+                                message
+                                for event_kind, message in non_push_messages
+                                if event_kind in _WAKE_KINDS
+                            ]
                             _parts = []
                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                            _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                            _synth = t(
-                                "gateway.kanban.wake.message",
-                                task_id=sub["task_id"],
-                                status=_status,
-                                title=_title,
-                                assignee=_assignee,
-                                board=board_slug,
-                            )
+                            if _wake_messages:
+                                _synth = "\n\n".join(_wake_messages)
+                            else:
+                                _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
+                                _synth = t(
+                                    "gateway.kanban.wake.message",
+                                    task_id=sub["task_id"],
+                                    status=_status,
+                                    title=_title,
+                                    assignee=_assignee,
+                                    board=board_slug,
+                                )
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
@@ -724,6 +742,21 @@ class GatewayKanbanWatchersMixin:
                                     text=_synth,
                                     session_id=_session_key,
                                 )
+                                for controller_event in d["events"]:
+                                    if (
+                                        controller_event.kind == "controller_envelope"
+                                        and str(
+                                            (controller_event.payload or {}).get("event_type")
+                                            or ""
+                                        ).upper()
+                                        == "RETURN"
+                                    ):
+                                        await asyncio.to_thread(
+                                            self._kanban_ack_controller_return,
+                                            sub,
+                                            controller_event.id,
+                                            board_slug,
+                                        )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
