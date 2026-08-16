@@ -178,7 +178,9 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
         cua_backend,
         "_resolve_mcp_invocation",
         return_value=("/opt/cua-driver", ["mcp"]),
-    ), patch.object(cua_backend.subprocess, "Popen", return_value=process) as popen, patch.object(
+    ), patch.object(cua_backend.sys, "platform", "linux"), patch.object(
+        cua_backend.subprocess, "Popen", return_value=process
+    ) as popen, patch.object(
         cua_backend.subprocess, "run", side_effect=[status, stopped]
     ):
         daemon.start()
@@ -195,6 +197,70 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
     assert env["CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS"] == "1"
     assert proxy_command == "/opt/cua-driver"
     assert proxy_args == ["mcp", "--embedded", "--socket", daemon.socket_path]
+
+
+def test_unrestricted_macos_daemon_uses_launchservices_driver_identity():
+    from tools.computer_use import cua_backend
+
+    process = Mock()
+    process.poll.return_value = None
+    process.stderr = []
+    process.wait.return_value = 0
+    status = SimpleNamespace(returncode=0, stdout="running", stderr="")
+    stopped = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
+    with patch.object(
+        cua_backend,
+        "_resolve_mcp_invocation",
+        return_value=("/Applications/CuaDriver.app/Contents/MacOS/cua-driver", ["mcp"]),
+    ), patch.object(cua_backend.sys, "platform", "darwin"), patch.object(
+        cua_backend,
+        "_macos_cua_app_bundle",
+        return_value="/Applications/CuaDriver.app",
+    ), patch.object(
+        cua_backend.subprocess, "Popen", return_value=process
+    ) as popen, patch.object(
+        cua_backend.subprocess, "run", side_effect=[status, stopped]
+    ):
+        daemon.start()
+        command = popen.call_args.args[0]
+        env = popen.call_args.kwargs["env"]
+        proxy_command, proxy_args = daemon.proxy_invocation()
+        daemon.stop()
+
+    assert command[:5] == ["/usr/bin/open", "-W", "-g", "-j", "-n"]
+    assert "/Applications/CuaDriver.app" in command
+    assert command[command.index("/Applications/CuaDriver.app") + 1] == "--args"
+    daemon_args = command[command.index("--args") + 1 :]
+    assert daemon_args[:2] == ["serve", "--embedded"]
+    assert daemon_args[daemon_args.index("--permission-mode") + 1] == "unrestricted"
+    assert "--dangerously-bypass-approvals" in daemon_args
+    assert f"{cua_backend._CUA_TELEMETRY_ENV_VAR}=0" in command
+    assert "CUA_DRIVER_PERMISSION_MODE=unrestricted" in command
+    assert "CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS=1" in command
+    assert env[cua_backend._CUA_TELEMETRY_ENV_VAR] == "0"
+    assert proxy_command == "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+    assert proxy_args == ["mcp", "--embedded", "--socket", daemon.socket_path]
+
+
+def test_unrestricted_macos_daemon_refuses_direct_binary_without_app_bundle():
+    from tools.computer_use import cua_backend
+
+    daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
+    with patch.object(
+        cua_backend,
+        "_resolve_mcp_invocation",
+        return_value=("/tmp/cua-driver", ["mcp"]),
+    ), patch.object(cua_backend.sys, "platform", "darwin"), patch.object(
+        cua_backend,
+        "_macos_cua_app_bundle",
+        return_value=None,
+    ), patch.object(cua_backend.subprocess, "Popen") as popen:
+        with pytest.raises(RuntimeError, match="signed CuaDriver.app"):
+            daemon.start()
+
+    popen.assert_not_called()
 
 
 def test_standard_backend_does_not_spawn_an_embedded_daemon():

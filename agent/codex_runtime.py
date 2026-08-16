@@ -955,6 +955,8 @@ def run_codex_app_server_turn(
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
     if turn.projected_messages:
+        from agent.message_metadata import append_message
+
         projected = list(turn.projected_messages)
         # Codex echoes the submitted input back as its own userMessage event,
         # but run_conversation already appended the user message before
@@ -968,7 +970,8 @@ def run_codex_app_server_turn(
             and projected[0].get("content") == user_message
         ):
             projected = projected[1:]
-        messages.extend(projected)
+        for projected_message in projected:
+            append_message(messages, projected_message)
 
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
