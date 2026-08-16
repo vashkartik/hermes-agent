@@ -125,6 +125,68 @@ def test_wake_only_success_advances_cursor_single_wake(tmp_path, monkeypatch):
     assert runner._kanban_sub_fail_counts == {}
 
 
+def test_wake_only_controller_return_is_acknowledged_before_cursor_advance(
+    tmp_path, monkeypatch,
+):
+    """A successful wake-only RETURN delivery must mint its receiver receipt."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-return.db"))
+    monkeypatch.setattr(
+        kb,
+        "_is_authorized_controller_assignee",
+        lambda assignee: assignee == "vector-controller",
+    )
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake-only controller return",
+            assignee="vector-controller",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode="wake",
+        )
+        projection = kb.controller_status_projection(conn, tid)
+        common = {
+            "correlation_id": projection["correlation_id"],
+            "ace_identity": projection["ace_identity"],
+        }
+        kb.record_controller_envelope(
+            conn, tid, event_type="OUTBOUND",
+            idempotency_key="wake-return-outbound",
+            occurred_at="2026-08-16T12:00:01Z", **common,
+        )
+        kb.record_controller_envelope(
+            conn, tid, event_type="TRANSITION",
+            idempotency_key="wake-return-transition",
+            occurred_at="2026-08-16T12:00:02Z",
+            ace_receipt={"run_id": "ace-1"}, **common,
+        )
+        kb.record_controller_envelope(
+            conn, tid, event_type="RETURN",
+            idempotency_key="wake-return-terminal",
+            occurred_at="2026-08-16T12:00:03Z",
+            terminal_receipt={"state": "done"}, **common,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.handled) == 1
+    with kb.connect() as conn:
+        projection = kb.controller_status_projection(conn, tid)
+        assert projection is not None and projection["terminal"] is True
+
+
 def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
     """Wake fails: cursor rewound, counter bumped, event retried next tick."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-fail.db"))

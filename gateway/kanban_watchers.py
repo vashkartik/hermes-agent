@@ -516,7 +516,6 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
-                    non_push_messages: list[tuple[str, str]] = []
                     mode = sub.get("delivery_mode") or "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
@@ -1004,6 +1003,21 @@ class GatewayKanbanWatchersMixin:
                             # (api_server) self-post ordering above.
                             try:
                                 await _push_wake()
+                                for controller_event in d["events"]:
+                                    if (
+                                        controller_event.kind == "controller_envelope"
+                                        and str(
+                                            (controller_event.payload or {}).get("event_type")
+                                            or ""
+                                        ).upper()
+                                        == "RETURN"
+                                    ):
+                                        await asyncio.to_thread(
+                                            self._kanban_ack_controller_return,
+                                            sub,
+                                            controller_event.id,
+                                            board_slug,
+                                        )
                                 sub_fail_counts.pop(sub_key, None)
                             except Exception as _wk_err:
                                 fails = sub_fail_counts.get(sub_key, 0) + 1

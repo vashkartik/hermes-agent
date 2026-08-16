@@ -463,3 +463,39 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+    def test_rejected_prompt_start_restores_pending_text_and_receipts(
+        self, monkeypatch,
+    ):
+        import threading
+        import tui_gateway.server as server
+
+        receipt = {"task_id": "t_controller", "return_event_id": 42}
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = ["controller return"]
+        session["_kanban_controller_receipts"] = [receipt]
+        stop = threading.Event()
+        submits: list[str] = []
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda sess: [])
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+        def reject_prompt(rid, sid, sess, text, **kwargs):
+            submits.append(text)
+            stop.set()
+            return False
+
+        monkeypatch.setattr(server, "_run_prompt_submit", reject_prompt)
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-poller-reject", session),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+        assert submits == ["controller return"]
+        assert session["running"] is False
+        assert session["_kanban_pending"] == ["controller return"]
+        assert session["_kanban_controller_receipts"] == [receipt]
