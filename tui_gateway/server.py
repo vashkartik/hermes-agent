@@ -10762,16 +10762,38 @@ def _notification_poller_loop(
                         if _accepted is False:
                             with session["history_lock"]:
                                 session["running"] = False
-                                session["_kanban_pending"] = (
-                                    _batch + list(session.get("_kanban_pending") or [])
+                                _existing_receipts = list(
+                                    session.get("_kanban_controller_receipts") or []
                                 )
-                                session["_kanban_controller_receipts"] = (
-                                    _receipt_batch
-                                    + list(
-                                        session.get("_kanban_controller_receipts")
-                                        or []
+
+                                def _receipt_key(receipt):
+                                    return (
+                                        receipt.get("task_id"),
+                                        receipt.get("return_event_id"),
+                                        receipt.get("board_slug") or "",
                                     )
+
+                                _existing_keys = {
+                                    _receipt_key(receipt)
+                                    for receipt in _existing_receipts
+                                }
+                                _submitter_restored = bool(_receipt_batch) and all(
+                                    _receipt_key(receipt) in _existing_keys
+                                    for receipt in _receipt_batch
                                 )
+                                if not _submitter_restored:
+                                    session["_kanban_pending"] = (
+                                        _batch
+                                        + list(session.get("_kanban_pending") or [])
+                                    )
+                                    _missing_receipts = [
+                                        receipt
+                                        for receipt in _receipt_batch
+                                        if _receipt_key(receipt) not in _existing_keys
+                                    ]
+                                    session["_kanban_controller_receipts"] = (
+                                        _missing_receipts + _existing_receipts
+                                    )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "

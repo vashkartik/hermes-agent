@@ -499,3 +499,40 @@ class TestNotificationPollerLoopKanbanWiring:
         assert session["running"] is False
         assert session["_kanban_pending"] == ["controller return"]
         assert session["_kanban_controller_receipts"] == [receipt]
+
+    def test_rejected_prompt_does_not_duplicate_batch_restored_by_submitter(
+        self, monkeypatch,
+    ):
+        import threading
+        import tui_gateway.server as server
+
+        receipt = {"task_id": "t_controller", "return_event_id": 42}
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = ["controller return"]
+        session["_kanban_controller_receipts"] = [receipt]
+        stop = threading.Event()
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda sess: [])
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+        def reject_after_restore(rid, sid, sess, text, **kwargs):
+            sess.setdefault("_kanban_pending", []).append(text)
+            sess.setdefault("_kanban_controller_receipts", []).extend(
+                kwargs["controller_receipts"]
+            )
+            sess["running"] = False
+            stop.set()
+            return False
+
+        monkeypatch.setattr(server, "_run_prompt_submit", reject_after_restore)
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-poller-late-reject", session),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+        assert session["_kanban_pending"] == ["controller return"]
+        assert session["_kanban_controller_receipts"] == [receipt]
