@@ -488,6 +488,11 @@ def test_backend_rejects_unknown_mode():
 def _captured_serve_command(monkeypatch, daemon):
     captured: Dict[str, Any] = {}
 
+    # These tests exercise the direct daemon argv contract, not the macOS
+    # signed-app launcher. Select that branch explicitly so the fixture stays
+    # deterministic on macOS CI and developer machines.
+    monkeypatch.setattr(cb.sys, "platform", "linux")
+
     class _FakeProc:
         stderr = None
 
