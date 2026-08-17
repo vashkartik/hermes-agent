@@ -7,7 +7,7 @@ adapter) and the TUI notification poller only watched process completions.
 ``last_event_id`` stayed 0 forever and no notification was ever delivered.
 
 These tests cover the delivery half that now lives in tui_gateway/server.py:
-``_collect_kanban_notifications`` (cursor claim + formatting + terminal
+``_collect_kanban_notifications`` (cursor claim + formatting + archive-only
 unsubscribe) and ``_format_kanban_event_text``.
 """
 
@@ -66,17 +66,53 @@ class TestCollectKanbanNotifications:
         assert texts == []
         spy_connect.assert_not_called()
 
-    def test_delivers_completed_event_and_unsubscribes(self):
+    def test_done_reopen_notifies_once_per_event_until_archive(self):
         tid = _create_subscribed_task()
         _complete(tid, summary="shipped the fix")
 
-        texts = _collect_kanban_notifications(_session())
+        first = _collect_kanban_notifications(_session())
 
-        assert len(texts) == 1
-        assert tid in texts[0]
-        assert "done" in texts[0]
-        assert "shipped the fix" in texts[0]
-        # Task is at a final status -> subscription removed.
+        assert len(first) == 1
+        assert tid in first[0]
+        assert "done" in first[0]
+        assert "shipped the fix" in first[0]
+        rows = _sub_rows(tid)
+        assert len(rows) == 1, "done must retain the originating session"
+        first_cursor = rows[0]["last_event_id"]
+
+        # The retained subscription must not replay the completed event.
+        assert _collect_kanban_notifications(_session()) == []
+
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,)
+                )
+                kb._append_event(conn, tid, "status", {"status": "ready"})
+            assert kb.complete_task(conn, tid, summary="review corrections")
+        finally:
+            conn.close()
+
+        reopened = _collect_kanban_notifications(_session())
+
+        assert len(reopened) == 2
+        assert "ready" in reopened[0]
+        assert "review corrections" in reopened[1]
+        rows = _sub_rows(tid)
+        assert len(rows) == 1
+        assert rows[0]["chat_id"] == SESSION_KEY
+        assert rows[0]["last_event_id"] > first_cursor
+        assert _collect_kanban_notifications(_session()) == []
+
+        conn = kb.connect()
+        try:
+            assert kb.archive_task(conn, tid)
+        finally:
+            conn.close()
+
+        # Archive is notification-terminal and removes the retained route.
+        assert _collect_kanban_notifications(_session()) == []
         assert _sub_rows(tid) == []
 
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
@@ -99,6 +135,36 @@ class TestCollectKanbanNotifications:
         assert spy_connect.called
         # Blocked is not a final status -> subscription stays alive so a
         # respawned task's next terminal event still reaches the user.
+        rows = _sub_rows(tid)
+        assert len(rows) == 1
+        assert rows[0]["last_event_id"] > pre_cursor
+
+    def test_block_loop_triage_wakes_originating_tui_session(self):
+        tid = _create_subscribed_task()
+        pre_cursor = _sub_rows(tid)[0]["last_event_id"]
+        conn = kb.connect()
+        try:
+            kb._append_event(
+                conn,
+                tid,
+                "block_loop_detected",
+                {
+                    "reason": "controller result needs owner input",
+                    "kind": "needs_input",
+                    "recurrences": 2,
+                    "limit": kb.BLOCK_RECURRENCE_LIMIT,
+                },
+            )
+        finally:
+            conn.close()
+
+        first = _collect_kanban_notifications(_session())
+        second = _collect_kanban_notifications(_session())
+
+        assert len(first) == 1
+        assert "TRIAGE" in first[0]
+        assert "controller result needs owner input" in first[0]
+        assert second == []
         rows = _sub_rows(tid)
         assert len(rows) == 1
         assert rows[0]["last_event_id"] > pre_cursor
@@ -190,7 +256,11 @@ class TestCollectKanbanNotifications:
         assert len(texts) == 1
         assert tid in texts[0]
         assert "cross-profile delivery" in texts[0]
-        assert _sub_rows(tid) == []
+        # Completion is reversible, so the shared-board subscription remains
+        # owned by this exact Desktop session until the task is archived.
+        rows = _sub_rows(tid)
+        assert len(rows) == 1
+        assert rows[0]["chat_id"] == SESSION_KEY
 
     def test_delivers_structured_controller_stages_once(self, monkeypatch):
         monkeypatch.setattr(
@@ -393,3 +463,76 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+    def test_rejected_prompt_start_restores_pending_text_and_receipts(
+        self, monkeypatch,
+    ):
+        import threading
+        import tui_gateway.server as server
+
+        receipt = {"task_id": "t_controller", "return_event_id": 42}
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = ["controller return"]
+        session["_kanban_controller_receipts"] = [receipt]
+        stop = threading.Event()
+        submits: list[str] = []
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda sess: [])
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+        def reject_prompt(rid, sid, sess, text, **kwargs):
+            submits.append(text)
+            stop.set()
+            return False
+
+        monkeypatch.setattr(server, "_run_prompt_submit", reject_prompt)
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-poller-reject", session),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+        assert submits == ["controller return"]
+        assert session["running"] is False
+        assert session["_kanban_pending"] == ["controller return"]
+        assert session["_kanban_controller_receipts"] == [receipt]
+
+    def test_rejected_prompt_does_not_duplicate_batch_restored_by_submitter(
+        self, monkeypatch,
+    ):
+        import threading
+        import tui_gateway.server as server
+
+        receipt = {"task_id": "t_controller", "return_event_id": 42}
+        session = self._poller_session(running=False)
+        session["_kanban_pending"] = ["controller return"]
+        session["_kanban_controller_receipts"] = [receipt]
+        stop = threading.Event()
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda sess: [])
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+        def reject_after_restore(rid, sid, sess, text, **kwargs):
+            sess.setdefault("_kanban_pending", []).append(text)
+            sess.setdefault("_kanban_controller_receipts", []).extend(
+                kwargs["controller_receipts"]
+            )
+            sess["running"] = False
+            stop.set()
+            return False
+
+        monkeypatch.setattr(server, "_run_prompt_submit", reject_after_restore)
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-poller-late-reject", session),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+        assert session["_kanban_pending"] == ["controller return"]
+        assert session["_kanban_controller_receipts"] == [receipt]
