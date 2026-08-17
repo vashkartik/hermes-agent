@@ -45,7 +45,11 @@ import {
   verifyHermesCli
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { isRetryableRemoteBootFailure, shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
+import {
+  isRetryableRemoteBootFailure,
+  shouldLatchBackendStartFailure,
+  shouldLatchRemoteReauthFailure
+} from './backend-start-failure'
 import {
   detectRemoteDisplay,
   isWindowsBinaryPathInWsl,
@@ -230,7 +234,14 @@ import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
-import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import {
+  assertLocalProfileCanStart,
+  decideProfileDeleteAction,
+  localProfilePoolKeys,
+  ProfileDeletionGate,
+  profileNameFromDeleteRequest,
+  resolveRouteProfile
+} from './profile-delete-routing'
 import {
   buildSidebarSessionSliceParams,
   fetchPrimaryProfileSessions,
@@ -256,6 +267,7 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
+import { ensureLoginShellPath } from './shell-path'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -1176,6 +1188,7 @@ let softRehomeInProgress = false
 // with no named profiles never populates this map, so their experience is
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
+const profileDeletionGate = new ProfileDeletionGate()
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -9485,6 +9498,9 @@ function profileRouteOptions(profile) {
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+
+  profileDeletionGate.assertCanStart(key)
+
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
   if (route.backend === 'primary') {
@@ -9560,6 +9576,8 @@ async function ensureRegistryBackend(connectionId, profile) {
     // child pooled under the composite 'conn:local::<profile>' key so it
     // can't collide with the v1 remote descriptor cached at the bare key.
     const profileKey = String(profile ?? '').trim() || 'default'
+
+    profileDeletionGate.assertCanStart(profileKey)
 
     const localRoute = resolveRegistryLocalRoute(profileKey, {
       globalRemote: globalRemoteActive(),
@@ -9813,6 +9831,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   const poolKey = opts.poolKey || profile
 
   await reapOrphanedBackendsOnce()
+  profileDeletionGate.assertCanStart(profile)
+
   // A profile may point at its OWN remote backend (connection.json
   // `profiles[name]`), or inherit the app-wide remote (env / global settings).
   // In either case there is no local child to spawn — we just verify the
@@ -9820,6 +9840,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
   const remote = opts.forceLocal ? null : await resolveRemoteBackend(profile)
+  profileDeletionGate.assertCanStart(profile)
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
@@ -9858,6 +9879,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     })
   }
 
+  profileDeletionGate.assertCanStart(profile)
+
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
@@ -9872,6 +9895,9 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
   const parentStartMarker = await desktopParentStartMarker()
+  assertLocalProfileCanStart(profile, profileDeletionGate, key =>
+    directoryExists(path.join(HERMES_HOME, 'profiles', key))
+  )
   const backendNonce = crypto.randomBytes(16).toString('hex')
   const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
 
@@ -9993,17 +10019,16 @@ function stopPoolBackend(profile) {
 }
 
 async function teardownPoolBackendAndWait(profile) {
-  const entry = backendPool.get(profile)
+  const entries = localProfilePoolKeys(profile)
+    .map(key => ({ entry: backendPool.get(key), key }))
+    .filter(item => item.entry)
 
-  if (!entry) {
-    return
+  for (const { entry, key } of entries) {
+    backendPool.delete(key)
+    stopBackendChild(entry.process)
   }
 
-  backendPool.delete(profile)
-
-  stopBackendChild(entry.process)
-
-  await waitForBackendExit(entry.process)
+  await Promise.all(entries.map(({ entry }) => waitForBackendExit(entry.process)))
 }
 
 function stopAllPoolBackends() {
@@ -10056,7 +10081,7 @@ async function prepareProfileDeleteRequest(request) {
 
   if (decision.action === 'teardown-primary') {
     writeActiveDesktopProfile('default')
-    await teardownPrimaryBackendAndWait()
+    await Promise.all([teardownPrimaryBackendAndWait(), teardownPoolBackendAndWait(decision.profile)])
 
     return decision.profile
   }
@@ -10166,6 +10191,22 @@ async function startHermes() {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
+
+    // GUI launches (Finder/Dock, desktop launchers) inherit a minimal PATH
+    // that skips the user's shell profiles. Merge the login-shell PATH into
+    // process.env BEFORE resolving the runtime or spawning the backend, so
+    // both the Electron-side resolvers and the whole backend subtree (tool
+    // availability checks, stdio MCP servers) can find Homebrew-, nvm-, and
+    // ~/.local/bin-installed CLIs. Single-flight with the whenReady warmup;
+    // failure-hardened — a broken shell profile never blocks boot.
+    const loginShellPath = await ensureLoginShellPath()
+
+    if (loginShellPath.applied) {
+      rememberLog('[env] merged login-shell PATH into process.env for backend spawn')
+    } else if (loginShellPath.reason && !['win32', 'unchanged'].includes(loginShellPath.reason)) {
+      rememberLog(`[env] login-shell PATH resolution unavailable (${loginShellPath.reason}); keeping inherited PATH`)
+    }
+
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
@@ -13026,7 +13067,7 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   }
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
+async function handleHermesApiRequest(request) {
   // Registry-pinned request (request.connectionId): the renderer is working
   // against a REGISTERED gateway connection, so the data — cron jobs and their
   // run sessions included — lives in THAT host's state.db, not any local
@@ -13123,6 +13164,18 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     upload: request?.upload,
     timeoutMs
   })
+}
+
+ipcMain.handle('hermes:api', async (_event, request) => {
+  const deletingProfile = profileNameFromDeleteRequest(request)
+
+  if (!deletingProfile) {
+    return handleHermesApiRequest(request)
+  }
+
+  const releaseProfileDeletion = profileDeletionGate.acquire(deletingProfile)
+
+  return handleHermesApiRequest(request).finally(releaseProfileDeletion)
 })
 
 // One deduper per cross-window cue — the choke point every window shares. Main
@@ -14694,6 +14747,10 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  // Warm the login-shell PATH resolution immediately so it usually completes
+  // before the backend start path awaits the same single-flight promise.
+  void ensureLoginShellPath()
+
   const systemCa = installWindowsSystemCaTrust(tls)
 
   if (systemCa.applied) {
