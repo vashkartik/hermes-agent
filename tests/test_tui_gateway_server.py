@@ -16741,8 +16741,8 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
         server._sessions.clear()
 
 
-def test_close_sessions_for_transport_parks_durable_device_without_orphan_reap(monkeypatch):
-    """Last mobile WS drop must not 20s-reap a durable Mac-side chat session."""
+def test_close_sessions_for_transport_keeps_durable_device_running_without_orphan_reap(monkeypatch):
+    """Last mobile WS drop must not kill a durable Mac-side chat session."""
     scheduled = []
     closed = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled.append)

@@ -1253,12 +1253,6 @@ def _close_sessions_for_transport(
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
         else:
-            # Park on the drop sentinel. Do not 20s-orphan-reap: a phone or
-            # second desktop is just another device. Last-client WS drop is
-            # not permission to tear down the Mac-side turn. Sidecar/tool
-            # sessions opt into close_on_disconnect above; idle TTL still
-            # collects truly abandoned sessions. A standalone `hermes --tui`
-            # keeps real _stdio and never hits this branch.
             session["transport"] = _detached_ws_transport
             detached += 1
     return reaped, detached
