@@ -1208,12 +1208,11 @@ def _close_sessions_for_transport(
     ``_close_session_by_id`` path, and re-point the rest back to stdio so later
     emits don't hit a dead socket.
 
-    Non-flagged detached sessions are handed to the grace-windowed WS-orphan
-    reaper (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume
-    that re-binds a live transport cancels the reap, otherwise the orphan is
-    torn down through the same idempotent ``_teardown_session`` path. This is
-    the single WS-disconnect teardown entry point — there is no second
-    independent reap loop in ``handle_ws``.
+    Non-flagged detached sessions are parked on the drop sentinel so later
+    emits don't hit a dead socket. Last-client WS drop (phone backgrounded,
+    second desktop asleep) is not a teardown. The idle-TTL reaper still
+    collects abandoned sessions; sidecar/dashboard sessions that set
+    close_on_disconnect are reaped immediately via ``_close_session_by_id``.
 
     A peer that was only VIEWING a session (Desktop still owns it while mobile
     watches) is simply detached from the fan-out: its departure must not reap
@@ -1254,15 +1253,14 @@ def _close_sessions_for_transport(
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
         else:
-            # Point detached sessions at the drop sentinel (NOT real stdio) so
-            # _ws_session_is_orphaned recognizes them and the grace-reap can
-            # actually fire; a standalone `hermes --tui` keeps real _stdio.
+            # Park on the drop sentinel. Do not 20s-orphan-reap: a phone or
+            # second desktop is just another device. Last-client WS drop is
+            # not permission to tear down the Mac-side turn. Sidecar/tool
+            # sessions opt into close_on_disconnect above; idle TTL still
+            # collects truly abandoned sessions. A standalone `hermes --tui`
+            # keeps real _stdio and never hits this branch.
             session["transport"] = _detached_ws_transport
             detached += 1
-            try:
-                _schedule_ws_orphan_reap(sid)
-            except Exception:
-                pass
     return reaped, detached
 
 
