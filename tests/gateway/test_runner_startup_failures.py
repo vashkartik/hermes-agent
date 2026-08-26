@@ -181,6 +181,10 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
     )
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
     monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
+    monkeypatch.setattr(
+        "gateway.run._replace_target_belongs_to_other_profile",
+        lambda _pid: False,
+    )
     monkeypatch.setattr("time.sleep", lambda _: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
