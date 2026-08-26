@@ -16741,6 +16741,37 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
         server._sessions.clear()
 
 
+def test_close_sessions_for_transport_keeps_durable_device_running_without_orphan_reap(monkeypatch):
+    """Last mobile WS drop must not kill a durable Mac-side chat session."""
+    scheduled = []
+    closed = []
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled.append)
+    monkeypatch.setattr(
+        server,
+        "_close_session_by_id",
+        lambda sid, *, end_reason: closed.append((sid, end_reason)) or True,
+    )
+    transport = object()
+    server._sessions.clear()
+    server._sessions["phone"] = {
+        "transport": transport,
+        "close_on_disconnect": False,
+        "running": True,
+    }
+    try:
+        reaped, detached = server._close_sessions_for_transport(
+            transport, end_reason="ws_disconnect"
+        )
+        assert reaped == 0
+        assert detached == 1
+        assert closed == []
+        assert scheduled == []
+        assert server._sessions["phone"]["transport"] is server._detached_ws_transport
+        assert server._sessions["phone"]["running"] is True
+    finally:
+        server._sessions.clear()
+
+
 def test_session_create_records_close_on_disconnect_flag(monkeypatch):
     monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
     server._sessions.clear()

@@ -128,7 +128,7 @@ class SessionStream:
     __slots__ = (
         "sid", "session_key", "profile_key", "_lock", "_subs", "_seq",
         "_replay", "_replay_floor", "_turn_id", "_turn_request_id",
-        "_turn_terminal_seen", "_touched_at",
+        "_turn_terminal_seen", "_touched_at", "_ever_attached",
     )
 
     def __init__(self, sid: str, *, session_key: str = "", profile_key: str = "") -> None:
@@ -146,6 +146,7 @@ class SessionStream:
         self._turn_request_id: Optional[str] = None
         self._turn_terminal_seen = False
         self._touched_at = time.time()
+        self._ever_attached = False
 
     # -- membership ---------------------------------------------------------
 
@@ -208,6 +209,7 @@ class SessionStream:
             if existing is None:
                 existing = Subscriber(transport=transport, client=client)
                 self._subs.append(existing)
+                self._ever_attached = True
             elif client:
                 existing.client = client
             # Opting into the contract is sticky: a client cannot drop back to
@@ -290,7 +292,26 @@ class SessionStream:
         event_type = params.get("type")
         with self._lock:
             if not self._subs:
-                return None
+                # Never had a device attached → stdio/Ink fallback.
+                if not self._ever_attached:
+                    return None
+                # Last device dropped. Mac-side turn keeps going; record
+                # frames so the device can replay on reconnect.
+                if event_type in TERMINAL_EVENT_TYPES:
+                    if self._turn_terminal_seen:
+                        return True
+                    self._turn_terminal_seen = True
+                self._seq += 1
+                seq = self._seq
+                stamped = self._stamp(frame, seq)
+                self._touched_at = time.time()
+                if REPLAY_FRAMES:
+                    if len(self._replay) == self._replay.maxlen and self._replay:
+                        self._replay_floor = (self._replay[0].get("params") or {}).get("seq") or 0
+                    self._replay.append(stamped)
+                    if self._replay_floor == 0 and self._replay:
+                        self._replay_floor = (self._replay[0].get("params") or {}).get("seq") or 0
+                return False
             if event_type in TERMINAL_EVENT_TYPES:
                 if self._turn_terminal_seen:
                     logger.debug(
