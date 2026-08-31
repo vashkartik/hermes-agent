@@ -40,10 +40,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_FILE = REPO_ROOT / ".ace" / "upstream-main.sha"
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
-UNSUPPORTED_RUNNERS = {
-    "ubuntu-latest-32-core",
-    "ubuntu-latest-96-core",
-}
+UNSUPPORTED_RUNNER_PATTERN = re.compile(
+    r"^[A-Za-z0-9_-]+-latest-[0-9]+-core$"
+)
 
 # How many ancestors of the recorded baseline to score. A sync that recorded a
 # mid-range commit shows up within a handful of steps; scoring the whole
@@ -146,14 +145,33 @@ def test_workflows_do_not_require_unsupported_large_runners():
         elif isinstance(value, str):
             yield value
 
+    nested_probe = {
+        "matrix": {
+            "include": [
+                {"runner": "ubuntu-latest"},
+                {"runner": "ubuntu-latest-32-core"},
+                {"runner": "windows-latest"},
+                {"runner": "windows-latest-32-core"},
+                {"runner": "macos-latest"},
+            ]
+        }
+    }
+    assert sorted(
+        scalar
+        for scalar in scalar_strings(nested_probe)
+        if UNSUPPORTED_RUNNER_PATTERN.fullmatch(scalar)
+    ) == ["ubuntu-latest-32-core", "windows-latest-32-core"]
+
     offenders = {}
     for workflow in sorted(WORKFLOWS_DIR.rglob("*.y*ml")):
         document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
         assert isinstance(document, dict), f"invalid workflow document: {workflow}"
         labels = sorted(
-            label
-            for label in UNSUPPORTED_RUNNERS
-            if any(label in scalar for scalar in scalar_strings(document))
+            {
+                scalar
+                for scalar in scalar_strings(document)
+                if UNSUPPORTED_RUNNER_PATTERN.fullmatch(scalar)
+            }
         )
         if labels:
             offenders[workflow.relative_to(REPO_ROOT).as_posix()] = labels
