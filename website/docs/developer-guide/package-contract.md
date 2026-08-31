@@ -44,7 +44,7 @@ Every family's manifest normalizes into the same envelope
 | description | `description` | `description` (≤ 60 chars, ends with `.`) | `description` | `description` |
 | provenance | `author`, `license`, `homepage` | `author`, `license`, `metadata.hermes.homepage` / `upstream` / `credits` / `supersedes` / `related_docs` | `source` (catalog policy: presence = Nous approval) | — |
 | platform | `platforms` (optional) | `platforms` (required) | — | — |
-| capability | `kind`, `capabilities`, `provides_*`, `hooks` | `metadata.hermes.requires_toolsets` / `fallback_for_*` | `transport.type`, `auth.type` | `tab`, `slots` |
+| capability | `kind`, `capabilities`, `provides_*`, `hooks` | `metadata.hermes.requires_toolsets` / `fallback_for_*` / `session_platforms` | `transport.type`, `auth.type`, `suggest` | `tab`, `slots` |
 | dependencies | `pip_dependencies` / `python_dependencies`, `requires_plugins`, `requires_env` / `optional_env`, `external_dependencies` | `dependencies` (pip, declared-only), `prerequisites.{env_vars,commands}`, `required_environment_variables`, `required_credential_files` | `auth.env`, `install` | — |
 | entrypoint | `__init__.py` `register(ctx)` (standalone/backend); family discovery otherwise | SKILL.md body | `transport.command` / `transport.url` | `entry` / `css` / `api` (relative, inside `dashboard/`) |
 
@@ -70,7 +70,7 @@ category's routing is a `kind-family-mismatch` error.
 | `description-too-long` | error (skills) | breaks the 60-char system-prompt budget |
 | `missing-author` / `missing-license` / `missing-platforms` | warning (plugins) / error (skills) | provenance/platform gaps |
 | `duplicate-id` | error | identity collision within a family (skill names are global across tiers; plugin `name` may repeat across categories because the key is the identity) |
-| `orphan-package` | error | a directory under a family root that is neither a package, a category, nor documented infrastructure (`KNOWN_INFRASTRUCTURE`) |
+| `orphan-package` | error | a directory under a family root that is neither a package, a category, nor documented infrastructure (`KNOWN_INFRASTRUCTURE`). Build residue — a directory whose whole subtree is caches (`__pycache__`) or the empty directories git leaves when tracked files move away — is skipped, not reported: it is not something an author can fix, and a fresh CI checkout would not see it. A directory with any real content still reports. |
 | `unknown-field` / `unknown-metadata` | warning | field no consumer reads (forward-compat surface at runtime; zero-tolerance for source-owned packages in CI) |
 | `unsafe-path` | error | manifest path escaping the package (absolute, drive letter, `..`) |
 | `unresolved-entrypoint` | error | missing `__init__.py` / `register(ctx)`, empty SKILL.md body, transport without command/url, dashboard entry that doesn't exist |
@@ -143,6 +143,12 @@ migrations (idempotent; `--check` reports without writing):
   omits it (`kind-family-mismatch`);
 - rename `metadata.hermes.upstream_skill` → `upstream`;
 - drop dead single-line fields with no consumer (`title`, `authors`).
+
+A field with no consumer but an established consumed equivalent is
+reported for manual migration rather than guessed — e.g.
+`required_commands:` (read by nothing; the same-named key in
+`tools/skills_tool.py` is a constant `[]` in the response payload) belongs
+under `prerequisites.commands:`, which the setup flow actually reads.
 
 Everything else is reported as *needs manual migration* — e.g. folding a
 dead `triggers:` list into the body's `## When to Use` section, or
