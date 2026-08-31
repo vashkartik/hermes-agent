@@ -11,7 +11,7 @@ writes a malformed / mid-window value, the drift counter reports a number that
 looks alarming (or reassuring) but means nothing, and the next sync computes
 its range from the wrong base.
 
-These tests pin the two properties that make the recorded value trustworthy:
+These tests pin the properties that make the recorded value trustworthy:
 
 1. **Format.** Exactly one 40-hex commit id. Always checked.
 2. **Minimality.** No ancestor may explain this tree better than the recorded
@@ -19,6 +19,12 @@ These tests pin the two properties that make the recorded value trustworthy:
    the final upstream commit. Checked only when the upstream objects are
    actually present locally, so CI without an ``upstream`` remote skips instead
    of failing.
+3. **Exact merge provenance.** Before the sync branch is squash-merged, the
+   marker must equal the official second parent of its latest
+   ``Merge Nous upstream ...`` commit. This is the exact check that rejects a
+   one-commit-behind marker even when the protected overlay makes tree-distance
+   scores tie. After a squash removes that ancestry, minimality remains the
+   available fallback.
 
 Verified 2026-08-03 for ``ace/patches`` @ d2ecf452 ("Sync current Nous Hermes
 main into Ace patches (#14)"): scanning all 1341 upstream commits in the
@@ -73,6 +79,25 @@ def _differing_files(a: str, b: str) -> int:
     return len([line for line in result.stdout.splitlines() if line.strip()])
 
 
+def _latest_unsquashed_upstream_parent() -> str | None:
+    """Return the official parent of the latest protected upstream merge."""
+    result = _git(
+        "log",
+        "--first-parent",
+        "--merges",
+        "--format=%P%x00%s",
+        "HEAD",
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parents_text, separator, subject = line.partition("\x00")
+        parents = parents_text.split()
+        if separator and subject.startswith("Merge Nous upstream ") and len(parents) == 2:
+            return parents[1]
+    return None
+
+
 def _scalar_strings(value):
     if isinstance(value, dict):
         for key, child in value.items():
@@ -123,6 +148,17 @@ def test_baseline_is_not_a_fork_commit(recorded_sha: str):
     assert "Sync current Nous Hermes main" not in subject, (
         "baseline points at a fork squash-sync commit, not the upstream commit "
         f"it synced from: {subject!r}"
+    )
+
+
+def test_baseline_matches_latest_unsquashed_upstream_parent(recorded_sha: str):
+    """A sync branch must record its exact official merge parent, not its parent."""
+    upstream_parent = _latest_unsquashed_upstream_parent()
+    if upstream_parent is None:
+        pytest.skip("upstream sync merge ancestry was removed by squash integration")
+    assert recorded_sha == upstream_parent, (
+        f"baseline {recorded_sha[:12]} does not match the exact official parent "
+        f"{upstream_parent[:12]} of the latest upstream sync merge"
     )
 
 
