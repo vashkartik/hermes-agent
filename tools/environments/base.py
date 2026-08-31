@@ -25,6 +25,12 @@ from typing import IO, Callable, Iterable, Protocol
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
+from tools.environments.path_utils import (
+    _SANDBOX_DIR_HASH_LEN,
+    _SANDBOX_DIR_MAX_LEN,
+    _SANDBOX_DIR_UNSAFE_RE,
+    sanitize_task_id_for_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -529,7 +535,8 @@ def _cwd_marker(session_id: str) -> str:
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -573,6 +580,7 @@ def _export_dump_excluding_session_vars(
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "${!HERMES_BROWSER_CONTROL_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers
         # (re-exported by every _wrap_command with outer-harness-preserving
         # ${VAR:-default} semantics).  Persisting them into the snapshot
@@ -602,6 +610,13 @@ class BaseEnvironment(ABC):
 
     # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
     _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
+
+    # True only when commands execute on the SAME host as the Hermes process
+    # (LocalEnvironment). Controller-host facts (sys.platform, Path.home())
+    # only describe the execution target when this is True — remote/container
+    # backends must not inherit controller-side platform behavior (e.g. the
+    # macOS TCC search pruning in tools/file_operations.py).
+    is_local: bool = False
 
     # Snapshot creation timeout (override for slow cold-starts).
     _snapshot_timeout: int = 30
@@ -915,6 +930,16 @@ class BaseEnvironment(ABC):
         parts.append(
             'export AI_AGENT="${AI_AGENT:-hermes-agent}" '
             'HERMES_AGENT="${HERMES_AGENT:-true}"'
+        )
+
+        # Non-interactive pager defaults: git log/diff/branch and similar
+        # pager-happy tools hang a captured (non-TTY writing to a pipe is
+        # fine, but PTY mode IS a TTY) or PTY-backed command waiting for `q`.
+        # GIT_PAGER=cat neutralizes git specifically; PAGER=cat catches the
+        # long tail (man, systemctl, psql, ...). ${VAR:-default} semantics:
+        # a user who exported their own pager in the session keeps it.
+        parts.append(
+            'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"'
         )
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
@@ -1364,6 +1389,10 @@ class BaseEnvironment(ABC):
         if cwd_path:
             self.cwd = cwd_path
             result["cwd_observed"] = True
+            # Keep the observation on this command's result as well as on the
+            # shared environment. Concurrent callers must not read self.cwd
+            # after another command has already updated it.
+            result["cwd"] = cwd_path
 
         # Strip the marker line AND the \n we injected before it.
         # The wrapper emits: printf '\n__MARKER__%s__MARKER__\n'

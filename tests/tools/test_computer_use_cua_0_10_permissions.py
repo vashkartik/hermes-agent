@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -174,13 +175,17 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
     stopped = SimpleNamespace(returncode=0, stdout="", stderr="")
 
     daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
-    with patch.object(
+    with patch.object(cua_backend.sys, "platform", "linux"), patch.object(
         cua_backend,
         "_resolve_mcp_invocation",
         return_value=("/opt/cua-driver", ["mcp"]),
-    ), patch.object(cua_backend.sys, "platform", "linux"), patch.object(
-        cua_backend.subprocess, "Popen", return_value=process
-    ) as popen, patch.object(
+    ), patch.object(
+        # This test pins the socket/ack contract, not overlay policy. Pin the
+        # policy off so the environment-dependent auto-detect (headless CI vs
+        # Wayland dev box) can't add a `--help` capability-probe subprocess.run
+        # call that the fixed two-entry side_effect below doesn't budget for.
+        cua_backend, "_cua_no_overlay", return_value=False,
+    ), patch.object(cua_backend.subprocess, "Popen", return_value=process) as popen, patch.object(
         cua_backend.subprocess, "run", side_effect=[status, stopped]
     ):
         daemon.start()
@@ -199,70 +204,6 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
     assert proxy_args == ["mcp", "--embedded", "--socket", daemon.socket_path]
 
 
-def test_unrestricted_macos_daemon_uses_launchservices_driver_identity():
-    from tools.computer_use import cua_backend
-
-    process = Mock()
-    process.poll.return_value = None
-    process.stderr = []
-    process.wait.return_value = 0
-    status = SimpleNamespace(returncode=0, stdout="running", stderr="")
-    stopped = SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
-    with patch.object(
-        cua_backend,
-        "_resolve_mcp_invocation",
-        return_value=("/Applications/CuaDriver.app/Contents/MacOS/cua-driver", ["mcp"]),
-    ), patch.object(cua_backend.sys, "platform", "darwin"), patch.object(
-        cua_backend,
-        "_macos_cua_app_bundle",
-        return_value="/Applications/CuaDriver.app",
-    ), patch.object(
-        cua_backend.subprocess, "Popen", return_value=process
-    ) as popen, patch.object(
-        cua_backend.subprocess, "run", side_effect=[status, stopped]
-    ):
-        daemon.start()
-        command = popen.call_args.args[0]
-        env = popen.call_args.kwargs["env"]
-        proxy_command, proxy_args = daemon.proxy_invocation()
-        daemon.stop()
-
-    assert command[:5] == ["/usr/bin/open", "-W", "-g", "-j", "-n"]
-    assert "/Applications/CuaDriver.app" in command
-    assert command[command.index("/Applications/CuaDriver.app") + 1] == "--args"
-    daemon_args = command[command.index("--args") + 1 :]
-    assert daemon_args[:2] == ["serve", "--embedded"]
-    assert daemon_args[daemon_args.index("--permission-mode") + 1] == "unrestricted"
-    assert "--dangerously-bypass-approvals" in daemon_args
-    assert f"{cua_backend._CUA_TELEMETRY_ENV_VAR}=0" in command
-    assert "CUA_DRIVER_PERMISSION_MODE=unrestricted" in command
-    assert "CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS=1" in command
-    assert env[cua_backend._CUA_TELEMETRY_ENV_VAR] == "0"
-    assert proxy_command == "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
-    assert proxy_args == ["mcp", "--embedded", "--socket", daemon.socket_path]
-
-
-def test_unrestricted_macos_daemon_refuses_direct_binary_without_app_bundle():
-    from tools.computer_use import cua_backend
-
-    daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
-    with patch.object(
-        cua_backend,
-        "_resolve_mcp_invocation",
-        return_value=("/tmp/cua-driver", ["mcp"]),
-    ), patch.object(cua_backend.sys, "platform", "darwin"), patch.object(
-        cua_backend,
-        "_macos_cua_app_bundle",
-        return_value=None,
-    ), patch.object(cua_backend.subprocess, "Popen") as popen:
-        with pytest.raises(RuntimeError, match="signed CuaDriver.app"):
-            daemon.start()
-
-    popen.assert_not_called()
-
-
 def test_standard_backend_does_not_spawn_an_embedded_daemon():
     from tools.computer_use.cua_backend import CuaDriverBackend
 
@@ -273,56 +214,77 @@ def test_standard_backend_does_not_spawn_an_embedded_daemon():
     assert unrestricted._embedded_daemon is not None
 
 
-def test_standard_existing_profile_grant_owns_private_macos_runtime():
-    from tools.computer_use.cua_backend import _standard_runtime_launch_args
+def test_retired_browser_grant_cannot_change_standard_runtime(tmp_path, monkeypatch):
+    from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
 
-    args, socket_path = _standard_runtime_launch_args(
-        ["mcp"],
-        grant_existing_profile=True,
-        platform="darwin",
-        socket_path="/tmp/hermes-cua-test.sock",
+    (tmp_path / "config.yaml").write_text(
+        "computer_use:\n  grant_existing_profile: true\n",
+        encoding="utf-8",
     )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session = _CuaDriverSession(_AsyncBridge())
+    captured = {}
 
-    assert args == [
-        "mcp",
-        "--grant",
-        "existing-profile",
-        "--socket",
-        "/tmp/hermes-cua-test.sock",
-    ]
-    assert socket_path == "/tmp/hermes-cua-test.sock"
+    async def drive_lifecycle():
+        def capture_params(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch(
+            "tools.computer_use.cua_backend.resolve_cua_driver_cmd",
+            return_value="/opt/cua-driver",
+        ), patch(
+            "tools.computer_use.cua_backend._resolve_mcp_invocation",
+            return_value=("/opt/cua-driver", ["mcp"]),
+        ), patch(
+            "mcp.StdioServerParameters", side_effect=capture_params
+        ), patch(
+            "mcp.client.stdio.stdio_client"
+        ) as stdio_client, patch(
+            "mcp.ClientSession"
+        ) as client_session:
+            stdio_client.return_value.__aenter__ = AsyncMock(
+                return_value=(MagicMock(), MagicMock())
+            )
+            stdio_client.return_value.__aexit__ = AsyncMock(return_value=None)
+            live_session = MagicMock()
+            live_session.initialize = AsyncMock()
+            live_session.list_tools = AsyncMock(return_value=MagicMock(tools=[]))
+            client_session.return_value.__aenter__ = AsyncMock(
+                return_value=live_session
+            )
+            client_session.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            async def stop_when_ready():
+                while session._shutdown_event is None:
+                    await asyncio.sleep(0)
+                session._shutdown_event.set()
+
+            stop_task = asyncio.create_task(stop_when_ready())
+            try:
+                await session._lifecycle_coro()
+            finally:
+                await stop_task
+
+    asyncio.run(drive_lifecycle())
+
+    assert captured["command"] == "/opt/cua-driver"
+    assert captured["args"] == ["mcp"]
 
 
-def test_standard_existing_profile_grant_stays_in_process_off_macos():
-    from tools.computer_use.cua_backend import _standard_runtime_launch_args
-
-    args, socket_path = _standard_runtime_launch_args(
-        ["mcp"], grant_existing_profile=True, platform="linux"
-    )
-
-    assert args == ["mcp", "--grant", "existing-profile"]
-    assert socket_path is None
-
-
-def test_transport_reset_invalidates_native_and_browser_capabilities():
+def test_transport_reset_invalidates_native_capabilities():
     from tools.computer_use.cua_backend import CuaDriverBackend
 
     backend = CuaDriverBackend(permission_mode="standard")
     backend._active_pid = 10
     backend._active_window_id = 20
     backend._snapshot_tokens = {1: "old-token"}
-    backend._typed_browser.state.pid = 10
-    backend._typed_browser.state.window_id = 20
-    backend._typed_browser.state.target_id = "old-target"
-    backend._typed_browser.state.refs = {"old-ref": {"click"}}
 
     backend._handle_transport_reset()
 
     assert backend._active_pid is None
     assert backend._active_window_id is None
     assert backend._snapshot_tokens == {}
-    assert backend._typed_browser.state.target_id is None
-    assert backend._typed_browser.state.refs == {}
 
 
 # ── the escalation is at least audible ──────────────────────────────────
