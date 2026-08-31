@@ -863,16 +863,10 @@ def _scan_gateway_pids(
                     pass
 
             if not _found_via_proc:
-                # BSD/macOS ps rejects the bare "eww" argument group when
-                # combined with -A; use -E (env display) + ww there instead.
-                # Without env in the output, profile gateways launched with
-                # HERMES_HOME in env (e.g. launchd jobs) are invisible to the
-                # scan and never restarted after `hermes update`.
-                ps_args = (
-                    ["ps", "-AEww", "-o", "pid=,command="]
-                    if sys.platform == "darwin"
-                    else ["ps", "-A", "eww", "-o", "pid=,command="]
-                )
+                # Portable across BSD/macOS and procps: select every process,
+                # keep command lines wide, and request only PID + command.
+                # This form does not request or expose process environments.
+                ps_args = ["ps", "-Aww", "-o", "pid=,command="]
                 result = subprocess.run(
                     ps_args,
                     capture_output=True,

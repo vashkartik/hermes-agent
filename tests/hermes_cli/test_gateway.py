@@ -441,7 +441,9 @@ def test_gateway_install_noninteractive_skips_legacy_unit_prompt(monkeypatch, tm
 
 
 def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkeypatch):
-    monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+    monkeypatch.setattr(
+        gateway, "_get_service_pids", lambda all_profiles=False: set()
+    )
     monkeypatch.setattr(gateway, "is_windows", lambda: False)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
 
@@ -455,7 +457,7 @@ def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkey
     monkeypatch.setattr(gateway.os, "listdir", _no_proc_listdir)
 
     def fake_run(cmd, **kwargs):
-        if cmd[:4] in (["ps", "-A", "eww", "-o"], ["ps", "-AEww", "-o", "pid=,command="]):
+        if cmd == ["ps", "-Aww", "-o", "pid=,command="]:
             return SimpleNamespace(returncode=1, stdout="", stderr="ps failed")
         if cmd[:3] == ["ps", "-o", "ppid="]:
             # _get_ancestor_pids() walks up the tree; return "no parent" so
