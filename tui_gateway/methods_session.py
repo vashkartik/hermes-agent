@@ -467,8 +467,12 @@ def _(rid, params: dict) -> dict:
                     # unpersisted sibling of the storm-killer paths (#91276).
                     transport = current_transport()
                     if transport is not None:
+                        became_owner = subscribe_session(
+                            live_sid, transport, owner=True
+                        )
                         with live.setdefault("history_lock", threading.Lock()):
-                            live["transport"] = transport
+                            if became_owner:
+                                live["transport"] = transport
                             live.setdefault("viewers", {})[transport] = time.time()
                     _cancel_ws_orphan_reap(live_sid)
                     history = live.get("history") or []

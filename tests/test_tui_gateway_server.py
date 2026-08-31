@@ -5587,6 +5587,134 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         server._pending_ws_reaps.pop("lazy-sid", None)
 
 
+def test_lazy_unpersisted_resume_preserves_explicit_owner_steer_authority(
+    monkeypatch,
+):
+    """A viewer resuming a never-persisted session must not become its owner."""
+    cancelled = []
+
+    class _Timer:
+        def __init__(self, _delay, fn):
+            self.fn = fn
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            cancelled.append(self)
+
+    class _LiveTransport:
+        def write(self, *args, **kwargs):
+            return True
+
+    owner = _LiveTransport()
+    viewer = _LiveTransport()
+    session = _session(
+        session_key="stored-owner-lazy",
+        transport=server._detached_ws_transport,
+        running=False,
+        history=[],
+        profile_home=None,
+    )
+    captured = []
+
+    def _steer_subagent(subagent_id, text, **authority):
+        captured.append((subagent_id, text, authority))
+        return True
+
+    from tools import delegate_tool
+
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: types.SimpleNamespace(
+            get_session=lambda _target: None,
+            get_session_by_title=lambda _target: None,
+        ),
+    )
+    monkeypatch.setattr(delegate_tool, "steer_subagent", _steer_subagent)
+    server.reset_session_streams()
+    server._sessions["owner-lazy-sid"] = session
+
+    resume_request = {
+        "method": "session.resume",
+        "params": {
+            "session_id": "stored-owner-lazy",
+            "omit_messages": True,
+        },
+    }
+    try:
+        assert server.subscribe_session(
+            "owner-lazy-sid", owner, owner=True, explicit=True
+        ) is True
+        server._schedule_ws_orphan_reap("owner-lazy-sid")
+        owner_resume = _dispatch_sync(
+            {"id": "owner-resume", **resume_request}, transport=owner
+        )
+
+        assert server.subscribe_session(
+            "owner-lazy-sid", viewer, owner=True, explicit=True
+        ) is False
+        server._schedule_ws_orphan_reap("owner-lazy-sid")
+        viewer_resume = _dispatch_sync(
+            {"id": "viewer-resume", **resume_request}, transport=viewer
+        )
+
+        assert owner_resume["result"]["session_id"] == "owner-lazy-sid"
+        assert viewer_resume["result"]["session_id"] == "owner-lazy-sid"
+        assert server.session_owner("owner-lazy-sid") is owner
+        assert session["transport"] is owner
+        assert owner in session["viewers"]
+        assert viewer in session["viewers"]
+        assert "owner-lazy-sid" not in server._pending_ws_reaps
+        assert len(cancelled) == 2
+
+        owner_steer = _dispatch_sync(
+            {
+                "id": "owner-steer",
+                "method": "subagent.steer",
+                "params": {
+                    "session_id": "owner-lazy-sid",
+                    "subagent_id": "child-1",
+                    "text": "owner direction",
+                },
+            },
+            transport=owner,
+        )
+        viewer_steer = _dispatch_sync(
+            {
+                "id": "viewer-steer",
+                "method": "subagent.steer",
+                "params": {
+                    "session_id": "owner-lazy-sid",
+                    "subagent_id": "child-1",
+                    "text": "viewer injection",
+                },
+            },
+            transport=viewer,
+        )
+
+        assert owner_steer["result"]["status"] == "queued"
+        assert viewer_steer["result"]["status"] == "rejected"
+        assert captured == [
+            (
+                "child-1",
+                "owner direction",
+                {
+                    "owner_session_id": "owner-lazy-sid",
+                    "owner_transport": owner,
+                    "owner_session_record": session,
+                },
+            )
+        ]
+    finally:
+        server._sessions.pop("owner-lazy-sid", None)
+        server._pending_ws_reaps.pop("owner-lazy-sid", None)
+        server.reset_session_streams()
+
+
 def test_ws_orphan_reap_still_fires_when_never_resumed(monkeypatch):
     """Nobody re-resumes: the reap fires normally and unregisters its Timer."""
     callbacks = []
@@ -14396,36 +14524,55 @@ def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
     """A send with no persistable store must fail the RPC with a real error
     (desktop maps it to a toast) instead of streaming the message into a
     store that will never save it (#98924)."""
-    class _Lease:
+    class _ActiveLease:
         def __init__(self):
             self.release_count = 0
 
         def release(self):
             self.release_count += 1
 
-    leases = []
+    class _UpdateLease:
+        def __init__(self):
+            self.release_count = 0
+
+        def release(self):
+            self.release_count += 1
+
+    active_leases = []
+    update_leases = []
+
+    def _claim_active_session_slot(*_args, **_kwargs):
+        lease = _ActiveLease()
+        active_leases.append(lease)
+        return lease, None
 
     def _acquire_turn(kind):
         assert kind == "desktop"
-        lease = _Lease()
-        leases.append(lease)
+        lease = _UpdateLease()
+        update_leases.append(lease)
         return lease
 
     from hermes_cli import update_guard
 
     monkeypatch.setattr(update_guard, "acquire_turn", _acquire_turn)
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", _claim_active_session_slot
+    )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {}})
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_db_error", "utf-8 decode failure")
-    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
 
     session = _session()
+    established_lease = _ActiveLease()
+    established_session = _session(active_session_lease=established_lease)
     server._sessions["lost-sid"] = session
+    server._sessions["established-sid"] = established_session
     server.request_ledger().forget_session("lost-sid")
+    server.request_ledger().forget_session("established-sid")
     try:
-        resp = server.handle_request(
+        first = server.handle_request(
             {
-                "id": "lost",
+                "id": "lost-first",
                 "method": "prompt.submit",
                 "params": {
                     "session_id": "lost-sid",
@@ -14434,19 +14581,10 @@ def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
                 },
             }
         )
-
         record = server.request_ledger().status("lost-sid", "lost-request-1")
-        duplicate = server.handle_request(
-            {
-                "id": "lost-duplicate",
-                "method": "prompt.submit",
-                "params": {
-                    "session_id": "lost-sid",
-                    "text": "will vanish",
-                    "request_id": "lost-request-1",
-                },
-            }
-        )
+        assert "active_session_lease" not in session
+        assert "_update_turn_lease" not in session
+
         retry = server.handle_request(
             {
                 "id": "lost-retry",
@@ -14458,23 +14596,54 @@ def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
                 },
             }
         )
+        assert "active_session_lease" not in session
+        assert "_update_turn_lease" not in session
+
+        established = server.handle_request(
+            {
+                "id": "established",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "established-sid",
+                    "text": "will vanish",
+                    "request_id": "established-request",
+                },
+            }
+        )
+        duplicate = server.handle_request(
+            {
+                "id": "established-duplicate",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "established-sid",
+                    "text": "will vanish",
+                    "request_id": "established-request",
+                },
+            }
+        )
     finally:
         server._sessions.pop("lost-sid", None)
+        server._sessions.pop("established-sid", None)
         server.request_ledger().forget_session("lost-sid")
+        server.request_ledger().forget_session("established-sid")
 
-    assert resp["error"]["code"] == 5072
-    assert "session storage unavailable" in resp["error"]["message"]
+    assert first["error"]["code"] == 5072
+    assert "session storage unavailable" in first["error"]["message"]
+    assert retry["error"]["code"] == 5072
     assert session["running"] is False
     assert session["inflight_turn"] is None
     assert session["last_active"] > 0
-    assert "_update_turn_lease" not in session
     assert record["status"] == "error"
-    assert record["result"] == resp["error"]
+    assert record["result"] == first["error"]
+    assert [lease.release_count for lease in active_leases] == [1, 1]
+    assert [lease.release_count for lease in update_leases] == [1, 1, 1]
+
+    assert established["error"]["code"] == 5072
+    assert established_session["active_session_lease"] is established_lease
+    assert established_lease.release_count == 0
+    assert "_update_turn_lease" not in established_session
     assert duplicate["result"]["status"] == "duplicate"
     assert duplicate["result"]["request_status"] == "error"
-    assert len(leases) == 2
-    assert [lease.release_count for lease in leases] == [1, 1]
-    assert retry["error"]["code"] == 5072
 
 
 @pytest.mark.real_agent_prewarm

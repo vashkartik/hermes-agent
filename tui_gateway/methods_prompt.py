@@ -423,8 +423,13 @@ def _(rid, params: dict) -> dict:
                             )
                             + "Update Hermes Desktop to continue it.",
                         )
+    active_session_lease_before = session.get("active_session_lease")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    active_session_lease = session.get("active_session_lease")
+    acquired_active_session_lease = (
+        active_session_lease_before is None and active_session_lease is not None
+    )
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -1042,6 +1047,11 @@ def _(rid, params: dict) -> dict:
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
             _release_update_turn_if_idle(session)
+            if (
+                acquired_active_session_lease
+                and session.get("active_session_lease") is active_session_lease
+            ):
+                _release_active_session_slot(session)
             return _settle_request_response(sid, request_id, response)
         # A branch becomes real here: copy its parent's transcript into the row so it
         # resumes with full context (the agent won't persist the seed itself).
