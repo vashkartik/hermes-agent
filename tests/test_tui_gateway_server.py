@@ -5246,6 +5246,95 @@ def test_live_session_payload_registers_transport_as_viewer():
     assert t in session.get("viewers", {})
 
 
+def test_live_resume_keeps_subagent_steer_authority_with_explicit_owner(
+    monkeypatch,
+):
+    """A second explicit resume is a viewer, not the delegation owner.
+
+    ``_live_session_payload`` reattaches both clients to the stream. Its legacy
+    transport mirror must keep naming the actual stream owner because that
+    exact runtime artifact authorizes ``subagent.steer``.
+    """
+
+    class _LiveTransport:
+        def write(self, *args, **kwargs):
+            return True
+
+    owner = _LiveTransport()
+    viewer = _LiveTransport()
+    session = _session(transport=server._detached_ws_transport, running=False)
+    server._sessions["steer-owner-sid"] = session
+    captured = []
+
+    def _steer_subagent(subagent_id, text, **authority):
+        captured.append((subagent_id, text, authority))
+        return True
+
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "steer_subagent", _steer_subagent)
+    server.reset_session_streams()
+    try:
+        assert server.subscribe_session(
+            "steer-owner-sid", owner, owner=True, explicit=True
+        ) is True
+        server._live_session_payload(
+            "steer-owner-sid", session, transport=owner, omit_messages=True
+        )
+
+        assert server.subscribe_session(
+            "steer-owner-sid", viewer, owner=True, explicit=True
+        ) is False
+        server._live_session_payload(
+            "steer-owner-sid", session, transport=viewer, omit_messages=True
+        )
+
+        assert server.session_owner("steer-owner-sid") is owner
+        assert session["transport"] is owner
+
+        owner_response = _dispatch_sync(
+            {
+                "id": "owner-steer",
+                "method": "subagent.steer",
+                "params": {
+                    "session_id": "steer-owner-sid",
+                    "subagent_id": "child-1",
+                    "text": "check the owner path",
+                },
+            },
+            transport=owner,
+        )
+        viewer_response = _dispatch_sync(
+            {
+                "id": "viewer-steer",
+                "method": "subagent.steer",
+                "params": {
+                    "session_id": "steer-owner-sid",
+                    "subagent_id": "child-1",
+                    "text": "viewer injection",
+                },
+            },
+            transport=viewer,
+        )
+
+        assert owner_response["result"]["status"] == "queued"
+        assert viewer_response["result"]["status"] == "rejected"
+        assert captured == [
+            (
+                "child-1",
+                "check the owner path",
+                {
+                    "owner_session_id": "steer-owner-sid",
+                    "owner_transport": owner,
+                    "owner_session_record": session,
+                },
+            )
+        ]
+    finally:
+        server._sessions.pop("steer-owner-sid", None)
+        server.reset_session_streams()
+
+
 def test_ws_orphan_reap_spares_reattached_session(monkeypatch):
     """A session that rebinds a live transport is NOT considered orphaned."""
 
@@ -14307,24 +14396,85 @@ def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
     """A send with no persistable store must fail the RPC with a real error
     (desktop maps it to a toast) instead of streaming the message into a
     store that will never save it (#98924)."""
+    class _Lease:
+        def __init__(self):
+            self.release_count = 0
+
+        def release(self):
+            self.release_count += 1
+
+    leases = []
+
+    def _acquire_turn(kind):
+        assert kind == "desktop"
+        lease = _Lease()
+        leases.append(lease)
+        return lease
+
+    from hermes_cli import update_guard
+
+    monkeypatch.setattr(update_guard, "acquire_turn", _acquire_turn)
     monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {}})
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_db_error", "utf-8 decode failure")
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
 
-    server._sessions["lost-sid"] = _session()
+    session = _session()
+    server._sessions["lost-sid"] = session
+    server.request_ledger().forget_session("lost-sid")
     try:
         resp = server.handle_request(
             {
                 "id": "lost",
                 "method": "prompt.submit",
-                "params": {"session_id": "lost-sid", "text": "will vanish"},
+                "params": {
+                    "session_id": "lost-sid",
+                    "text": "will vanish",
+                    "request_id": "lost-request-1",
+                },
+            }
+        )
+
+        record = server.request_ledger().status("lost-sid", "lost-request-1")
+        duplicate = server.handle_request(
+            {
+                "id": "lost-duplicate",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "lost-sid",
+                    "text": "will vanish",
+                    "request_id": "lost-request-1",
+                },
+            }
+        )
+        retry = server.handle_request(
+            {
+                "id": "lost-retry",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "lost-sid",
+                    "text": "will vanish",
+                    "request_id": "lost-request-2",
+                },
             }
         )
     finally:
         server._sessions.pop("lost-sid", None)
+        server.request_ledger().forget_session("lost-sid")
 
     assert resp["error"]["code"] == 5072
     assert "session storage unavailable" in resp["error"]["message"]
+    assert session["running"] is False
+    assert session["inflight_turn"] is None
+    assert session["last_active"] > 0
+    assert "_update_turn_lease" not in session
+    assert record["status"] == "error"
+    assert record["result"] == resp["error"]
+    assert duplicate["result"]["status"] == "duplicate"
+    assert duplicate["result"]["request_status"] == "error"
+    assert len(leases) == 2
+    assert [lease.release_count for lease in leases] == [1, 1]
+    assert retry["error"]["code"] == 5072
 
 
 @pytest.mark.real_agent_prewarm

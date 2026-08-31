@@ -11430,18 +11430,20 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
+    became_owner = False
     if transport is not None:
         # Attach the resuming client to the fan-out. It takes ownership only
         # when nobody live holds it (reconnect); otherwise it joins as a viewer
         # so the device that already owns the session keeps streaming. Done
         # outside history_lock: subscribe_session touches the stream registry,
         # never this session's history.
-        subscribe_session(sid, transport, owner=True)
+        became_owner = subscribe_session(sid, transport, owner=True)
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
-            session["transport"] = transport
+            if became_owner:
+                session["transport"] = transport
             # Track every transport that has shown this session (multi-window:
             # pop-out windows each resume the same sid). The last viewer
             # becomes the transport on the disconnect path so closing a

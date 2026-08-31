@@ -1030,13 +1030,19 @@ def _(rid, params: dict) -> dict:
             # Store unavailable: failing the RPC is the only user-visible
             # signal — same principle as the disk-full path above (#98924).
             # _db_error carries the SessionDB open failure for the toast.
-            return _err(
+            response = _err(
                 rid,
                 5072,
                 "session storage unavailable: "
                 f"{_db_error or 'state.db could not be opened'} — the message "
                 "was not saved; repair state.db and try again",
             )
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+            _release_update_turn_if_idle(session)
+            return _settle_request_response(sid, request_id, response)
         # A branch becomes real here: copy its parent's transcript into the row so it
         # resumes with full context (the agent won't persist the seed itself).
         _persist_branch_seed(session)

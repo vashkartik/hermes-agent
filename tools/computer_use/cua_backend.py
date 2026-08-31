@@ -576,7 +576,8 @@ def _validate_cua_driver_app_signature(app_path: str) -> None:
 
     Launching via ``/usr/bin/open`` hands LaunchServices whatever bundle sits
     at the path, so the TCC-identity fix must not become a launcher for
-    arbitrary apps: require ``codesign -dv`` to report EXACTLY
+    arbitrary apps: first require strict deep signature-integrity verification,
+    then require ``codesign -dv`` to report EXACTLY
     ``Identifier=com.trycua.driver`` and an expected TeamIdentifier.
     ``TeamIdentifier=not set`` (unsigned/ad-hoc dev builds) is allowed only
     when ``computer_use.allow_unsigned_driver: true`` is set in config.yaml —
@@ -587,6 +588,23 @@ def _validate_cua_driver_app_signature(app_path: str) -> None:
     if not codesign:
         raise RuntimeError(
             "codesign is required to verify CuaDriver.app before launching it."
+        )
+    try:
+        verified = subprocess.run(
+            [codesign, "--verify", "--deep", "--strict", app_path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"could not verify CuaDriver.app signature integrity: {exc}"
+        ) from exc
+    if verified.returncode != 0:
+        detail = (verified.stderr or verified.stdout or "").strip()
+        raise RuntimeError(
+            f"CuaDriver.app at {app_path} failed code-signature integrity "
+            f"verification; refusing to launch it ({detail})"
         )
     try:
         proc = subprocess.run(
@@ -632,9 +650,14 @@ def _embedded_daemon_spawn_command(
     serve_args: List[str],
     *,
     platform: str,
+    env: Dict[str, str],
     app_path: Optional[str] = None,
 ) -> List[str]:
-    """Build the private-daemon launch while preserving macOS TCC identity."""
+    """Build the private-daemon launch while preserving macOS TCC identity.
+
+    LaunchServices does not forward ``env=`` from the ``open`` process into
+    the app, so explicitly forward only cua-driver's reviewed policy keys.
+    """
     if platform != "darwin":
         return [driver_cmd, *serve_args]
     resolved_app = app_path or _resolve_cua_driver_app_path(driver_cmd)
@@ -644,15 +667,20 @@ def _embedded_daemon_spawn_command(
             "Run `hermes computer-use install` to restore it."
         )
     _validate_cua_driver_app_signature(resolved_app)
-    return [
+    command = [
         "/usr/bin/open",
         "-n",
         "-g",
-        "-a",
-        resolved_app,
-        "--args",
-        *serve_args,
     ]
+    for name in (
+        _CUA_TELEMETRY_ENV_VAR,
+        "CUA_DRIVER_PERMISSION_MODE",
+        "CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS",
+    ):
+        if name in env:
+            command.extend(["--env", f"{name}={env[name]}"])
+    command.extend(["-a", resolved_app, "--args", *serve_args])
+    return command
 
 
 class _EmbeddedCuaDaemon:
@@ -806,6 +834,7 @@ class _EmbeddedCuaDaemon:
             self._command,
             serve_args,
             platform=sys.platform,
+            env=env,
         )
         self._process = subprocess.Popen(
             command,

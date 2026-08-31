@@ -27,9 +27,26 @@ def _codesign_proc(
     )
 
 
-def _patch_codesign(monkeypatch, proc):
+def _verify_proc(*, returncode: int = 0, stderr: str = ""):
+    return subprocess.CompletedProcess(
+        ["codesign", "--verify"],
+        returncode,
+        stdout="",
+        stderr=stderr,
+    )
+
+
+def _patch_codesign(monkeypatch, proc, *, verify_proc=None, calls=None):
     monkeypatch.setattr(cua_backend.shutil, "which", lambda name: "/usr/bin/codesign")
-    monkeypatch.setattr(cua_backend.subprocess, "run", lambda *args, **kwargs: proc)
+
+    def _run(command, **_kwargs):
+        if calls is not None:
+            calls.append(list(command))
+        if "--verify" in command:
+            return verify_proc if verify_proc is not None else _verify_proc()
+        return proc
+
+    monkeypatch.setattr(cua_backend.subprocess, "run", _run)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="macOS bundle paths use POSIX separators")
@@ -75,6 +92,53 @@ def test_driver_signature_accepts_official_team_ids(monkeypatch, team_id):
     _patch_codesign(monkeypatch, _codesign_proc(team_id=team_id))
 
     cua_backend._validate_cua_driver_app_signature("/Applications/CuaDriver.app")
+
+
+def test_driver_signature_verifies_integrity_before_reading_identity(monkeypatch):
+    calls = []
+    _patch_codesign(
+        monkeypatch,
+        _codesign_proc(team_id="YCK386LBJ7"),
+        calls=calls,
+    )
+
+    cua_backend._validate_cua_driver_app_signature("/Applications/CuaDriver.app")
+
+    assert calls == [
+        [
+            "/usr/bin/codesign",
+            "--verify",
+            "--deep",
+            "--strict",
+            "/Applications/CuaDriver.app",
+        ],
+        ["/usr/bin/codesign", "-dv", "/Applications/CuaDriver.app"],
+    ]
+
+
+def test_driver_signature_rejects_failed_integrity_verification(monkeypatch):
+    calls = []
+    _patch_codesign(
+        monkeypatch,
+        _codesign_proc(team_id="YCK386LBJ7"),
+        verify_proc=_verify_proc(returncode=1, stderr="sealed resource modified"),
+        calls=calls,
+    )
+
+    with pytest.raises(RuntimeError, match="integrity verification"):
+        cua_backend._validate_cua_driver_app_signature(
+            "/Applications/CuaDriver.app"
+        )
+
+    assert calls == [
+        [
+            "/usr/bin/codesign",
+            "--verify",
+            "--deep",
+            "--strict",
+            "/Applications/CuaDriver.app",
+        ]
+    ]
 
 
 def test_driver_signature_still_rejects_unrecognised_team(monkeypatch):
@@ -162,12 +226,24 @@ def test_embedded_spawn_resolves_shim_and_accepts_current_team(monkeypatch):
         "/Users/test/.local/bin/cua-driver",
         ["serve", "--embedded", "--socket", "/tmp/private.sock"],
         platform="darwin",
+        env={
+            "CUA_DRIVER_RS_TELEMETRY_ENABLED": "0",
+            "CUA_DRIVER_PERMISSION_MODE": "unrestricted",
+            "CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS": "1",
+            "ANTHROPIC_API_KEY": "must-not-leak",
+        },
     )
 
     assert command == [
         "/usr/bin/open",
         "-n",
         "-g",
+        "--env",
+        "CUA_DRIVER_RS_TELEMETRY_ENABLED=0",
+        "--env",
+        "CUA_DRIVER_PERMISSION_MODE=unrestricted",
+        "--env",
+        "CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS=1",
         "-a",
         "/Applications/CuaDriver.app",
         "--args",
