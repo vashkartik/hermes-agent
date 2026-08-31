@@ -35,9 +35,15 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_FILE = REPO_ROOT / ".ace" / "upstream-main.sha"
+WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+TESTS_WORKFLOW = WORKFLOWS_DIR / "tests.yml"
+UNSUPPORTED_RUNNER_PATTERN = re.compile(
+    r"^[A-Za-z0-9_-]+-latest-[0-9]+-core$"
+)
 
 # How many ancestors of the recorded baseline to score. A sync that recorded a
 # mid-range commit shows up within a handful of steps; scoring the whole
@@ -65,6 +71,29 @@ def _differing_files(a: str, b: str) -> int:
     if result.returncode != 0:
         pytest.skip(f"git diff {a[:8]}..{b[:8]} unavailable: {result.stderr.strip()}")
     return len([line for line in result.stdout.splitlines() if line.strip()])
+
+
+def _scalar_strings(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from _scalar_strings(key)
+            yield from _scalar_strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _scalar_strings(child)
+    elif isinstance(value, str):
+        yield value
+
+
+def _mapping_values(value, target_key: str):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == target_key:
+                yield child
+            yield from _mapping_values(child, target_key)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _mapping_values(child, target_key)
 
 
 @pytest.fixture(scope="module")
@@ -125,3 +154,101 @@ def test_baseline_is_the_tip_of_the_synced_range(recorded_sha: str):
             f"({ancestor_score} vs {baseline_score} differing files) — the "
             "recorded baseline is probably from the middle of the synced range"
         )
+
+
+def test_workflows_do_not_require_unsupported_large_runners():
+    """Fork CI must stay on GitHub-hosted runner labels available to ACE."""
+    nested_probe = {
+        "matrix": {
+            "include": [
+                {"runner": "ubuntu-latest"},
+                {"runner": "ubuntu-latest-32-core"},
+                {"runner": "windows-latest"},
+                {"runner": "windows-latest-32-core"},
+                {"runner": "macos-latest"},
+            ]
+        }
+    }
+    assert sorted(
+        scalar
+        for scalar in _scalar_strings(nested_probe)
+        if UNSUPPORTED_RUNNER_PATTERN.fullmatch(scalar)
+    ) == ["ubuntu-latest-32-core", "windows-latest-32-core"]
+
+    offenders = {}
+    for workflow in sorted(WORKFLOWS_DIR.rglob("*.y*ml")):
+        document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        assert isinstance(document, dict), f"invalid workflow document: {workflow}"
+        labels = sorted(
+            {
+                scalar
+                for scalar in _scalar_strings(document)
+                if UNSUPPORTED_RUNNER_PATTERN.fullmatch(scalar)
+            }
+        )
+        if labels:
+            offenders[workflow.relative_to(REPO_ROOT).as_posix()] = labels
+
+    assert not offenders, f"unsupported workflow runner labels: {offenders}"
+
+
+def test_python_workflow_keeps_duration_balanced_slicing():
+    """ACE CI must retain duration-balanced public-runner test slices."""
+    workflow = yaml.safe_load(TESTS_WORKFLOW.read_text(encoding="utf-8"))
+    assert isinstance(workflow, dict)
+
+    # PyYAML 1.1 treats the unquoted workflow key ``on`` as boolean true.
+    triggers = workflow["on"] if "on" in workflow else workflow[True]
+    assert triggers["workflow_call"]["inputs"]["slice_count"]["default"] == 8
+
+    jobs = workflow["jobs"]
+    generate = jobs["generate"]
+    sliced_test = jobs["test"]
+    save = jobs["save-durations"]
+
+    generate_text = "\n".join(_scalar_strings(generate))
+    assert "--generate-slices" in generate_text
+    assert "inputs.slice_count" in generate_text
+    assert "steps.matrix.outputs.matrix" in generate["outputs"]["matrix"]
+    restore_step = next(
+        step
+        for step in generate["steps"]
+        if str(step.get("uses", "")).startswith("actions/cache/restore@")
+    )
+    assert restore_step["with"]["path"] == "test_durations.json"
+    assert "test-durations-" in restore_step["with"]["restore-keys"]
+
+    assert sliced_test["needs"] == "generate"
+    assert "needs.generate.outputs.matrix" in str(
+        sliced_test["strategy"]["matrix"]
+    )
+    test_text = "\n".join(_scalar_strings(sliced_test))
+    assert "scripts/run_tests.sh --files" in test_text
+    assert "matrix.slice.files" in test_text
+    upload_step = next(
+        step
+        for step in sliced_test["steps"]
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    )
+    assert "matrix.slice.index" in upload_step["with"]["name"]
+    assert upload_step["with"]["path"] == "test_durations.json"
+
+    assert save["needs"] == "test"
+    save_text = "\n".join(_scalar_strings(save))
+    assert "test-durations-slice-*" in save_text
+    assert "durations/*/test_durations.json" in save_text
+    download_step = next(
+        step
+        for step in save["steps"]
+        if str(step.get("uses", "")).startswith("actions/download-artifact@")
+    )
+    assert download_step["with"]["pattern"] == "test-durations-slice-*"
+    cache_step = next(
+        step
+        for step in save["steps"]
+        if str(step.get("uses", "")).startswith("actions/cache/save@")
+    )
+    assert cache_step["with"]["path"] == "test_durations.json"
+
+    worker_values = list(_mapping_values(workflow, "HERMES_TEST_WORKERS"))
+    assert all(str(value).strip() != "96" for value in worker_values)

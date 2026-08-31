@@ -55,6 +55,20 @@ def test_deliver_returns_none_without_subscribers():
     assert stream.deliver(_frame("s1", "message.delta")) is None
 
 
+def test_deliver_keeps_replay_after_last_device_disconnects():
+    """Mac-side turn keeps going after the phone drops; reconnect can replay."""
+    stream = SessionStream("s1")
+    phone = FakeTransport("phone")
+    stream.attach(phone, owner=True)
+    assert stream.deliver(_frame("s1", "message.delta", {"i": 1})) is True
+    stream.detach(phone)
+    assert stream.deliver(_frame("s1", "message.delta", {"i": 2})) is False
+    frames, truncated, latest = stream.replay_since(0)
+    assert truncated is False
+    assert latest == 2
+    assert [f["params"]["payload"]["i"] for f in frames] == [1, 2]
+
+
 def test_every_subscriber_sees_the_same_sequence():
     stream = SessionStream("s1")
     a, b, c = FakeTransport("a"), FakeTransport("b"), FakeTransport("c")

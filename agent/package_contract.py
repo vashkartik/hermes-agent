@@ -143,22 +143,27 @@ KNOWN_SKILL_FRONTMATTER_FIELDS = frozenset(
 #: metadata.hermes.* keys with a consumer or documented meaning.
 #: ``upstream`` / ``supersedes`` / ``related_docs`` / ``credits`` are
 #: provenance metadata (documented in the package-contract guide; no
-#: runtime consumer, surfaced in listings only).
+#: runtime consumer, surfaced in listings only). ``session_platforms``
+#: gates a skill onto named gateway channels (agent/skill_utils.py ->
+#: agent/prompt_builder.py).
 KNOWN_SKILL_HERMES_KEYS = frozenset(
     {
         "tags", "category", "related_skills", "homepage", "config",
         "requires_toolsets", "fallback_for_toolsets", "requires_tools",
         "fallback_for_tools", "credits", "upstream", "supersedes",
-        "related_docs",
+        "related_docs", "session_platforms",
     }
 )
 
 #: optional-mcps manifest.yaml fields (mirrors hermes_cli.mcp_catalog
-#: _parse_manifest — the install-time fail-closed reader).
+#: _parse_manifest — the install-time fail-closed reader). ``suggest``
+#: carries the desktop composer's brand-pill triggers and is parsed there
+#: into a ``SuggestSpec``; the shape is validated by that reader, not
+#: re-validated here (one validator per boundary).
 KNOWN_MCP_MANIFEST_FIELDS = frozenset(
     {
         "manifest_version", "name", "description", "source", "transport",
-        "auth", "install", "post_install", "tools",
+        "auth", "install", "post_install", "tools", "suggest",
     }
 )
 
@@ -1009,6 +1014,33 @@ KNOWN_INFRASTRUCTURE = frozenset(
 _SKILL_EXCLUDED_DIRS = frozenset({".git", "__pycache__", ".archive", "index-cache"})
 
 
+def _has_source_content(directory: Path) -> bool:
+    """True when *directory*'s subtree holds any file a package could own.
+
+    Build residue is not a package and must not be reported as an orphan:
+    ``__pycache__`` and other cache directories, plus the empty
+    directories git leaves behind when tracked files move away, survive a
+    branch switch and would otherwise turn a clean tree's inventory red
+    for reasons no author can act on. Anything else — even a stray README
+    — is real content and stays classifiable, so a genuinely malformed
+    package still reports ``orphan-package``.
+    """
+    try:
+        entries = sorted(directory.iterdir(), key=lambda c: c.name)
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.name.startswith((".", "__")):
+            continue
+        if entry.is_file():
+            return True
+        if entry.name in _SKILL_EXCLUDED_DIRS:
+            continue
+        if _has_source_content(entry):
+            return True
+    return False
+
+
 def _iter_dirs(path: Path) -> List[Path]:
     if not path.is_dir():
         return []
@@ -1032,6 +1064,8 @@ def _plugin_package_dirs(plugins_root: Path) -> Tuple[List[Tuple[Path, str]], Li
     orphans: List[Path] = []
     for child in _iter_dirs(plugins_root):
         rel = f"plugins/{child.name}"
+        if not _has_source_content(child):
+            continue
         if (child / "plugin.yaml").exists():
             packages.append((child, child.name))
             continue
@@ -1049,7 +1083,7 @@ def _plugin_package_dirs(plugins_root: Path) -> Tuple[List[Tuple[Path, str]], Li
             packages.extend(subpkgs)
             known_names = {p.name for p, _ in subpkgs}
             for sub in _iter_dirs(child):
-                if sub.name not in known_names:
+                if sub.name not in known_names and _has_source_content(sub):
                     orphans.append(sub)
             continue
         if rel in KNOWN_INFRASTRUCTURE:
@@ -1077,6 +1111,8 @@ def _skill_package_dirs(root: Path, rel_root: str) -> Tuple[List[Path], List[Pat
         for child in _iter_dirs(directory):
             if child.name in _SKILL_EXCLUDED_DIRS:
                 continue
+            if not _has_source_content(child):
+                continue
             rel = f"{rel_root}/{child.relative_to(root)}".replace("\\", "/")
             if rel in KNOWN_INFRASTRUCTURE:
                 found = True
@@ -1089,6 +1125,8 @@ def _skill_package_dirs(root: Path, rel_root: str) -> Tuple[List[Path], List[Pat
 
     for child in _iter_dirs(root):
         if child.name in _SKILL_EXCLUDED_DIRS:
+            continue
+        if not _has_source_content(child):
             continue
         rel = f"{rel_root}/{child.name}"
         if rel in KNOWN_INFRASTRUCTURE:

@@ -100,7 +100,9 @@ def test_identity_is_public_id():
     assert "plugin:image_gen/openai" in by_ref
     assert "plugin:kanban" in by_ref  # dashboard-app package
     assert by_ref["plugin:kanban"].kind == "dashboard"
-    assert "skill:github-auth" in by_ref
+    # Skill identity is the directory name, never the category path.
+    assert "skill:github" in by_ref
+    assert by_ref["skill:github"].path == "skills/software-development/github"
     assert "mcp:figma" in by_ref
     # name duplication across categories is legal; identity is the key
     assert "plugin:image_gen/fal" in by_ref and "plugin:video_gen/fal" in by_ref

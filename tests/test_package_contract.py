@@ -560,6 +560,37 @@ class TestEnumerator:
         _, findings = enumerate_source_packages(synthetic_repo)
         assert "orphan-package" in [f.rule for f in _errors(findings)]
 
+    def test_build_residue_is_not_an_orphan(self, synthetic_repo):
+        """Cache dirs and git's leftover empty dirs are not packages.
+
+        Switching branches leaves ``__pycache__`` and empty directories
+        behind after tracked files move away. Reporting those as
+        orphan-package turns a clean tree's inventory red for something no
+        author can fix, and differs from CI's fresh checkout.
+        """
+        stale = synthetic_repo / "plugins" / "moved-away"
+        (stale / "__pycache__").mkdir(parents=True)
+        (stale / "__pycache__" / "old.cpython-311.pyc").write_bytes(b"\x00")
+        (synthetic_repo / "skills" / "samplecat" / "emptied").mkdir(parents=True)
+        nested = synthetic_repo / "skills" / "samplecat" / "gone" / "scripts"
+        (nested / "__pycache__").mkdir(parents=True)
+
+        records, findings = enumerate_source_packages(synthetic_repo)
+
+        assert not [f for f in findings if f.rule == "orphan-package"]
+        # Residue is skipped, never mistaken for a package.
+        assert not [r for r in records if r.id in {"moved-away", "emptied", "gone"}]
+
+    def test_orphan_still_reported_when_residue_dir_holds_real_content(
+        self, synthetic_repo
+    ):
+        """The residue guard must not swallow genuinely broken packages."""
+        broken = synthetic_repo / "skills" / "samplecat" / "half-authored"
+        (broken / "__pycache__").mkdir(parents=True)
+        (broken / "README.md").write_text("wip\n", encoding="utf-8")
+        _, findings = enumerate_source_packages(synthetic_repo)
+        assert "orphan-package" in [f.rule for f in _errors(findings)]
+
     def test_plugin_without_entrypoint_reported(self, synthetic_repo):
         broken = synthetic_repo / "plugins" / "no-entry"
         broken.mkdir()

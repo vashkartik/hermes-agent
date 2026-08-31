@@ -296,6 +296,144 @@ def test_valid_flow_projects_structured_milestones_and_gates_terminal_actions(co
     assert kb.complete_task(conn, review_id, summary="review approved") is True
 
 
+def test_controller_human_block_requires_typed_escalation(conn) -> None:
+    missing = _task(conn)
+    _opt_in(conn, missing, correlation="corr-missing-escalate")
+    _record(conn, missing, "OUTBOUND", 1, correlation="corr-missing-escalate")
+    _record(
+        conn,
+        missing,
+        "TRANSITION",
+        2,
+        correlation="corr-missing-escalate",
+        ace_receipt={"receipt_id": "accepted"},
+    )
+
+    with pytest.raises(kb.ControllerEnvelopeError, match="typed ESCALATE"):
+        kb.block_task(
+            conn,
+            missing,
+            reason="pretty comment is not a receipt",
+            kind="needs_input",
+        )
+    missing_task = kb.get_task(conn, missing)
+    assert missing_task is not None
+    assert missing_task.status == "ready"
+
+    escalated = _task(conn)
+    _opt_in(conn, escalated, correlation="corr-escalated")
+    _record(conn, escalated, "OUTBOUND", 1, correlation="corr-escalated")
+    _record(
+        conn,
+        escalated,
+        "TRANSITION",
+        2,
+        correlation="corr-escalated",
+        ace_receipt={"receipt_id": "accepted"},
+    )
+    _record(
+        conn,
+        escalated,
+        "ESCALATE",
+        3,
+        correlation="corr-escalated",
+        payload={"reason": "owner decision required"},
+    )
+    assert kb.block_task(
+        conn,
+        escalated,
+        reason="owner decision required",
+        kind="needs_input",
+    ) is True
+    escalated_task = kb.get_task(conn, escalated)
+    assert escalated_task is not None
+    assert escalated_task.status == "blocked"
+    assert kb.unblock_task(conn, escalated) is True
+    with pytest.raises(kb.ControllerEnvelopeError, match="fresh typed ESCALATE"):
+        kb.block_task(
+            conn,
+            escalated,
+            reason="same stale escalation must not authorize another block",
+            kind="needs_input",
+        )
+
+    legacy = _task(conn, assignee="builder")
+    assert kb.block_task(
+        conn,
+        legacy,
+        reason="legacy behavior remains unchanged",
+        kind="needs_input",
+    ) is True
+
+
+def test_acknowledged_controller_return_can_recover_historical_triage(conn) -> None:
+    task_id = _task(conn)
+    _opt_in(conn, task_id, correlation="corr-triage-recovery")
+    kb.add_notify_sub(
+        conn,
+        task_id=task_id,
+        platform="tui",
+        chat_id="receiver-session",
+    )
+    _record(conn, task_id, "OUTBOUND", 1, correlation="corr-triage-recovery")
+    _record(
+        conn,
+        task_id,
+        "TRANSITION",
+        2,
+        correlation="corr-triage-recovery",
+        ace_receipt={"receipt_id": "accepted"},
+    )
+    _record(
+        conn,
+        task_id,
+        "ESCALATE",
+        3,
+        correlation="corr-triage-recovery",
+        payload={"reason": "owner decision required"},
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (task_id,))
+    _record(
+        conn,
+        task_id,
+        "RETURN",
+        4,
+        correlation="corr-triage-recovery",
+        terminal_receipt={"state": "request-changes"},
+    )
+    return_event_id = [
+        ev.id
+        for ev in kb.list_events(conn, task_id)
+        if ev.kind == "controller_envelope"
+        and (ev.payload or {}).get("event_type") == "RETURN"
+    ][-1]
+    _, _, claimed = kb.claim_unseen_events_for_sub(
+        conn,
+        task_id=task_id,
+        platform="tui",
+        chat_id="receiver-session",
+        kinds=("controller_envelope",),
+    )
+    assert return_event_id in {ev.id for ev in claimed}
+    kb.acknowledge_controller_return(
+        conn,
+        task_id,
+        return_event_id=return_event_id,
+        platform="tui",
+        chat_id="receiver-session",
+    )
+
+    assert kb.complete_task(
+        conn,
+        task_id,
+        summary="Recovered acknowledged controller return",
+    ) is True
+    recovered = kb.get_task(conn, task_id)
+    assert recovered is not None
+    assert recovered.status == "done"
+
+
 def test_acknowledgment_requires_exact_subscription_and_claimed_return(conn) -> None:
     task_id = _task(conn)
     _opt_in(conn, task_id)
