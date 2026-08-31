@@ -484,7 +484,13 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(request_id, sid, session, text)
+            server._run_prompt_submit(
+                request_id,
+                sid,
+                session,
+                text,
+                display_kind=frame.get("display_kind") or None,
+            )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()
@@ -569,6 +575,9 @@ class ComputeHost:
                 reasoning_config_override=frame.get("reasoning_config_override"),
                 service_tier_override=frame.get("service_tier_override"),
                 platform_override=frame.get("source"),
+                context_cwd_is_launch_artifact=bool(
+                    frame.get("context_cwd_is_launch_artifact", False)
+                ),
                 session_db=session_db,
             )
             if server._transfer_db_to_agent(agent, session_db):
