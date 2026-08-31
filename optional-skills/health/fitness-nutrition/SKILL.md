@@ -4,15 +4,13 @@ description: "Workout planning, macros, and body metrics via wger/USDA."
 platforms: [linux, macos, windows]
 version: 1.0.0
 author: Hailey Marshall (haileymarshall), Hermes Agent
-authors:
-  - haileymarshall
 license: MIT
 metadata:
   hermes:
     tags: [health, fitness, nutrition, gym, workout, diet, exercise]
     category: health
-    prerequisites:
-      commands: [curl, python]
+prerequisites:
+  commands: [curl, python]
 required_environment_variables:
   - name: USDA_API_KEY
     prompt: "USDA FoodData Central API key (free)"

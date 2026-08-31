@@ -607,6 +607,13 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     authored skills never lose routing signal to index truncation. Edit and
     patch paths deliberately skip this so existing over-limit skills remain
     maintainable while their descriptions are cleaned up.
+
+    Documented adapter over the package contract
+    (agent/package_contract.py): enforces the contract's non-negotiables
+    (fence, mapping, name, description ≤ SKILL_PROMPT_DESC_LIMIT, body) at
+    the fail-closed create/edit boundary, with its own YAML error surfaces
+    because a hard reject needs the parse error verbatim (the canonical
+    parser's key:value fallback would swallow it).
     """
     if not content.strip():
         return "Content cannot be empty."

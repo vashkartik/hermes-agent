@@ -5,7 +5,8 @@ version: 0.1.0
 author: Danilo Znamerovszkij (https://github.com/danilo-znamerovszkij/draw-your-font), ported by Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
-required_commands: [node, npx]
+prerequisites:
+  commands: [node, npx]
 metadata:
   hermes:
     tags: [font, handwriting, typography, ttf, woff, vision, creative]

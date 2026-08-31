@@ -172,11 +172,14 @@ def yaml_load(content: str):
 # ── Frontmatter parsing ──────────────────────────────────────────────────
 
 
-def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
+def parse_frontmatter(
+    content: str, *, salvage_malformed: bool = True
+) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter from a markdown string.
 
-    Uses yaml with CSafeLoader for full YAML support (nested metadata, lists)
-    with a fallback to simple key:value splitting for robustness.
+    The single frontmatter parser for every skill surface (see the package
+    contract, ``agent/package_contract.py``). Uses yaml with CSafeLoader for
+    full YAML support (nested metadata, lists).
 
     A single leading UTF-8 BOM (U+FEFF) is stripped before parsing. Windows
     GUI editors (Notepad, PowerShell ``>``) prepend one when saving a SKILL.md
@@ -185,6 +188,14 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     check below and the whole frontmatter is silently discarded — name,
     description, ``platforms`` gating, env-var setup, and conditional
     activation all vanish. See CONTRIBUTING.md "File encoding".
+
+    Args:
+        salvage_malformed: when the YAML fails to parse, recover what a
+            naive ``key: value`` split can (default — a local SKILL.md the
+            user is editing should keep working while its YAML is broken).
+            Pass ``False`` for untrusted/remote metadata (the skills hub),
+            where a malformed block must yield ``{}`` rather than
+            half-parsed keys that would be displayed as real fields.
 
     Returns:
         (frontmatter_dict, remaining_body)
@@ -211,6 +222,8 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
         if isinstance(parsed, dict):
             frontmatter = parsed
     except Exception:
+        if not salvage_malformed:
+            return {}, body
         # Fallback: simple key:value parsing for malformed YAML
         for line in yaml_content.strip().split("\n"):
             if ":" not in line:

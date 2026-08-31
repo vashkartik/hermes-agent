@@ -9,6 +9,11 @@ description: "Step-by-step guide to building a complete Hermes plugin with tools
 
 This guide walks through building a complete Hermes plugin from scratch. By the end you'll have a working plugin with multiple tools, lifecycle hooks, shipped data files, and a bundled skill — everything the plugin system supports.
 
+Manifest field semantics, validation rules, and versioning for every
+package family (plugins, skills, MCP catalog entries) are defined by the
+[package contract](/developer-guide/package-contract) — `hermes packages
+lint` checks a checkout against it.
+
 :::info Not sure which guide you need?
 Hermes has several distinct pluggable interfaces — some use Python `register_*` APIs, others are config-driven or drop-in directories. Use this map first:
 

@@ -474,6 +474,7 @@ from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
+from hermes_cli.subcommands.packages import build_packages_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
@@ -12389,7 +12390,8 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
-        "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
+        "model", "monitoring", "packages", "pairing", "pause", "peer", "pets", "plugins",
+        "portal", "profile",
         "project", "proxy",
         "prompt-size",
         "resume",
@@ -13099,6 +13101,12 @@ def cmd_plugins(args):
     plugins_command(args)
 
 
+def cmd_packages(args):
+    from hermes_cli.packages_cmd import cmd_packages as _impl
+
+    return _impl(args)
+
+
 def cmd_mcp(args):
     from hermes_cli.mcp_config import mcp_command
 
@@ -13712,6 +13720,11 @@ def main():
     # plugins command  (parser built in hermes_cli/subcommands/plugins.py)
     # =========================================================================
     build_plugins_parser(subparsers, cmd_plugins=cmd_plugins)
+
+    # =========================================================================
+    # packages command  (parser built in hermes_cli/subcommands/packages.py)
+    # =========================================================================
+    build_packages_parser(subparsers, cmd_packages=cmd_packages)
 
     # =========================================================================
     # Plugin CLI commands — dynamically registered by memory/general plugins.

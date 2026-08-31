@@ -1,5 +1,7 @@
 name: supermemory
 version: 1.0.1
 description: "Supermemory semantic long-term memory with profile recall, semantic search, explicit memory tools, and session ingest."
+author: NousResearch
+kind: exclusive
 pip_dependencies:
   - supermemory

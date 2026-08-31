@@ -290,6 +290,34 @@ class TestNormalizeSkillLookupName:
 # ── parse_frontmatter: UTF-8 BOM tolerance ─────────────────────────────────
 
 
+class TestParseFrontmatterMalformedSalvage:
+    """``salvage_malformed`` selects what a broken YAML block yields.
+
+    Local SKILL.md files keep the salvage default so a skill the user is
+    mid-edit still resolves what it can. Untrusted/remote metadata (the
+    skills hub) opts out, because half-parsed keys would be displayed as
+    real skill fields.
+    """
+
+    MALFORMED = "---\n: : : invalid{{\n---\n\nBody.\n"
+
+    def test_salvage_default_recovers_key_value_pairs(self):
+        fm, body = parse_frontmatter(self.MALFORMED)
+        assert fm == {"": ": : invalid{{"}
+        assert body.strip() == "Body."
+
+    def test_strict_mode_yields_empty_mapping(self):
+        fm, body = parse_frontmatter(self.MALFORMED, salvage_malformed=False)
+        assert fm == {}
+        assert body.strip() == "Body."
+
+    def test_strict_mode_does_not_change_valid_frontmatter(self):
+        valid = "---\nname: ok\ndescription: Fine.\n---\n\nBody.\n"
+        assert parse_frontmatter(valid) == parse_frontmatter(
+            valid, salvage_malformed=False
+        )
+
+
 class TestParseFrontmatterBOM:
     """A UTF-8 BOM (U+FEFF) on a Windows-saved SKILL.md must not defeat
     frontmatter parsing.

@@ -777,6 +777,15 @@ Hermes has two plugin surfaces. Both live under `plugins/` in the repo so
 repo-shipped plugins can be discovered alongside user-installed ones in
 `~/.hermes/plugins/` and pip-installed entry points.
 
+Manifest semantics for every source-owned package family (plugins, skills,
+MCP catalog entries, dashboard extensions) are owned by the **package
+contract** — `agent/package_contract.py`, documented at
+`website/docs/developer-guide/package-contract.md`. `hermes packages
+inventory|lint|migrate` is the deterministic census/validation/migration
+CLI, and `tests/test_package_inventory.py` keeps source-owned packages at
+zero contract findings. New consumed manifest fields must be added to the
+contract's census in the same PR that lands their consumer.
+
 ### General plugins (`hermes_cli/plugins.py` + `plugins/<name>/`)
 
 `PluginManager` discovers plugins from `~/.hermes/plugins/`, `./.hermes/plugins/`,

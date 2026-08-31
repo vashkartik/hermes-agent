@@ -55,6 +55,11 @@ from functools import wraps
 from pathlib import Path
 from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Type, Union)
 
+from agent.package_contract import (
+    KNOWN_PLUGIN_MANIFEST_FIELDS as _KNOWN_MANIFEST_FIELDS,
+    PLUGIN_MANIFEST_SUPPORTED as SUPPORTED_MANIFEST_VERSION,
+    VALID_PLUGIN_KINDS as _VALID_PLUGIN_KINDS,
+)
 from hermes_constants import (
     get_hermes_home,
     hermes_home_key,
@@ -680,7 +685,6 @@ def _get_enabled_plugins() -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
 
 
 def _portable_skill_namespace(key: str) -> str:
@@ -708,24 +712,13 @@ def _display_author(value: object) -> str:
 
 # ── Manifest v2 (#64165) parsing helpers ──────────────────────────────────
 
-# Fields the current parser understands. Anything else in plugin.yaml is
-# forward-compat surface: warn (once per manifest, at debug for v1 files to
-# avoid churning existing plugins, at warning for v2+) and continue loading.
-_KNOWN_MANIFEST_FIELDS: Set[str] = {
-    # v1
-    "name", "version", "description", "author", "requires_env",
-    "provides_tools", "provides_hooks", "kind", "hooks", "label",
-    "optional_env", "platforms", "external_dependencies", "pip_dependencies",
-    "provides_browser_providers", "provides_web_providers",
-    # v2 (#64165)
-    "manifest_version", "api_version", "requires_plugins",
-    "python_dependencies", "config_schema", "license", "homepage", "tags",
-    # owned by sibling sub-issues but reserved so their manifests don't warn
-    "capabilities", "emits", "listens", "hermes", "depends",
-}
-
-# Highest manifest schema version this Hermes understands.
-SUPPORTED_MANIFEST_VERSION = 2
+# Fields the current parser understands (anything else in plugin.yaml is
+# forward-compat surface: warn and continue loading), the highest manifest
+# schema version, and the valid plugin kinds are all owned by the package
+# contract (agent/package_contract.py) and imported at the top of this
+# module as _KNOWN_MANIFEST_FIELDS / SUPPORTED_MANIFEST_VERSION /
+# _VALID_PLUGIN_KINDS — single source of truth, re-exported here so
+# existing imports keep working.
 
 _CONFIG_SCHEMA_TYPES: Dict[str, tuple] = {
     "str": (str,),

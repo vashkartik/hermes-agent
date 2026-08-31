@@ -6,16 +6,6 @@ author: Hermes Agent + Teknium (design systems sourced from VoltAgent/awesome-de
 license: MIT
 tags: [design, css, html, ui, web-development, design-systems, templates]
 platforms: [linux, macos, windows]
-triggers:
-  - build a page that looks like
-  - make it look like stripe
-  - design like linear
-  - vercel style
-  - create a UI
-  - web design
-  - landing page
-  - dashboard design
-  - website styled like
 ---
 
 # Popular Web Designs
@@ -23,6 +13,13 @@ triggers:
 54 real-world design systems ready for use when generating HTML/CSS. Each template captures a
 site's complete visual language: color palette, typography hierarchy, component styles, spacing
 system, shadows, responsive behavior, and practical agent prompts with exact CSS values.
+
+## When to Use
+
+- User asks to build a page/UI "that looks like" or "styled like" a known site
+  ("make it look like Stripe", "design like Linear", "Vercel style")
+- General web design work: landing pages, dashboards, or any UI where a proven
+  visual language is a better starting point than inventing one
 
 ## Related design skills
 

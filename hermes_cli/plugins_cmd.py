@@ -1748,6 +1748,12 @@ def _read_manifest_info(d: Path, prefix: str):
     """Read a native or portable manifest and return display metadata.
 
     Returns None if no manifest file exists.
+
+    Display-only fast path (documented adapter): reads the same
+    name/version/description/key identity the package contract
+    (agent/package_contract.py) defines, with the loader's defaults, but
+    skips full normalization to keep ``hermes plugins list`` cheap.
+    Validation lives in the contract + PluginManager, never here.
     """
     manifest_file = d / "plugin.yaml"
     if not manifest_file.exists():

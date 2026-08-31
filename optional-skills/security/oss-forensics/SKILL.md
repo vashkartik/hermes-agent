@@ -6,22 +6,6 @@ author: Teknium (teknium1), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 category: security
-triggers:
-  - "investigate this repository"
-  - "investigate [owner/repo]"
-  - "check for supply chain compromise"
-  - "recover deleted commits"
-  - "forensic analysis of [owner/repo]"
-  - "was this repo compromised"
-  - "supply chain attack"
-  - "suspicious commit"
-  - "force push detected"
-  - "IOC extraction"
-toolsets:
-  - terminal
-  - web
-  - file
-  - delegation
 metadata:
   hermes:
     tags: [Security, Forensics, GitHub, Supply-Chain]
@@ -34,6 +18,16 @@ A 7-phase multi-agent investigation framework for researching open-source supply
 Adapted from RAPTOR's forensics system. Covers GitHub Archive, Wayback Machine, GitHub API,
 local git analysis, IOC extraction, evidence-backed hypothesis formation and validation,
 and final forensic report generation.
+
+## When to Use
+
+- "investigate this repository / [owner/repo]" for supply-chain compromise
+- Recovering deleted commits, analyzing force-push evidence, or extracting
+  IOCs from a suspicious commit
+- Forensic analysis and reporting on a suspected supply-chain attack
+
+Uses the `terminal`, `web_search`/`web_extract`, file, and `delegate_task`
+tool surfaces; run it from a session where those toolsets are enabled.
 
 ---
 

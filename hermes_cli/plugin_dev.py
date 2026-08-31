@@ -355,6 +355,38 @@ def _check_manifest_v2(report: "DoctorReport", manifest: Any) -> None:
                 )
 
 
+def _check_contract(report: "DoctorReport", plugin_path: Path) -> None:
+    """Envelope checks from the canonical package contract.
+
+    Parses the raw plugin.yaml through agent.package_contract so the doctor
+    reports the same identity/version/platform/dependency findings as
+    ``hermes packages lint`` does for source-owned packages.
+    """
+    from agent.package_contract import parse_plugin_manifest
+    from agent.skill_utils import yaml_load
+
+    manifest_file = plugin_path / "plugin.yaml"
+    if not manifest_file.exists():
+        return
+    try:
+        data = yaml_load(manifest_file.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    _, findings = parse_plugin_manifest(
+        data, key=plugin_path.name, path=str(plugin_path)
+    )
+    for finding in findings:
+        # Everything surfaces as a warning here: the doctor validates
+        # user-authored plugins, which keep the runtime's documented
+        # warn-and-continue posture (a v1 manifest with only ``name`` must
+        # still pass — see test_doctor_accepts_manifest_defaults_from_
+        # runtime_parser). The fail-closed zero-findings gate applies to
+        # source-owned packages via ``hermes packages lint``.
+        report.warning(f"[{finding.rule}] {finding.message}")
+
+
 def doctor_plugin(target: str | os.PathLike[str] | None = None) -> DoctorReport:
     """Validate one plugin through Hermes' real scanner and registration path."""
     try:
@@ -414,6 +446,7 @@ def doctor_plugin(target: str | os.PathLike[str] | None = None) -> DoctorReport:
                 report.warning(f"registration adds tool {name!r} not listed in provides_tools")
 
             _check_manifest_v2(report, host.manifest)
+            _check_contract(report, path)
     except _DoctorLoadError as exc:
         report.error(str(exc))
     except Exception as exc:
