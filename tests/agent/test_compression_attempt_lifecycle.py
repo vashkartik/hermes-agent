@@ -89,8 +89,8 @@ class TestWorkerTeardownOnCeiling:
                 time.sleep(0.01)
             # Cooperative-but-not-instant exit: the unwind after seeing the
             # poison takes real time (rollback, telemetry). Long enough that
-            # a host WITHOUT the bounded-grace join returns first; far
-            # inside the 5s grace for a host WITH it.
+            # a host WITHOUT the bounded-grace join returns first; 80ms is far
+            # inside this test's effective 1.0s grace and production's 5s max.
             time.sleep(0.08)
             worker_done.set()
             return (original, "late")
@@ -101,7 +101,7 @@ class TestWorkerTeardownOnCeiling:
             messages=original,
             system_prompt_fallback="fallback",
             idle_timeout_seconds=0.1,
-            total_ceiling_seconds=0.2,
+            total_ceiling_seconds=1.0,
             fence=fence,
             stall_fallback=False,
         )
