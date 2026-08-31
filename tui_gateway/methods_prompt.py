@@ -423,13 +423,6 @@ def _(rid, params: dict) -> dict:
                             )
                             + "Update Hermes Desktop to continue it.",
                         )
-    active_session_lease_before = session.get("active_session_lease")
-    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
-        return _err(rid, 4090, limit_message)
-    active_session_lease = session.get("active_session_lease")
-    acquired_active_session_lease = (
-        active_session_lease_before is None and active_session_lease is not None
-    )
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -508,6 +501,20 @@ def _(rid, params: dict) -> dict:
                 "request_status": record["status"],
                 "result": record["result"],
             })
+
+    # Resolve execute-once retries before reserving session capacity. A
+    # duplicate does not admit a new turn, so claiming here used to strand a
+    # fresh active-session lease after the original storage failure released
+    # its own lease and the duplicate returned immediately.
+    active_session_lease_before = session.get("active_session_lease")
+    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
+        return _settle_request_response(
+            sid, request_id, _err(rid, 4090, limit_message)
+        )
+    active_session_lease = session.get("active_session_lease")
+    acquired_active_session_lease = (
+        active_session_lease_before is None and active_session_lease is not None
+    )
 
     while True:
         busy_transport = None

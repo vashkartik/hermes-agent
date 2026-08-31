@@ -14585,6 +14585,20 @@ def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
         assert "active_session_lease" not in session
         assert "_update_turn_lease" not in session
 
+        duplicate = server.handle_request(
+            {
+                "id": "lost-duplicate",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "lost-sid",
+                    "text": "will vanish",
+                    "request_id": "lost-request-1",
+                },
+            }
+        )
+        assert "active_session_lease" not in session
+        assert "_update_turn_lease" not in session
+
         retry = server.handle_request(
             {
                 "id": "lost-retry",
@@ -14602,17 +14616,6 @@ def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
         established = server.handle_request(
             {
                 "id": "established",
-                "method": "prompt.submit",
-                "params": {
-                    "session_id": "established-sid",
-                    "text": "will vanish",
-                    "request_id": "established-request",
-                },
-            }
-        )
-        duplicate = server.handle_request(
-            {
-                "id": "established-duplicate",
                 "method": "prompt.submit",
                 "params": {
                     "session_id": "established-sid",
