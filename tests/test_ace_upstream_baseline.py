@@ -35,9 +35,15 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_FILE = REPO_ROOT / ".ace" / "upstream-main.sha"
+WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+UNSUPPORTED_RUNNERS = {
+    "ubuntu-latest-32-core",
+    "ubuntu-latest-96-core",
+}
 
 # How many ancestors of the recorded baseline to score. A sync that recorded a
 # mid-range commit shows up within a handful of steps; scoring the whole
@@ -125,3 +131,31 @@ def test_baseline_is_the_tip_of_the_synced_range(recorded_sha: str):
             f"({ancestor_score} vs {baseline_score} differing files) — the "
             "recorded baseline is probably from the middle of the synced range"
         )
+
+
+def test_workflows_do_not_require_unsupported_large_runners():
+    """Fork CI must stay on GitHub-hosted runner labels available to ACE."""
+    def scalar_strings(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield from scalar_strings(key)
+                yield from scalar_strings(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from scalar_strings(child)
+        elif isinstance(value, str):
+            yield value
+
+    offenders = {}
+    for workflow in sorted(WORKFLOWS_DIR.rglob("*.y*ml")):
+        document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        assert isinstance(document, dict), f"invalid workflow document: {workflow}"
+        labels = sorted(
+            label
+            for label in UNSUPPORTED_RUNNERS
+            if any(label in scalar for scalar in scalar_strings(document))
+        )
+        if labels:
+            offenders[workflow.relative_to(REPO_ROOT).as_posix()] = labels
+
+    assert not offenders, f"unsupported workflow runner labels: {offenders}"
