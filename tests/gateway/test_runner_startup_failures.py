@@ -158,11 +158,15 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
     # get_running_pid returns 42 before we kill the old gateway, then None
     # after remove_pid_file() clears the record (reflects real behavior).
     _pid_state = {"alive": True}
+    old_start_time = 1234.5
     def _mock_get_running_pid():
         return 42 if _pid_state["alive"] else None
     def _mock_remove_pid_file():
         _pid_state["alive"] = False
     monkeypatch.setattr("gateway.status.get_running_pid", _mock_get_running_pid)
+    monkeypatch.setattr(
+        "gateway.status.get_process_start_time", lambda _pid: old_start_time
+    )
     monkeypatch.setattr("gateway.status.remove_pid_file", _mock_remove_pid_file)
     monkeypatch.setattr(
         "gateway.status.release_all_scoped_locks",
@@ -171,8 +175,8 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
     # force-kill reaps the process: terminate_pid(force=True) flips it dead,
     # and the post-kill re-poll via _pid_exists then sees it gone so the
     # replacement proceeds.
-    def _mock_terminate_pid(pid, force=False):
-        calls.append((pid, force))
+    def _mock_terminate_pid(pid, force=False, expected_start_time=None):
+        calls.append((pid, force, expected_start_time))
         if force:
             _pid_state["alive"] = False
     monkeypatch.setattr("gateway.status.terminate_pid", _mock_terminate_pid)
@@ -196,7 +200,10 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
     ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
 
     assert ok is True
-    assert calls == [(42, False), (42, True)]
+    assert calls == [
+        (42, False, None),
+        (42, True, old_start_time),
+    ]
 
 
 @pytest.mark.asyncio
@@ -236,7 +243,7 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
     )
     monkeypatch.setattr(
         "gateway.status.terminate_pid",
-        lambda pid, force=False: calls.append((pid, force)),
+        lambda pid, force=False, **kwargs: calls.append((pid, force)),
     )
     # Ownership guard (#89315): legitimate same-home replace fixture — the
     # persisted record is bound to target pid 42 in this home.
@@ -306,7 +313,7 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
         })
         return True
 
-    def record_terminate(pid, force=False):
+    def record_terminate(pid, force=False, **kwargs):
         events.append(f"terminate_pid(pid={pid}, force={force})")
 
     class _CleanExitRunner:
@@ -395,7 +402,7 @@ async def test_start_gateway_replace_clears_marker_on_permission_denied(
         })
         return True
 
-    def raise_permission(pid, force=False):
+    def raise_permission(pid, force=False, **kwargs):
         raise PermissionError("simulated EPERM")
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
@@ -543,5 +550,3 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
         await start_gateway(config=GatewayConfig(), replace=False, verbosity=0)
 
     assert exc_info.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
-
-

@@ -62,8 +62,10 @@ DEFAULT_CONFIG = {
         # Maximum time an alias routing key waits for the active turn holding
         # the same resolved session lease. On expiry the inbound message is
         # rejected with a resend notice rather than run without serialization.
-        # Non-positive values fall back to 1800 seconds.
-        "gateway_turn_lease_timeout": 1800,
+        # Keep this short: Telegram dispatches updates sequentially, so an
+        # inline lease waiter also delays unrelated topics. Non-positive values
+        # fall back to the five-second safety default.
+        "gateway_turn_lease_timeout": 5,
         # Per-session AIAgent cache in the gateway. Each cached agent keeps a
         # warm prompt prefix AND the session's full transcript, so the cache
         # trades memory for cost: too small and every turn re-pays an uncached
@@ -295,6 +297,14 @@ DEFAULT_CONFIG = {
         # from gateway_timeout (which kills the turn) and
         # gateway_notify_interval ("still working" heartbeats). 0 = disable.
         "session_stall_timeout": 300,
+        # Transcript-sanitiser repeated-heal escalation threshold (#96870).
+        # After this many pre-send heal passes within a 10-minute session
+        # window, log one ERROR (session id + heal pattern) and queue a
+        # ONE-TIME out-of-band user notice pointing at /debug share or
+        # `hermes doctor`. Delivered via the status channel only —
+        # conversation context / prompt caching untouched. 0 = disable
+        # escalation (per-window WARNINGs still fire).
+        "sanitizer_heal_escalation_threshold": 3,
         # Long-lived reconnect-loop escalation (seconds). A platform that has
         # been continuously failing/reconnecting for this long gets
         # needs_attention flagged in gateway runtime status (visible in
@@ -381,6 +391,20 @@ DEFAULT_CONFIG = {
         # ``false`` keeps the historical strict-provider behavior (Mistral,
         # Groq, Cerebras reject the field with HTTP 400).
         "reasoning_echo": False,
+        # Turn liveness watchdog (#95548): a turn that shows no observable
+        # progress (activity-clock idle, never touched by lease renewal) for
+        # `timeout_s` seconds is logged loudly, force-interrupted so the UI
+        # can retry it, and its durable turn lease stops renewing so TTL
+        # expiry lets stale-turn cleanup reclaim the session even when the
+        # hard interrupt cannot unwind a wedged frame. `timeout_s` <= 0
+        # disables the watchdog; `poll_s` is the sampling interval. Invalid
+        # values (typo, NaN, Inf, non-positive poll) warn and fall back to
+        # the default instead of crashing startup or silently disabling the
+        # watchdog. See agent/turn_liveness.py.
+        "turn_liveness": {
+            "timeout_s": 600.0,
+            "poll_s": 15.0,
+        },
     },
 
     "terminal": {
@@ -3170,6 +3194,12 @@ DEFAULT_CONFIG = {
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
 
+        # After an unexpected SIGTERM interrupts a running gateway agent,
+        # wait this many seconds for it to unwind before adapter and database
+        # teardown proceeds. Keep this short so service-manager shutdowns do
+        # not exhaust their stop budget before resource cleanup begins.
+        "signal_interrupt_grace_timeout": 1,
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
@@ -3206,6 +3236,18 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_interval_s": 30.0,
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
+
+        # Startup-liveness watchdog (OOF-298): plain daemon thread armed at
+        # process entry for gateway runs, hard-exits 75 if the event loop is
+        # not confirmed live within the deadline. The watchdog module itself
+        # is stdlib-only and armed before config can load, so run_gateway()
+        # bridges these keys to the internal HERMES_STARTUP_WATCHDOG /
+        # HERMES_STARTUP_WATCHDOG_TIMEOUT_S env vars AND applies them to the
+        # already-armed handle (disarm on disable, disarm+re-arm on a config
+        # timeout) — config.yaml is the user-facing surface; explicit env
+        # values win as operator override.
+        "startup_watchdog": True,
+        "startup_watchdog_timeout_seconds": 300,
 
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the

@@ -11,14 +11,20 @@ writes a malformed / mid-window value, the drift counter reports a number that
 looks alarming (or reassuring) but means nothing, and the next sync computes
 its range from the wrong base.
 
-These tests pin the two properties that make the recorded value trustworthy:
+These tests pin the properties that make the recorded value trustworthy:
 
 1. **Format.** Exactly one 40-hex commit id. Always checked.
-2. **Minimality.** The recorded commit must explain this tree better than any
-   of its own ancestors — i.e. it is the *tip* of what was synced, not a
-   commit from the middle of the synced range. Checked only when the upstream
-   objects are actually present locally, so CI without an ``upstream`` remote
-   skips instead of failing.
+2. **Minimality.** No ancestor may explain this tree better than the recorded
+   commit. A tie is valid when ACE intentionally overlays every path changed by
+   the final upstream commit. Checked only when the upstream objects are
+   actually present locally, so CI without an ``upstream`` remote skips instead
+   of failing.
+3. **Exact merge provenance.** Before the sync branch is squash-merged, the
+   marker must equal the official second parent of its latest
+   ``Merge Nous upstream ...`` commit. This is the exact check that rejects a
+   one-commit-behind marker even when the protected overlay makes tree-distance
+   scores tie. After a squash removes that ancestry, minimality remains the
+   available fallback.
 
 Verified 2026-08-03 for ``ace/patches`` @ d2ecf452 ("Sync current Nous Hermes
 main into Ace patches (#14)"): scanning all 1341 upstream commits in the
@@ -71,6 +77,25 @@ def _differing_files(a: str, b: str) -> int:
     if result.returncode != 0:
         pytest.skip(f"git diff {a[:8]}..{b[:8]} unavailable: {result.stderr.strip()}")
     return len([line for line in result.stdout.splitlines() if line.strip()])
+
+
+def _latest_unsquashed_upstream_parent() -> str | None:
+    """Return the official parent of the latest protected upstream merge."""
+    result = _git(
+        "log",
+        "--first-parent",
+        "--merges",
+        "--format=%P%x00%s",
+        "HEAD",
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parents_text, separator, subject = line.partition("\x00")
+        parents = parents_text.split()
+        if separator and subject.startswith("Merge Nous upstream ") and len(parents) == 2:
+            return parents[1]
+    return None
 
 
 def _scalar_strings(value):
@@ -126,13 +151,24 @@ def test_baseline_is_not_a_fork_commit(recorded_sha: str):
     )
 
 
+def test_baseline_matches_latest_unsquashed_upstream_parent(recorded_sha: str):
+    """A sync branch must record its exact official merge parent, not its parent."""
+    upstream_parent = _latest_unsquashed_upstream_parent()
+    if upstream_parent is None:
+        pytest.skip("upstream sync merge ancestry was removed by squash integration")
+    assert recorded_sha == upstream_parent, (
+        f"baseline {recorded_sha[:12]} does not match the exact official parent "
+        f"{upstream_parent[:12]} of the latest upstream sync merge"
+    )
+
+
 def test_baseline_is_the_tip_of_the_synced_range(recorded_sha: str):
-    """The recorded commit must match this tree better than its ancestors.
+    """No ancestor may match this tree better than the recorded commit.
 
     This is the accounting property a squash sync can silently break: recording
-    the merge-base (or any mid-range commit) instead of the upstream tip leaves
-    a baseline whose ancestors match just as well, and every later drift
-    computation inherits the error.
+    the merge-base (or any mid-range commit) can leave a later ancestor closer
+    to the resulting tree. Equal scores are legitimate when the final upstream
+    commit touches only paths that the protected ACE overlay already replaces.
     """
     if not _have_object(recorded_sha):
         pytest.skip("recorded baseline object not present locally")
@@ -148,8 +184,8 @@ def test_baseline_is_the_tip_of_the_synced_range(recorded_sha: str):
 
     for ancestor in ancestors:
         ancestor_score = _differing_files(ancestor, head)
-        assert ancestor_score > baseline_score, (
-            f"ancestor {ancestor[:8]} matches this tree at least as well as the "
+        assert ancestor_score >= baseline_score, (
+            f"ancestor {ancestor[:8]} matches this tree better than the "
             f"recorded baseline {recorded_sha[:8]} "
             f"({ancestor_score} vs {baseline_score} differing files) — the "
             "recorded baseline is probably from the middle of the synced range"

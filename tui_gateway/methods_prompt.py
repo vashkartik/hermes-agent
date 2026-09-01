@@ -508,8 +508,16 @@ def _(rid, params: dict) -> dict:
     # its own lease and the duplicate returned immediately.
     active_session_lease_before = session.get("active_session_lease")
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
+        reason = getattr(limit_message, "reason", None)
         return _settle_request_response(
-            sid, request_id, _err(rid, 4090, limit_message)
+            sid,
+            request_id,
+            _err(
+                rid,
+                4090,
+                str(limit_message),
+                {"reason": reason} if reason else None,
+            ),
         )
     active_session_lease = session.get("active_session_lease")
     acquired_active_session_lease = (
@@ -1834,6 +1842,8 @@ def _(rid, params: dict) -> dict:
     # from _pending) while the card is still visible — common when a WebSocket
     # reconnect during the wait drops tool.complete. A late answer must resolve
     # gracefully instead of hitting the raw 4009 "no pending answer request".
+    if proxied := _respond_compute_host_clarify(rid, params):
+        return proxied
     return _respond(rid, params, "answer", allow_expired=True)
 
 

@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
-from hermes_constants import venv_python_path
+from hermes_constants import get_default_hermes_root, venv_python_path
 
 logger = logging.getLogger(__name__)
 
@@ -1789,8 +1789,53 @@ def _update_complete_message(pre_version: str | None) -> str:
     if post_version:
         return f"✓ Update complete! (v{post_version})"
     return "✓ Update complete!"
- 
- 
+
+
+def _post_update_sqlite_runtime_status():
+    """Return whether the interpreter used after update has safe SQLite."""
+    from hermes_constants import project_venv_dir
+    from hermes_cli.sqlite_runtime import probe_sqlite_runtime
+
+    venv_dir = project_venv_dir(_m().PROJECT_ROOT)
+    python = (
+        venv_python_path(venv_dir, windows=_m()._is_windows())
+        if venv_dir is not None
+        else Path(sys.executable)
+    )
+    info = probe_sqlite_runtime(python)
+    return info is not None and not info.wal_reset_vulnerable, info
+
+
+def _print_verified_update_completion(message: str) -> bool:
+    """Print a success completion only after probing the next Hermes runtime."""
+    if not message.startswith("✓"):
+        _print_update_completion(message)
+        return False
+    sqlite_runtime_ok, sqlite_info = _post_update_sqlite_runtime_status()
+    if sqlite_info is None:
+        # Grace path: an unprobeable interpreter (no venv in a dev checkout,
+        # probe subprocess unavailable) must not fail an otherwise-successful
+        # update — only a POSITIVE vulnerable probe withholds success
+        # (same contract as _venv_core_imports_healthy's unknown states).
+        logger.debug("Post-update SQLite runtime probe unavailable; not blocking")
+        _print_update_completion(message)
+        return True
+    if sqlite_runtime_ok:
+        _print_update_completion(message)
+        return True
+    print()
+    detail = (
+        f"SQLite {sqlite_info.sqlite_version_string} still has the "
+        "WAL-reset corruption bug"
+    )
+    print(f"⚠ Update partially complete — {detail}.")
+    print(
+        "  Rebuild the Hermes venv with a uv-managed Python, restart Hermes, "
+        "then verify with `hermes doctor`."
+    )
+    return False
+
+
 def _clear_stale_sqlite_sidecars(db_path: Path) -> None:
     """Delete the WAL / shared-memory / rollback-journal files next to *db_path*.
 
@@ -1817,11 +1862,16 @@ def _print_update_summary(
     node_failures: list,
     desktop_build_ok: bool,
     pre_update_version: str | None,
-) -> None:
+) -> bool:
     """Final update banner. A failed Desktop rebuild is non-fatal for the
     Python side, but must not print ``✓ Update complete!`` (#88251)."""
+    sqlite_runtime_ok, sqlite_info = _post_update_sqlite_runtime_status()
+    if sqlite_info is None:
+        # Grace path: an unprobeable interpreter must not fail the update —
+        # only a POSITIVE vulnerable probe demotes success to partial.
+        sqlite_runtime_ok = True
     print()
-    if node_failures or not desktop_build_ok:
+    if node_failures or not desktop_build_ok or not sqlite_runtime_ok:
         parts = []
         if node_failures:
             parts.append(
@@ -1831,14 +1881,27 @@ def _print_update_summary(
             parts.append(
                 "the desktop app was not rebuilt and is still on the previous build"
             )
+        if not sqlite_runtime_ok and sqlite_info is not None:
+            parts.append(
+                f"SQLite {sqlite_info.sqlite_version_string} still has the "
+                "WAL-reset corruption bug"
+            )
         print("⚠ Update partially complete — " + "; ".join(parts) + ".")
         if node_failures:
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
         if not desktop_build_ok:
             print("  Run `hermes desktop` to retry the desktop rebuild.")
+        if not sqlite_runtime_ok:
+            print(
+                "  The Python runtime remediation did not complete. Run `hermes "
+                "update` again; if SQLite is unchanged, rebuild the Hermes venv "
+                "with a uv-managed Python, restart Hermes, then verify with "
+                "`hermes doctor`."
+            )
     else:
         _print_update_completion(_update_complete_message(pre_update_version))
+    return desktop_build_ok and sqlite_runtime_ok
 
 
 def _write_gateway_update_exit_code(ok: bool) -> None:
@@ -2290,7 +2353,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
             "Post-update state.db integrity check (zip path) failed: %s", exc
         )
 
-    _print_update_summary(
+    update_complete = _print_update_summary(
         node_failures=node_failures,
         desktop_build_ok=desktop_build_ok,
         pre_update_version=pre_update_version,
@@ -2310,11 +2373,11 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         from hermes_cli.update_receipt import finalize_update_receipt
 
         finalize_update_receipt(
-            "success" if (desktop_build_ok and not node_failures) else "partial"
+            "success" if update_complete and not node_failures else "partial"
         )
     except Exception as _receipt_exc:
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
-    return desktop_build_ok
+    return update_complete
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -3987,7 +4050,7 @@ def _repair_node_deps_on_current_checkout(
     gateway_mode: bool = False,
     pre_update_snapshot_id: str | None = None,
     completion_message: str = "✓ Already up to date!",
-) -> None:
+) -> bool:
     """Repair Node deps on the ``commit_count == 0`` path (#77211).
 
     A current checkout does not imply healthy Node deps: a previous npm
@@ -4007,7 +4070,7 @@ def _repair_node_deps_on_current_checkout(
         print_completion(
             "⚠ Checkout is current, but Node.js dependencies could not be repaired."
         )
-        return
+        return False
     # Pair the refresh with the web build like every other
     # _update_node_dependencies call site; it staleness-checks internally,
     # so this is a no-op when nothing changed.
@@ -4017,7 +4080,7 @@ def _repair_node_deps_on_current_checkout(
         gateway_mode=gateway_mode,
         pre_update_snapshot_id=pre_update_snapshot_id,
     )
-    print_completion(completion_message)
+    return bool(print_completion(completion_message))
 
 
 def _update_node_dependencies() -> list[str]:
@@ -4997,7 +5060,12 @@ def _detect_venv_python_processes(
 
     matches: list[tuple[int, str, str]] = []
     try:
-        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+        # On Windows, prefetching cmdline and cwd performs two expensive
+        # per-process queries. A busy workstation can have 500+ processes, so
+        # querying those fields for every unrelated process can exceed the
+        # Desktop preflight watchdog. First collect only cheap identity fields;
+        # fetch cmdline/cwd lazily for plausible Python/uv/Hermes candidates.
+        proc_iter = psutil.process_iter(["pid", "exe", "name"])
     except Exception:
         return []
     for proc in proc_iter:
@@ -5013,13 +5081,23 @@ def _detect_venv_python_processes(
             exe_norm = str(Path(exe).resolve()).lower()
         except (OSError, ValueError):
             exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
-        cmdline_low = cmdline_raw.lower()
-        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
-
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
         is_holder = exe_norm.startswith(venv_prefix)
+        name = str(info.get("name") or Path(exe).name)
+        name_low = name.lower()
+
+        if not is_holder and not (
+            name_low.startswith(("python", "pypy"))
+            or name_low in {"uv.exe", "uvx.exe", "hermes.exe"}
+        ):
+            continue
+
+        try:
+            cmdline_raw = " ".join(proc.cmdline() or [])
+        except Exception:
+            cmdline_raw = ""
+        cmdline_low = cmdline_raw.lower()
         # Fallback: uv/base-interpreter trampolines run a python whose exe is
         # OUTSIDE the venv but which still imports from it and holds its .pyd
         # files. Catch those by what they're running: a cmdline that references
@@ -5028,6 +5106,10 @@ def _detect_venv_python_processes(
         if not is_holder and venv_prefix in cmdline_low:
             is_holder = True
         if not is_holder and "hermes_cli.main" in cmdline_low:
+            try:
+                cwd_low = str(proc.cwd() or "").lower().rstrip(os.sep) + os.sep
+            except Exception:
+                cwd_low = os.sep
             if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
                 is_holder = True
         if not is_holder:
@@ -5473,6 +5555,55 @@ def _leftover_pausable_gateway_pids(
     return pids
 
 
+def _refuse_gateway_ancestor_tree_kill(
+    pids: list[int], *, gateway_mode: bool
+) -> bool:
+    """Refuse a plain Windows update that would kill its own process tree.
+
+    A chat agent can launch plain ``hermes update`` through its terminal tool.
+    In that topology the updater is a child of the gateway.  The leftover
+    holder recovery below uses ``taskkill /T /F`` on Windows, so force-stopping
+    that gateway also kills the updater before it can mutate the checkout
+    (#98814).
+
+    ``/update`` uses the supported ``--gateway`` hand-off and is deliberately
+    exempt: it detaches the updater and provides file-based progress/result
+    delivery.  For every other invocation, refuse only when a nominated
+    gateway is positively identified as this process's ancestor.  If ancestry
+    cannot be established, preserve the existing holder recovery behavior.
+    """
+    if gateway_mode or not pids:
+        return False
+
+    try:
+        from hermes_cli.gateway import _is_pid_ancestor_of_current_process
+
+        ancestors = [
+            int(pid)
+            for pid in pids
+            if _is_pid_ancestor_of_current_process(int(pid))
+        ]
+    except Exception as exc:
+        logger.debug("Could not inspect gateway ancestry before tree-kill: %s", exc)
+        return False
+
+    if not ancestors:
+        return False
+
+    rendered = ", ".join(str(pid) for pid in ancestors)
+    print(
+        "✗ Refusing to stop the gateway process tree because this updater "
+        f"is running inside it (gateway PID(s): {rendered})."
+    )
+    print(
+        "  On Windows, taskkill /T would terminate the updater before the "
+        "update can run."
+    )
+    print("  From a chat platform, use `/update` instead.")
+    print("  Otherwise, run `hermes update` from a separate terminal.")
+    return True
+
+
 def _ledger_manual_serve_holders(
     matches: list[tuple[int, str, str]],
 ) -> list[dict]:
@@ -5582,7 +5713,7 @@ def _relaunch_stopped_serves(token: dict) -> None:
 
 def _orphaned_desktop_backend_pids(
     matches: list[tuple[int, str, str]],
-) -> list[int] | None:
+) -> list[tuple[int, int]] | None:
     """PIDs from *matches* when every remaining holder is an ORPHANED backend.
 
     The venv-holder guard refuses on the Desktop app's ``serve`` backend by
@@ -5630,7 +5761,7 @@ def _orphaned_desktop_backend_pids(
         )
 
     # Pass 1: find orphaned backend ROOTS among the holders.
-    roots: list[int] = []
+    roots: list[tuple[int, int]] = []
     remaining: list[tuple[int, str]] = []  # (pid, argv_low) still to justify
     for pid, _name, cmdline in matches:
         argv = cmdline
@@ -5648,6 +5779,21 @@ def _orphaned_desktop_backend_pids(
             continue
         try:
             proc = psutil.Process(int(pid))
+            # Fingerprint from the SAME psutil handle used for classification
+            # below, quantized to centiseconds — the exact scheme
+            # gateway.status.get_process_start_time uses on Windows, so the
+            # value round-trips through pid_is_hermes at kill time. (Reading
+            # /proc/<pid>/stat here instead would consult the HOST process
+            # table and use different units.)
+            process_start_time = int(round(proc.create_time() * 100))
+        except psutil.NoSuchProcess:
+            # The candidate itself exited during classification; there is
+            # nothing left to reap and no identity to pass to taskkill.
+            continue
+        except Exception:
+            return None
+
+        try:
             ppid = proc.ppid()
             parent = psutil.Process(ppid) if ppid else None
             if parent is not None and parent.is_running():
@@ -5666,12 +5812,12 @@ def _orphaned_desktop_backend_pids(
             pass  # parent gone → orphan
         except Exception:
             return None
-        roots.append(int(pid))
+        roots.append((int(pid), process_start_time))
 
     # Pass 2: every non-backend holder must be a descendant of an accepted
     # orphan root — then it dies with the root's tree reap. Anything else
     # (operator REPL, stray script) keeps the refusal.
-    root_set = set(roots)
+    root_set = {pid for pid, _start_time in roots}
     for pid, _low in remaining:
         if not root_set:
             return None
@@ -5801,7 +5947,9 @@ def _handoff_reapable_backend_pids(
     return roots or None
 
 
-def _stop_process_trees(pids: list[int]) -> None:
+def _stop_process_trees(
+    pids: list[int] | list[tuple[int, int]],
+) -> None:
     """Force-stop each PID with its full child tree (Windows).
 
     ``taskkill /T /F`` mirrors the Desktop's ``forceKillProcessTree`` and
@@ -5809,12 +5957,38 @@ def _stop_process_trees(pids: list[int]) -> None:
     ``.hermes-runtime`` interpreter child alive and holding the install open
     (#70026). Best effort; never raises.
     """
-    for pid in pids:
+    from gateway.status import get_process_start_time
+    from hermes_cli._subprocess_compat import pid_is_hermes, windows_hide_flags
+
+    for entry in pids:
+        if isinstance(entry, tuple):
+            pid, expected_start_time = entry
+        else:
+            pid = int(entry)
+            expected_start_time = get_process_start_time(pid)
         try:
+            if expected_start_time is None:
+                logger.debug(
+                    "Skipping taskkill of PID %s: process identity unavailable",
+                    pid,
+                )
+                continue
+            if not pid_is_hermes(
+                pid,
+                expected_start_time=expected_start_time,
+            ):
+                logger.debug(
+                    "Skipping taskkill of non-Hermes or changed PID %s",
+                    pid,
+                )
+                continue
             subprocess.run(
-                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
                 check=False,
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
         except Exception as exc:
             logger.debug("Could not stop process tree %s: %s", pid, exc)
@@ -6071,7 +6245,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        from gateway.status import terminate_pid
+        from gateway.status import get_process_start_time, terminate_pid
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
@@ -6261,8 +6435,13 @@ def _pause_windows_gateways_for_update() -> dict | None:
     force_killed = []
     for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
         try:
-            terminate_pid(int(pid), force=True)
-            force_killed.append(int(pid))
+            pid_int = int(pid)
+            terminate_pid(
+                pid_int,
+                force=True,
+                expected_start_time=get_process_start_time(pid_int),
+            )
+            force_killed.append(pid_int)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -7241,6 +7420,114 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
             f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
         )
 
+def _git_is_trampoline(git_cmd: list) -> bool:
+    """Whether *git_cmd* resolves to a Git-for-Windows trampoline launcher.
+
+    Git for Windows ships two ~46KB shims (``bin\\git.exe``, ``cmd\\git.exe``)
+    that re-exec the real ``mingw64\\libexec\\git-core\\git.exe``. When the
+    shim's re-exec target is missing or PATH resolves to the shim in a
+    context where it cannot find git-core, every git call dies with the
+    launcher's own guard message instead of running — a broken PATH entry,
+    not a network or filesystem problem (#87876). Never raises; unknown
+    states report False so a probe failure can't block an update.
+    """
+    try:
+        result = subprocess.run(
+            git_cmd + ["--version"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return False
+    output = ((result.stdout or "") + (result.stderr or "")).lower()
+    return "fork bomb" in output
+
+
+def _portable_git_candidates() -> list:
+    """PortableGit candidate paths: shared root first, then profile home.
+
+    The Hermes-managed PortableGit tree lives under the SHARED root
+    (``<root>/git/...``), not the profile-scoped HERMES_HOME
+    (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must
+    look there (monerostar review, #87876). The profile-home candidate is
+    kept as a fallback for custom layouts that place it there.
+    """
+    candidates = []
+    try:
+        for root in (get_default_hermes_root(), Path(get_hermes_home())):
+            candidates.append(
+                root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
+            )
+    except Exception:
+        pass
+    return candidates
+
+
+def _locate_real_git() -> Optional[Path]:
+    """Find a real Git-for-Windows binary that is not a broken trampoline.
+
+    The trampoline symptom is PATH-level: ``bin\\git.exe`` / ``cmd\\git.exe``
+    (both ~46KB shims) fail to re-exec git-core, while the real binary at
+    ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when invoked
+    directly (#87876). Check the standard Git for Windows locations plus the
+    Hermes-managed PortableGit copy; accept the first candidate that runs and
+    does NOT print the trampoline guard. Returns None when nothing suitable
+    is found — callers then keep the broken command and let the existing
+    fetch-failure ZIP fallback handle it.
+    """
+    candidates = [
+        Path(r"C:\Program Files\Git\mingw64\libexec\git-core\git.exe"),
+        Path(r"C:\Program Files (x86)\Git\mingw64\libexec\git-core\git.exe"),
+    ] + _portable_git_candidates()
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            result = subprocess.run(
+                [str(candidate), "--version"],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=15,
+            )
+        except Exception:
+            continue
+        output = ((result.stdout or "") + (result.stderr or "")).lower()
+        if "fork bomb" in output:
+            continue
+        return candidate
+    return None
+
+
+def _ensure_non_trampoline_git(git_cmd: list) -> list:
+    """Swap a broken Git-for-Windows trampoline for a real git binary.
+
+    Runs up front, right after the git command is built. When the resolved
+    ``git`` is a broken trampoline, locate the real binary and rebuild the
+    command with it so fetch/pull/checkout keep working with a real git
+    instead of degrading to the ZIP fallback. When no real binary can be
+    found, leave the command untouched — the existing fetch-failure handler
+    already falls back to the ZIP path on Windows. No-op off Windows (the
+    trampoline is a Git-for-Windows artifact) and when git is healthy.
+    """
+    if sys.platform != "win32":
+        return git_cmd
+    if not _git_is_trampoline(git_cmd):
+        return git_cmd
+    real_git = _locate_real_git()
+    if real_git is None:
+        print(
+            "⚠ Detected a broken git trampoline and could not locate a real "
+            "git binary — the update will fall back to the ZIP path."
+        )
+        return git_cmd
+    print(
+        f"⚠ Detected a broken git trampoline; switching to real git at "
+        f"{real_git}"
+    )
+    return [str(real_git)] + list(git_cmd[1:])
+
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
@@ -7755,13 +8042,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if _venv_holders:
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:
+                if _refuse_gateway_ancestor_tree_kill(
+                    _gateway_holders, gateway_mode=gateway_mode
+                ):
+                    _m()._resume_windows_gateways_after_update(
+                        _windows_gateway_resume
+                    )
+                    sys.exit(2)
                 # Every remaining holder is a gateway the pause machinery
                 # already owns — respawned by its supervisor inside the
                 # pause→guard window, or up through a spawn path discovery
                 # does not map. Stop them and re-check instead of
                 # dead-ending; the post-update resume (and the supervisor
                 # that respawned them) brings gateways back afterwards.
-                from gateway.status import terminate_pid
+                from gateway.status import get_process_start_time, terminate_pid
 
                 print(
                     f"  ⚠ {len(_gateway_holders)} gateway process(es) still "
@@ -7769,7 +8063,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 for _pid in _gateway_holders:
                     try:
-                        terminate_pid(int(_pid), force=True)
+                        pid_int = int(_pid)
+                        terminate_pid(
+                            pid_int,
+                            force=True,
+                            expected_start_time=get_process_start_time(pid_int),
+                        )
                     except Exception as exc:
                         logger.debug(
                             "Could not stop leftover gateway %s: %s", _pid, exc
@@ -7949,6 +8248,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
     git_cmd = ["git"]
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    # A broken Git-for-Windows trampoline refuses every git call with a
+    # "BUG (fork bomb)" guard instead of running; swap in a real binary up
+    # front so the normal git path survives instead of degrading to ZIP
+    # (#87876).
+    git_cmd = _ensure_non_trampoline_git(git_cmd)
 
     # Discard npm lockfile churn before any stash/branch logic. npm rewrites
     # tracked package-lock.json files non-deterministically at install/build
@@ -8314,6 +8618,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # "Already up to date!" and exits without doing the one job it
             # was spawned for.
             handed_off_sync = os.environ.get(_m()._UPDATE_REEXEC_ENV) == "1"
+            current_checkout_complete = True
             if handed_off_sync:
                 print("→ Finishing the dependency install handed off by hermes.exe...")
             elif not healthy:
@@ -8384,13 +8689,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         gateway_mode=gateway_mode,
                         pre_update_snapshot_id=pre_update_snapshot_id,
                     )
-                    _print_update_completion("✓ Update complete!")
+                    current_checkout_complete = _print_verified_update_completion(
+                        "✓ Update complete!"
+                    )
                 else:
+                    current_checkout_complete = False
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
-                _repair_node_deps_on_current_checkout(
-                    _print_update_completion,
+                current_checkout_complete = _repair_node_deps_on_current_checkout(
+                    _print_verified_update_completion,
                     assume_yes=assume_yes,
                     gateway_mode=gateway_mode,
                     pre_update_snapshot_id=pre_update_snapshot_id,
@@ -8414,8 +8722,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Git is current, but a prior pull may still owe the fleet a
             # restart (#95294). Catch up even on the "Already up to date"
             # path — that early return is what left the gateway on stale
-            # code for two days.
+            # code for two days. Runs BEFORE the runtime-verification exit
+            # gate below: a vulnerable SQLite runtime demotes the outcome to
+            # partial, but must not strand the fleet on stale code (#91277
+            # fleet contract — the pending-restart check always executes).
             _apply_pending_fleet_restart_catchup()
+            if not current_checkout_complete:
+                if gateway_mode:
+                    _write_gateway_update_exit_code(False)
+                try:
+                    from hermes_cli.update_receipt import finalize_update_receipt
+
+                    finalize_update_receipt("partial")
+                except Exception as _receipt_exc:
+                    logger.debug(
+                        "Update receipt finalize (current checkout) failed: %s",
+                        _receipt_exc,
+                    )
+                sys.exit(1)
             return
 
         if commit_count > 0:
@@ -9080,7 +9404,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             pre_update_snapshot_id=pre_update_snapshot_id,
         )
 
-        _print_update_summary(
+        update_complete = _print_update_summary(
             node_failures=node_failures,
             desktop_build_ok=desktop_build_ok,
             pre_update_version=pre_update_version,
@@ -9211,11 +9535,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #
         # Writing the marker here — after git pull + pip install succeed but
         # before we attempt the restart — ensures the new gateway sees it
-        # regardless of how we die. Gated on desktop_build_ok (#88251): a
-        # Desktop rebuild failure must not be reported as "0" — the gateway's
-        # /update watcher (gateway/run.py) polls this file.
+        # regardless of how we die. The verified summary includes Desktop and
+        # SQLite-runtime health, so neither failure is reported as "0" to the
+        # gateway watcher (gateway/run.py).
         if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+            _write_gateway_update_exit_code(update_complete)
 
         gateway_fleet_restart_incomplete = False
         gateway_restart_phase_errors: list[str] = []
@@ -9979,14 +10303,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(
                         f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
                     )
-                    from gateway.status import terminate_pid as _terminate_pid
+                    from gateway.status import (
+                        get_process_start_time as _get_process_start_time,
+                        terminate_pid as _terminate_pid,
+                    )
                     for pid in _stuck:
                         try:
                             # Routes through taskkill /T /F on Windows,
                             # SIGKILL on POSIX — _signal.SIGKILL doesn't
                             # exist on Windows so the old raw os.kill call
                             # used to crash the entire update path.
-                            _terminate_pid(pid, force=True)
+                            _terminate_pid(
+                                pid,
+                                force=True,
+                                expected_start_time=_get_process_start_time(pid),
+                            )
                         except (ProcessLookupError, PermissionError, OSError):
                             pass
                     # Give the OS a beat to reap the processes so the
@@ -10327,7 +10658,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             from hermes_cli.update_receipt import finalize_update_receipt
 
             _receipt_path = finalize_update_receipt(
-                "partial" if gateway_fleet_restart_incomplete else "success",
+                (
+                    "partial"
+                    if gateway_fleet_restart_incomplete or not update_complete
+                    else "success"
+                ),
                 fleet=_fleet_snapshot,
             )
             if _receipt_path is not None:
